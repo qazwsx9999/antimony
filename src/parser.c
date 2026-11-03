@@ -666,6 +666,17 @@ static Node *parse_stmt(Parser *p) {
         expect_term(p);
         return n;
     }
+    case T_DEFER: {
+        next(p);
+        Node *n = new_node(N_DEFER, t->pos);
+        if (cur(p)->kind == T_LBRACE) {
+            n->body = parse_block(p);
+            expect_term(p);
+        } else {
+            n->body = parse_stmt(p);
+        }
+        return n;
+    }
     case T_LOOP: {
         Node *n = parse_loop(p, NULL);
         expect_term(p);

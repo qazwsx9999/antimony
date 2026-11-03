@@ -26,6 +26,7 @@ typedef struct {
     int max_temp_depth;
     int base_slots;           // local variable slots in current function
     int max_out_stack_args;   // max args > 4 across calls in current function
+    VEC(Node *) defers;       // active `defer` statement bodies in current function
 } CG;
 
 static uint32_t add_string(CG *cg, const char *s, int len) {
@@ -862,7 +863,7 @@ static void gen_expr(CG *cg, Node *n) {
         Type *src = n->lhs->type;
         Type *dst = n->type;
         gen_expr(cg, n->lhs);
-        if (src == dst) return;
+        if (src == dst || src->kind == TY_PTR || dst->kind == TY_PTR) return;
         if (src->kind == TY_FLOAT && dst->kind == TY_FLOAT) {
             // f32 <-> f64
             gpr_to_xmm_f64(0, RAX, src);
@@ -1361,6 +1362,7 @@ static void gen_range_loop(CG *cg, Node *n) {
     int l_brk  = x_label();
     n->label_continue = l_cont;
     n->label_break    = l_brk;
+    n->defer_depth    = cg->defers.len;
 
     // Fast path for forward unit-step range loops `loop i in a..b`:
     // No division needed; increments `i` by 1 until `i == end`.
@@ -1493,6 +1495,7 @@ static void gen_iter_loop(CG *cg, Node *n) {
     int l_cond = x_label(), l_cont = x_label(), l_brk = x_label();
     n->label_continue = l_cont;
     n->label_break    = l_brk;
+    n->defer_depth    = cg->defers.len;
 
     x_bind(l_cond);
     x_load(RAX, RBP, slot_disp(s_idx));
@@ -1530,6 +1533,17 @@ static void gen_iter_loop(CG *cg, Node *n) {
     x_bind(l_brk);
 }
 
+static void emit_defers_from(CG *cg, int limit) {
+    int saved_len = cg->defers.len;
+    for (int i = saved_len - 1; i >= limit; i--) {
+        cg->defers.len = i;
+        Node *dbody = cg->defers.items[i];
+        if (dbody->kind == N_BLOCK) gen_block(cg, dbody);
+        else                        gen_stmt(cg, dbody);
+    }
+    cg->defers.len = saved_len;
+}
+
 static void gen_stmt(CG *cg, Node *n) {
     switch (n->kind) {
     case N_VAR:
@@ -1556,16 +1570,35 @@ static void gen_stmt(CG *cg, Node *n) {
         gen_expr(cg, n->lhs);
         return;
 
+    case N_DEFER:
+        vec_push(cg->defers, n->body);
+        return;
+
     case N_RETURN:
-        if (n->lhs) gen_expr(cg, n->lhs);
+        if (n->lhs) {
+            gen_expr(cg, n->lhs);
+            if (cg->defers.len > 0) {
+                int ret_slot = push_temp(cg);
+                emit_defers_from(cg, 0);
+                pop_temp(cg, ret_slot, RAX);
+            }
+        } else if (cg->defers.len > 0) {
+            emit_defers_from(cg, 0);
+        }
         x_jmp(cg->cur_epilogue);
         return;
 
     case N_BREAK:
+        if (cg->defers.len > n->target->defer_depth) {
+            emit_defers_from(cg, n->target->defer_depth);
+        }
         x_jmp(n->target->label_break);
         return;
 
     case N_CONTINUE:
+        if (cg->defers.len > n->target->defer_depth) {
+            emit_defers_from(cg, n->target->defer_depth);
+        }
         x_jmp(n->target->label_continue);
         return;
 
@@ -1627,6 +1660,7 @@ static void gen_stmt(CG *cg, Node *n) {
         int l_top = x_label(), l_brk = x_label();
         n->label_continue = l_top;
         n->label_break    = l_brk;
+        n->defer_depth    = cg->defers.len;
         x_bind(l_top);
         gen_block(cg, n->body);
         x_jmp(l_top);
@@ -1638,6 +1672,7 @@ static void gen_stmt(CG *cg, Node *n) {
         int l_cond = x_label(), l_brk = x_label();
         n->label_continue = l_cond;
         n->label_break    = l_brk;
+        n->defer_depth    = cg->defers.len;
         x_bind(l_cond);
         gen_cond_jump(cg, n->cond, l_brk, false);
         gen_block(cg, n->body);
@@ -1659,6 +1694,7 @@ static void gen_stmt(CG *cg, Node *n) {
         n->label_continue = l_cont;
         n->label_break    = l_brk;
         gen_stmt(cg, n->init);
+        n->defer_depth    = cg->defers.len;
         x_bind(l_cond);
         gen_cond_jump(cg, n->cond, l_brk, false);
         gen_block(cg, n->body);
@@ -1679,8 +1715,22 @@ static void gen_stmt(CG *cg, Node *n) {
 }
 
 static void gen_block(CG *cg, Node *b) {
+    int defer_mark = cg->defers.len;
     for (int i = 0; i < b->list.len; i++) {
         gen_stmt(cg, b->list.items[i]);
+    }
+    if (cg->defers.len > defer_mark) {
+        bool ends_jump = false;
+        if (b->list.len > 0) {
+            NodeKind lk = b->list.items[b->list.len - 1]->kind;
+            if (lk == N_RETURN || lk == N_BREAK || lk == N_CONTINUE) {
+                ends_jump = true;
+            }
+        }
+        if (!ends_jump) {
+            emit_defers_from(cg, defer_mark);
+        }
+        cg->defers.len = defer_mark;
     }
 }
 
@@ -1829,6 +1879,7 @@ static void gen_fn(CG *cg, Node *fn) {
     cg->temp_depth = 0;
     cg->max_temp_depth = 0;
     cg->max_out_stack_args = 0;
+    cg->defers.len = 0;
 
     // Save allocated non-volatile registers (RBX, R12..R15).
     for (int k = 0; k < num_saved; k++) {

@@ -588,4 +588,122 @@ fn main() {
 }
 "@ "0`n1`n10`n11`n105`n3`n2`n10`n20`n99`n111"
 
+# 12. Phase 7: defer, sizeof/alignof, ptr_cast, and std/ library
+Test-CompileError "defer_return" "fn main() { defer return }" "'return' is not allowed inside a 'defer'"
+Test-CompileError "defer_break"  "fn main() { loop { defer break } }" "'break' is not allowed inside a 'defer'"
+Test-CompileError "defer_nested" "fn main() { defer { defer print(1) } }" "cannot nest 'defer'"
+Test-CompileError "ptr_cast_bad" "fn main() { var x = ptr_cast(i32, 0) }" "first argument to 'ptr_cast' must be a pointer type"
+
+Test-RunOk "defer_lifo_and_loops" @"
+var log_val: i64 = 0
+
+fn record(d: i64) {
+    log_val = log_val * 10 + d
+}
+
+fn early_return(x: i32): i32 {
+    var ret = 100
+    defer record(1)
+    defer {
+        record(2)
+        ret = 999
+    }
+    if x > 0 {
+        defer record(3)
+        return ret + x
+    }
+    defer record(4)
+    return ret
+}
+
+fn main() {
+    var r = early_return(5)
+    print(r)
+    print(log_val)
+
+    log_val = 0
+    loop i in 0..4 {
+        defer record(i64(i + 1))
+        if i == 1 {
+            continue
+        }
+        if i == 2 {
+            break
+        }
+        record(9)
+    }
+    print(log_val)
+}
+"@ "105`n321`n9123"
+
+Test-RunOk "sizeof_alignof_ptrcast_and_std" @"
+import "std/mem.sb"
+import "std/io.sb"
+import "std/time.sb"
+import "std/str.sb"
+
+struct Header {
+    tag: u8
+    id: i32
+    val: i64
+}
+
+fn main() {
+    print(sizeof(u8))
+    print(sizeof(i32))
+    print(sizeof(f64))
+    print(sizeof(*Header))
+    print(sizeof(Header))
+    print(alignof(Header))
+
+    var arr[4]: i32 = [1, 2, 3, 4]
+    print(sizeof(arr))
+
+    // Heap allocation + ptr_cast + defer free_mem
+    var raw = alloc(sizeof(Header))
+    defer free_mem(raw)
+    var h = ptr_cast(*Header, raw)
+    h.tag = 7
+    h.id  = 42
+    h.val = 123456789
+    print(h.tag)
+    print(h.id)
+    print(h.val)
+    print(usize(h) == usize(raw))
+
+    // Arena allocator
+    var arena: Arena
+    arena_init(&arena, 1024)
+    defer arena_free(&arena)
+    var p1 = ptr_cast(*i64, arena_alloc(&arena, sizeof(i64), alignof(i64)))
+    var p2 = ptr_cast(*i64, arena_alloc(&arena, sizeof(i64), alignof(i64)))
+    *p1 = 111
+    *p2 = 222
+    print(*p1 + *p2)
+
+    // std/str.sb
+    print(cstr_len("Antimony"))
+    print(cstr_eq("sb", "sb"))
+    var digits[5]: u8 = [45, 52, 50, 48, 49]
+    print(parse_i64(digits))
+
+    // std/time.sb
+    var t0 = perf_counter()
+    var t1 = perf_counter()
+    print(t1 >= t0)
+    print(perf_freq() > 0)
+
+    // std/io.sb
+    var path: *u8 = "tests/tmp/std_io_test.bin"
+    var payload[4]: u8 = [65, 66, 67, 68]
+    print(write_file_bytes(path, payload))
+    print(file_size(path))
+    var read_buf[4]: u8
+    print(read_file_into(path, read_buf))
+    print(read_buf[0])
+    print(read_buf[3])
+    print(delete_file(path))
+}
+"@ "1`n4`n8`n8`n16`n8`n16`n7`n42`n123456789`ntrue`n333`n8`ntrue`n-4201`ntrue`ntrue`ntrue`n4`n4`n65`n68`ntrue"
+
 Write-Host "`nAll tests passed."

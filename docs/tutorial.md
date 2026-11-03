@@ -585,19 +585,74 @@ fn main() {
 
 ---
 
-## 13. Built-in Functions
+## 13. `defer`, `sizeof` / `alignof`, `ptr_cast`, and the Standard Library (`std/`)
+
+### 13.1 Scope-Based Cleanup (`defer`)
+`defer` schedules a statement or `{ ... }` block to run in **reverse (LIFO) order** when the enclosing scope exits—whether at the end of a block, or via `return`, `break`, or `continue`. When `return expr` runs, `expr` is evaluated before the deferred cleanup statements execute:
+
+```
+import "std/mem.sb"
+
+fn process_buffer(n: usize): i32 {
+    var buf = alloc(n)
+    defer free_mem(buf)     // guaranteed to run on every return path!
+
+    if buf == null {
+        return -1
+    }
+    buf[0] = 42
+    return i32(buf[0])
+}
+```
+
+### 13.2 `sizeof`, `alignof`, and `ptr_cast`
+- `sizeof(T)` and `alignof(T)` evaluate at compile time to the size and alignment in bytes of any type or expression (`sizeof(Vec2)`, `sizeof(*u8)`, `sizeof(my_array)`).
+- `ptr_cast(*T, expr)` converts a raw pointer (such as `*u8` returned from `alloc`) or 64-bit integer address into `*T` with zero runtime overhead:
+
+```
+import "std/mem.sb"
+
+struct Node {
+    id: i32
+    val: i64
+}
+
+fn main() {
+    var raw = alloc(sizeof(Node))
+    defer free_mem(raw)
+
+    var node = ptr_cast(*Node, raw)
+    node.id  = 1
+    node.val = 9000
+    print(node.val)         // 9000
+}
+```
+
+### 13.3 Standard Library Modules (`std/`)
+Antimony ships with native standard library modules in `std/` that you can import from any directory:
+- `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `realloc_mem`, `free_mem`, `copy_mem`, `set_mem`, `cmp_mem`) and fast bump-pointer `Arena` (`arena_init`, `arena_alloc`, `arena_reset`, `arena_free`).
+- `import "std/io.sb"` — Native Win32 file I/O (`write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
+- `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
+- `import "std/str.sb"` — C-string and ASCII byte-slice utilities (`cstr_len`, `cstr_eq`, `is_digit`, `is_alpha`, `is_space`, `parse_i64`).
+
+---
+
+## 14. Built-in Functions
 
 | Function | Description |
 |---|---|
 | `print(x)` | Prints any integer, float (`f32`/`f64`), enum, pointer, `bool`, or `str` followed by a newline |
 | `len(x)` | Returns the length of an array, slice, or string |
+| `sizeof(T_or_expr)` | Compile-time size in bytes of a type or expression |
+| `alignof(T_or_expr)` | Compile-time alignment in bytes of a type or expression |
+| `ptr_cast(*T, x)` | Zero-cost cast of a pointer or 64-bit integer address `x` to pointer type `*T` |
 | `exit(code: i32)` | Terminates the program immediately with exit status `code` |
 | `rev(a..b [by s])` | Reverses a range inside a `loop` header |
-| `T(x)` | Explicitly converts `x` to scalar integer, float, or enum type `T` (e.g. `i64(x)`, `f64(x)`, `i32(Status.Done)`) |
+| `T(x)` | Explicitly converts `x` to scalar integer, float, or enum type `T` (e.g. `i64(x)`, `f64(x)`, `usize(ptr)`) |
 
 ---
 
-## 14. Complete Example Program
+## 15. Complete Example Program
 
 See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony, or try this prime-counting benchmark:
 

@@ -1,0 +1,38 @@
+// std/time.sb - High-resolution Win32 performance timers and sleep utilities.
+
+extern "kernel32.dll" {
+    fn GetTickCount64(): u64
+    fn QueryPerformanceCounter(lpPerformanceCount: *i64): i32
+    fn QueryPerformanceFrequency(lpFrequency: *i64): i32
+    fn Sleep(dwMilliseconds: u32)
+}
+
+// Returns milliseconds elapsed since the system was started.
+fn ticks_ms(): u64 {
+    return GetTickCount64()
+}
+
+// Returns the current high-resolution performance counter tick.
+fn perf_counter(): i64 {
+    var c: i64 = 0
+    QueryPerformanceCounter(&c)
+    return c
+}
+
+// Returns the frequency (ticks per second) of the high-resolution performance counter.
+fn perf_freq(): i64 {
+    var f: i64 = 1
+    QueryPerformanceFrequency(&f)
+    return f
+}
+
+// Returns elapsed microseconds between two `perf_counter()` readings.
+fn elapsed_us(start: i64, end: i64): i64 {
+    var f = perf_freq()
+    return ((end - start) * 1_000_000) / f
+}
+
+// Suspends execution of the current thread for `ms` milliseconds.
+fn sleep_ms(ms: u32) {
+    Sleep(ms)
+}

@@ -1,3 +1,5 @@
+import "std/mem.sb"
+
 const LIMIT = 10
 
 extern "msvcrt.dll" fn sqrt(x: f64): f64
@@ -85,6 +87,13 @@ fn main() {
     print(pt.x)
     print(pt.y)
     print(mode_weight(Mode.Custom))
+
+    var raw_v = alloc(sizeof(Vec2))
+    defer free_mem(raw_v)
+    var heap_v = ptr_cast(*Vec2, raw_v)
+    heap_v.x = 77
+    heap_v.y = 88
+    print(heap_v.x + heap_v.y)
 
     var radius = 2.5
     var area = 3.14159265 * radius * radius

@@ -53,28 +53,40 @@ static void extract_dir(const char *path, char *dir_out, size_t cap) {
     dir_out[len] = '\0';
 }
 
+static char *try_open_module(const char *prefix, const char *raw_path, char *out_path, size_t out_cap) {
+    if (prefix && prefix[0]) {
+        snprintf(out_path, out_cap, "%s%s", prefix, raw_path);
+    } else {
+        snprintf(out_path, out_cap, "%s", raw_path);
+    }
+    char *src = read_entire_file_or_null(out_path);
+    if (!src) {
+        size_t clen = strlen(out_path);
+        if (clen < 3 || _stricmp(out_path + clen - 3, ".sb") != 0) {
+            char with_ext[1032];
+            snprintf(with_ext, sizeof(with_ext), "%s.sb", out_path);
+            src = read_entire_file_or_null(with_ext);
+            if (src) snprintf(out_path, out_cap, "%s", with_ext);
+        }
+    }
+    return src;
+}
+
 static void load_module_recursive(const char *raw_path, const char *base_dir,
                                   bool is_import, Pos import_pos, NodeVec *all_decls) {
     char candidate[1024];
     bool is_abs = (raw_path[0] == '/' || raw_path[0] == '\\' ||
                    (raw_path[0] && raw_path[1] == ':'));
-    if (!is_abs && base_dir && base_dir[0]) {
-        snprintf(candidate, sizeof(candidate), "%s%s", base_dir, raw_path);
-    } else {
-        snprintf(candidate, sizeof(candidate), "%s", raw_path);
-    }
-
-    char *src = read_entire_file_or_null(candidate);
-    if (!src) {
-        // If no '.sb' extension was given, try appending '.sb'.
-        size_t clen = strlen(candidate);
-        if (clen < 3 || _stricmp(candidate + clen - 3, ".sb") != 0) {
-            char with_ext[1032];
-            snprintf(with_ext, sizeof(with_ext), "%s.sb", candidate);
-            src = read_entire_file_or_null(with_ext);
-            if (src) snprintf(candidate, sizeof(candidate), "%s", with_ext);
+    char *src = try_open_module(is_abs ? "" : base_dir, raw_path, candidate, sizeof(candidate));
+#ifdef _WIN32
+    if (!src && is_import && !is_abs) {
+        char exe_path[1024], exe_dir[1024];
+        if (GetModuleFileNameA(NULL, exe_path, sizeof(exe_path)) > 0) {
+            extract_dir(exe_path, exe_dir, sizeof(exe_dir));
+            src = try_open_module(exe_dir, raw_path, candidate, sizeof(candidate));
         }
     }
+#endif
     if (!src) {
         if (is_import) {
             fatal(import_pos, "cannot open imported module '%s'", raw_path);

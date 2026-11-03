@@ -83,6 +83,7 @@ typedef struct {
     VEC(Node *) loops;
     int next_slot;
     int next_var_index;
+    int in_defer;
     AssignSet assigned;     // current definite-assignment state
 } Checker;
 
@@ -272,6 +273,33 @@ static Type *resolve_decl_type(Checker *c, Node *d) {
         return make_slice_type(base, d->pos);
     }
     return base;
+}
+
+// If `arg` is a type expression (`T`, `*T`, `**T`, etc.) passed to `sizeof`, `alignof`,
+// or `ptr_cast`, resolves and returns that `Type *`; otherwise returns NULL.
+static Type *try_resolve_type_arg(Checker *c, Node *arg) {
+    int ptr_depth = 0;
+    Node *cur = arg;
+    while (cur && cur->kind == N_DEREF) {
+        ptr_depth++;
+        cur = cur->lhs;
+    }
+    if (cur && cur->kind == N_IDENT) {
+        Symbol *s = lookup(c, cur->name);
+        if (s && s->kind == SYM_TYPE) {
+            Type *t = s->type;
+            if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) {
+                layout_struct(c, t);
+            } else if (t->kind == TY_ENUM && t->state != 2) {
+                layout_enum(c, t);
+            }
+            for (int i = 0; i < ptr_depth; i++) {
+                t = make_ptr_type(t, arg->pos);
+            }
+            return t;
+        }
+    }
+    return NULL;
 }
 
 static void layout_enum(Checker *c, Type *et) {
@@ -1081,6 +1109,12 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             }
             if (arg->type == &ty_untyped_int && (is_int(s->type) || s->type->kind == TY_ENUM)) {
                 coerce(arg, (s->type->kind == TY_ENUM) ? &ty_i32 : s->type);
+            } else if (arg->type->kind == TY_PTR && s->type->kind == TY_INT && s->type->size == 8) {
+                n->kind = N_CONV;
+                n->lhs = arg;
+                n->type = s->type;
+                if (expected) coerce(n, expected);
+                return;
             } else if (is_float(arg->type) && is_int(s->type)) {
                 materialize(arg);
                 n->kind = N_CONV;
@@ -1113,7 +1147,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             return;
         }
 
-        // Built-in functions (`print`, `exit`, `rev`).
+        // Built-in functions (`print`, `exit`, `rev`, `len`, `sizeof`, `alignof`, `ptr_cast`).
         if (s->kind == SYM_BUILTIN) {
             n->builtin = s->builtin;
             if (s->builtin == B_REV) {
@@ -1156,6 +1190,52 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     return;
                 }
                 fatal(arg->pos, "'len' requires an array, slice, or string argument (got '%s')", at->name);
+            }
+            if (s->builtin == B_SIZEOF || s->builtin == B_ALIGNOF) {
+                const char *bname = (s->builtin == B_SIZEOF) ? "sizeof" : "alignof";
+                if (n->list.len != 1) fatal(n->pos, "'%s' takes 1 argument (type or expression)", bname);
+                Node *arg = n->list.items[0];
+                Type *t = try_resolve_type_arg(c, arg);
+                if (!t) {
+                    check_expr(c, arg, NULL);
+                    materialize(arg);
+                    t = arg->type;
+                }
+                if (t == &ty_void) {
+                    fatal(arg->pos, "'%s' is not valid on 'void'", bname);
+                }
+                if (t->kind == TY_STRUCT && t->state != 2) {
+                    layout_struct(c, t);
+                }
+                n->type = &ty_untyped_int;
+                n->is_const = true;
+                n->cval = (s->builtin == B_SIZEOF) ? t->size : t->align;
+                if (expected) coerce(n, expected);
+                return;
+            }
+            if (s->builtin == B_PTR_CAST) {
+                if (n->list.len != 2) {
+                    fatal(n->pos, "'ptr_cast' takes 2 arguments: ptr_cast(*T, expr)");
+                }
+                Type *target_t = try_resolve_type_arg(c, n->list.items[0]);
+                if (!target_t || target_t->kind != TY_PTR) {
+                    fatal(n->list.items[0]->pos, "first argument to 'ptr_cast' must be a pointer type '*T'");
+                }
+                Node *val = n->list.items[1];
+                check_expr(c, val, NULL);
+                if (val->type == &ty_untyped_int) {
+                    coerce(val, &ty_usize);
+                } else if (val->type == &ty_null) {
+                    coerce(val, target_t);
+                } else if (val->type->kind != TY_PTR && !(val->type->kind == TY_INT && val->type->size == 8)) {
+                    fatal(val->pos, "'ptr_cast' source must be a pointer or 64-bit integer ('usize'/'i64'), got '%s'",
+                          val->type->name);
+                }
+                n->kind = N_CONV;
+                n->lhs = val;
+                n->type = target_t;
+                if (expected) coerce(n, expected);
+                return;
             }
         }
 
@@ -1240,6 +1320,8 @@ static bool body_assigns_var(Node *stmt, Symbol *v) {
         for (int i = 0; i < stmt->list.len; i++)
             if (body_assigns_var(stmt->list.items[i]->body, v)) return true;
         return body_assigns_var(stmt->els, v);
+    case N_DEFER:
+        return body_assigns_var(stmt->body, v);
     case N_LOOP_INF:
     case N_LOOP_COND:
     case N_LOOP_RANGE:
@@ -1444,6 +1526,9 @@ static bool check_stmt(Checker *c, Node *n) {
         return false;
 
     case N_RETURN:
+        if (c->in_defer > 0) {
+            fatal(n->pos, "'return' is not allowed inside a 'defer' statement");
+        }
         if (c->ret_type == &ty_void) {
             if (n->lhs) {
                 fatal(n->pos, "function '%s' has no return type and cannot return a value",
@@ -1460,6 +1545,10 @@ static bool check_stmt(Checker *c, Node *n) {
 
     case N_BREAK:
     case N_CONTINUE: {
+        if (c->in_defer > 0) {
+            fatal(n->pos, "'%s' is not allowed inside a 'defer' statement",
+                  n->kind == N_BREAK ? "break" : "continue");
+        }
         if (c->loops.len == 0) {
             fatal(n->pos, "'%s' outside of a loop", n->kind == N_BREAK ? "break" : "continue");
         }
@@ -1478,6 +1567,25 @@ static bool check_stmt(Checker *c, Node *n) {
         n->target = target;
         c->assigned = ALL_ASSIGNED;
         return true;
+    }
+
+    case N_DEFER: {
+        if (c->in_defer > 0) {
+            fatal(n->pos, "cannot nest 'defer' inside another 'defer'");
+        }
+        if (n->body->kind == N_VAR || n->body->kind == N_CONST) {
+            fatal(n->body->pos, "cannot declare a variable or constant directly in 'defer' (use 'defer { ... }')");
+        }
+        c->in_defer++;
+        AssignSet saved = c->assigned;
+        if (n->body->kind == N_BLOCK) {
+            check_block(c, n->body, true);
+        } else {
+            check_stmt(c, n->body);
+        }
+        c->assigned = saved;
+        c->in_defer--;
+        return false;
     }
 
     case N_IF: {
@@ -1780,7 +1888,8 @@ static void register_builtins(Checker *c) {
         (void)s;
     }
     struct { const char *name; int id; } builtins[] = {
-        {"print", B_PRINT}, {"exit", B_EXIT}, {"rev", B_REV}, {"len", B_LEN}
+        {"print", B_PRINT}, {"exit", B_EXIT}, {"rev", B_REV}, {"len", B_LEN},
+        {"sizeof", B_SIZEOF}, {"alignof", B_ALIGNOF}, {"ptr_cast", B_PTR_CAST}
     };
     for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
         const char *nm = intern(builtins[i].name, (int)strlen(builtins[i].name));

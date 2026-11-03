@@ -1,0 +1,82 @@
+// std/io.sb - Native Win32 file I/O utilities (zero CRT dependency).
+
+const GENERIC_READ: u32          = 0x80000000
+const GENERIC_WRITE: u32         = 0x40000000
+const FILE_SHARE_READ: u32       = 1
+const CREATE_ALWAYS: u32         = 2
+const OPEN_EXISTING: u32         = 3
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80
+const INVALID_HANDLE_VALUE: isize = -1
+
+extern "kernel32.dll" {
+    fn CreateFileA(
+        lpFileName: *u8,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: usize,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: usize
+    ): isize
+    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
+    fn WriteFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
+    fn GetFileSizeEx(hFile: isize, lpFileSize: *i64): i32
+    fn CloseHandle(hObject: isize): i32
+    fn DeleteFileA(lpFileName: *u8): i32
+}
+
+// Writes `n` bytes from `data` to `path` (creating or overwriting the file).
+fn write_file_ptr(path: *u8, data: *u8, n: u32): bool {
+    var h = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    if h == INVALID_HANDLE_VALUE {
+        return false
+    }
+    defer CloseHandle(h)
+    var written: u32 = 0
+    var ok = WriteFile(h, data, n, &written, 0)
+    return ok != 0 && written == n
+}
+
+// Writes a byte slice `data[]` to `path`.
+fn write_file_bytes(path: *u8, data[]: u8): bool {
+    if len(data) == 0 {
+        return write_file_ptr(path, null, 0)
+    }
+    return write_file_ptr(path, &data[0], u32(len(data)))
+}
+
+// Returns the size in bytes of `path`, or -1 if the file cannot be opened.
+fn file_size(path: *u8): i64 {
+    var h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+    if h == INVALID_HANDLE_VALUE {
+        return -1
+    }
+    defer CloseHandle(h)
+    var sz: i64 = 0
+    if GetFileSizeEx(h, &sz) == 0 {
+        return -1
+    }
+    return sz
+}
+
+// Reads up to `len(buf)` bytes from `path` into `buf[]`. Returns bytes read, or -1 on error.
+fn read_file_into(path: *u8, buf[]: u8): i64 {
+    if len(buf) == 0 {
+        return 0
+    }
+    var h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+    if h == INVALID_HANDLE_VALUE {
+        return -1
+    }
+    defer CloseHandle(h)
+    var nread: u32 = 0
+    if ReadFile(h, &buf[0], u32(len(buf)), &nread, 0) == 0 {
+        return -1
+    }
+    return i64(nread)
+}
+
+// Deletes the file at `path`; returns true on success.
+fn delete_file(path: *u8): bool {
+    return DeleteFileA(path) != 0
+}

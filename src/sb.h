@@ -73,7 +73,7 @@ char *i128_str(i128 v, char *buf);
 typedef enum {
     T_EOF, T_TERM, T_SEMI, T_IDENT, T_INT, T_FLOAT, T_STR,
     // keywords
-    T_VAR, T_CONST, T_FN, T_STRUCT, T_ENUM, T_MATCH, T_IMPORT, T_EXTERN,
+    T_VAR, T_CONST, T_FN, T_STRUCT, T_ENUM, T_MATCH, T_DEFER, T_IMPORT, T_EXTERN,
     T_RETURN, T_IF, T_ELSE, T_LOOP, T_IN, T_BY,
     T_BREAK, T_CONTINUE, T_TRUE, T_FALSE, T_NULL,
     // punctuation
@@ -143,7 +143,7 @@ extern Type ty_isize, ty_usize, ty_f32, ty_f64;
 typedef struct Node Node;
 
 typedef enum { SYM_VAR, SYM_PARAM, SYM_CONST, SYM_FN, SYM_TYPE, SYM_BUILTIN } SymKind;
-typedef enum { B_PRINT = 1, B_EXIT, B_REV, B_LEN } BuiltinId;
+typedef enum { B_PRINT = 1, B_EXIT, B_REV, B_LEN, B_SIZEOF, B_ALIGNOF, B_PTR_CAST } BuiltinId;
 
 typedef struct Symbol {
     SymKind kind;
@@ -177,7 +177,7 @@ typedef enum {
     N_INT, N_FLOAT, N_STR, N_BOOL, N_NULL, N_IDENT, N_CALL, N_CONV, N_UNARY, N_BINARY,
     N_ADDR, N_DEREF, N_ARRAY_LIT, N_STRUCT_LIT, N_FIELD_INIT, N_INDEX, N_SLICE, N_FIELD,
     // statements
-    N_VAR, N_CONST, N_ASSIGN, N_EXPR_STMT, N_IF, N_MATCH, N_MATCH_ARM, N_BLOCK, N_RETURN,
+    N_VAR, N_CONST, N_ASSIGN, N_EXPR_STMT, N_IF, N_MATCH, N_MATCH_ARM, N_DEFER, N_BLOCK, N_RETURN,
     N_BREAK, N_CONTINUE, N_LOOP_INF, N_LOOP_COND, N_LOOP_RANGE, N_LOOP_ITER, N_LOOP_C,
     // declarations
     N_FN, N_PARAM, N_STRUCT, N_FIELD_DECL, N_ENUM, N_ENUM_VAR, N_IMPORT
@@ -230,6 +230,7 @@ struct Node {
     int slot_start, slot_end, slot_step;  // range/iter loop hidden slots
     int num_slots;                        // fn: total stack slots
     int label_break, label_continue;      // codegen
+    int defer_depth;                      // codegen: active defer count at loop entry
 };
 
 NodeVec parse(Token *toks, int count);
