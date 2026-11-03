@@ -15,7 +15,7 @@ struct Vec2 {
     y: i32
 }
 
-fn mode_weight(m: Mode): i32 {
+fn (m: Mode) weight(): i32 {
     match m {
         Mode.Fast {
             return 1
@@ -26,9 +26,13 @@ fn mode_weight(m: Mode): i32 {
     }
 }
 
-fn translate(v: *Vec2, dx: i32, dy: i32) {
+fn (v: *Vec2) translate(dx: i32, dy: i32) {
     v.x += dx
     v.y += dy
+}
+
+fn (v: Vec2) length_sq(): i32 {
+    return v.x * v.x + v.y * v.y
 }
 
 fn add(a: i32, b: i32): i32 {
@@ -83,10 +87,11 @@ fn main() {
     print(arr[3])
 
     var pt = Vec2 { x: 10, y: 20 }
-    translate(&pt, 5, -3)
+    pt.translate(5, -3)
     print(pt.x)
     print(pt.y)
-    print(mode_weight(Mode.Custom))
+    print(pt.length_sq())
+    print(Mode.Custom.weight())
 
     var raw_v = alloc(sizeof(Vec2))
     defer free_mem(raw_v)

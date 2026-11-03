@@ -234,13 +234,36 @@ static Node *parse_primary_base(Parser *p) {
     }
 }
 
-// Parses postfix field access `p.x`, indexing `a[i]`, and slicing `a[lo..hi]`.
+// Parses postfix field access `p.x`, method calls `p.foo(a, b)`, indexing `a[i]`, and slicing `a[lo..hi]`.
 static Node *parse_primary(Parser *p) {
     Node *base = parse_primary_base(p);
     for (;;) {
         if (cur(p)->kind == T_DOT) {
             Token *dot = next(p);
             Token *fid = expect(p, T_IDENT);
+            if (cur(p)->kind == T_LPAREN) {
+                next(p); // '('
+                Node *n = new_node(N_CALL, dot->pos);
+                n->lhs = base;
+                n->name = fid->name;
+                bool saved_nsl = p->no_struct_lit;
+                p->no_struct_lit = false;
+                skip_terms(p);
+                if (cur(p)->kind != T_RPAREN) {
+                    for (;;) {
+                        skip_terms(p);
+                        vec_push(n->list, parse_expr(p));
+                        skip_terms(p);
+                        if (!match(p, T_COMMA)) break;
+                        skip_terms(p);
+                        if (cur(p)->kind == T_RPAREN) break;
+                    }
+                }
+                p->no_struct_lit = saved_nsl;
+                expect(p, T_RPAREN);
+                base = n;
+                continue;
+            }
             Node *n = new_node(N_FIELD, dot->pos);
             n->lhs = base;
             n->name = fid->name;
@@ -721,9 +744,10 @@ static Node *parse_stmt(Parser *p) {
         expect_term(p);
         return n;
     }
+    case T_LPAREN:
     case T_IDENT: {
         // Labeled loop: `outer: loop ...`
-        if (peek(p, 1)->kind == T_COLON) {
+        if (t->kind == T_IDENT && peek(p, 1)->kind == T_COLON) {
             Token *lbl = next(p);
             next(p); // ':'
             skip_terms(p);
@@ -734,7 +758,7 @@ static Node *parse_stmt(Parser *p) {
             expect_term(p);
             return n;
         }
-        // Parse primary lvalue or call expression (`x`, `arr[i]`, `p.x`, `foo(a, b)`).
+        // Parse primary lvalue or call expression (`x`, `arr[i]`, `p.x`, `foo(a, b)`, `p.foo(a)`).
         Node *lhs = parse_primary(p);
         if (is_assign_op(cur(p)->kind)) {
             if (lhs->kind != N_IDENT && lhs->kind != N_INDEX && lhs->kind != N_FIELD) {
@@ -787,9 +811,35 @@ static Node *parse_block(Parser *p) {
 
 static Node *parse_fn_header(Parser *p) {
     Token *kw = expect(p, T_FN);
-    Token *id = expect(p, T_IDENT);
     Node *fn = new_node(N_FN, kw->pos);
-    fn->name = id->name;
+
+    // Optional method receiver: `fn (self: *Vec2) method(...)` or `fn (self: Vec2) method(...)`
+    const char *recv_type_name = NULL;
+    if (match(p, T_LPAREN)) {
+        skip_terms(p);
+        Token *rid = expect(p, T_IDENT);
+        Node *rparam = new_node(N_PARAM, rid->pos);
+        rparam->name = rid->name;
+        expect(p, T_COLON);
+        rparam->type_name = parse_type_spec(p, &rparam->type_pos, &rparam->decl_kind, &rparam->len_expr, &rparam->ptr_depth);
+        if (rparam->decl_kind != DECL_SCALAR || rparam->ptr_depth > 1) {
+            fatal(rparam->type_pos, "method receiver must be a struct/enum type 'T' or pointer '*T'");
+        }
+        recv_type_name = rparam->type_name;
+        vec_push(fn->list, rparam);
+        skip_terms(p);
+        expect(p, T_RPAREN);
+    }
+
+    Token *id = expect(p, T_IDENT);
+    if (recv_type_name) {
+        char mname[256];
+        int mlen = snprintf(mname, sizeof(mname), "%s.%s", recv_type_name, id->name);
+        fn->name  = intern(mname, mlen);
+        fn->name2 = id->name; // bare method name
+    } else {
+        fn->name = id->name;
+    }
 
     expect(p, T_LPAREN);
     skip_terms(p);
@@ -826,6 +876,9 @@ static Node *parse_fn(Parser *p) {
 
 static Node *parse_extern_fn(Parser *p, const char *dll_name) {
     Node *fn = parse_fn_header(p);
+    if (fn->name2) {
+        fatal(fn->pos, "extern function '%s' cannot have a method receiver", fn->name2);
+    }
     fn->is_extern = true;
     fn->dll_name  = dll_name;
     if (cur(p)->kind == T_LBRACE) {

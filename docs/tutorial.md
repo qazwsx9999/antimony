@@ -471,6 +471,30 @@ fn main() {
 }
 ```
 
+### 10.3 Methods on Structs & Enums (`fn (self: *T)` / `fn (self: T)`)
+Declare a method on any `struct` or `enum` by placing the receiver `(name: *T)` or `(name: T)` right after `fn`.
+- **Zero overhead:** Methods compile directly to static function calls with the receiver passed as the first argument.
+- **Auto-referencing & auto-dereferencing:** Calling a `*T` method on an addressable `T` variable automatically passes `&v`; calling a `T` method on a `*T` pointer automatically dereferences `*p`.
+
+```
+fn (v: *Vec2) translate(dx: i32, dy: i32) {
+    v.x += dx
+    v.y += dy
+}
+
+fn (v: Vec2) length_sq(): i32 {
+    return v.x * v.x + v.y * v.y
+}
+
+fn main() {
+    var pt = Vec2 { x: 3, y: 4 }
+    print(pt.length_sq())   // 25
+    pt.translate(10, 20)    // auto-references &pt
+    print(pt.x)             // 13
+    print(pt.y)             // 24
+}
+```
+
 ---
 
 ## 11. Enums (`enum`) & Pattern Matching (`match`)

@@ -395,6 +395,25 @@ static StructField *find_field(Type *st, const char *name) {
     return NULL;
 }
 
+// Verifies that an lvalue (`x`, `p.x`, `arr[i]`) is not rooted at a read-only
+// value parameter or range-loop variable without an intervening pointer dereference.
+static void check_lvalue_mutable(Node *lval, Pos pos) {
+    Node *base = lval;
+    while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
+        if (base->lhs->type && (base->lhs->type->kind == TY_PTR || base->lhs->type->kind == TY_SLICE)) return;
+        base = base->lhs;
+    }
+    if (base && base->kind == N_IDENT && base->sym) {
+        if (base->sym->kind == SYM_PARAM) {
+            fatal(pos, "cannot mutate or take address of read-only parameter '%s' (use a pointer parameter '*%s')",
+                  base->sym->name, base->sym->type->name);
+        }
+        if (base->sym->readonly) {
+            fatal(pos, "cannot mutate or take address of read-only loop variable '%s'", base->sym->name);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Expressions and constant folding (spec §3, §7, §8.2)
 // ---------------------------------------------------------------------------
@@ -606,6 +625,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             if (opd->is_const) {
                 fatal(n->pos, "cannot take address '&' of constant or enum variant");
             }
+            check_lvalue_mutable(opd, n->pos);
         } else {
             fatal(n->pos, "operand of '&' must be a variable, array element, struct field, or pointer dereference");
         }
@@ -1081,6 +1101,95 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     }
 
     case N_CALL: {
+        // Method call: `recv.method(arg1, arg2, ...)`
+        if (n->lhs) {
+            if (n->lhs->kind == N_IDENT) {
+                Symbol *vs = lookup(c, n->lhs->name);
+                if (vs && vs->kind == SYM_VAR && !vs->is_global && vs->var_index >= 0 &&
+                    vs->type && (vs->type->kind == TY_STRUCT || vs->type->kind == TY_ENUM)) {
+                    char mname[256];
+                    int mlen = snprintf(mname, sizeof(mname), "%s.%s", vs->type->name, n->name);
+                    Symbol *ms = lookup_in(c->global, intern(mname, mlen));
+                    if (ms && ms->kind == SYM_FN && ms->decl->list.items[0]->type->kind == TY_PTR) {
+                        c->assigned |= (1ULL << vs->var_index);
+                    }
+                }
+            }
+
+            check_expr(c, n->lhs, NULL);
+            Type *rt = n->lhs->type;
+            Type *base_t = NULL;
+            if (rt->kind == TY_STRUCT || rt->kind == TY_ENUM) {
+                base_t = rt;
+            } else if (rt->kind == TY_PTR && (rt->elem->kind == TY_STRUCT || rt->elem->kind == TY_ENUM)) {
+                base_t = rt->elem;
+            } else {
+                fatal(n->pos, "cannot call method '.%s' on type '%s' (expected struct, enum, or pointer to struct/enum)",
+                      n->name, rt->name);
+            }
+
+            char mname[256];
+            int mlen = snprintf(mname, sizeof(mname), "%s.%s", base_t->name, n->name);
+            Symbol *ms = lookup_in(c->global, intern(mname, mlen));
+            if (!ms || ms->kind != SYM_FN) {
+                fatal(n->pos, "type '%s' has no method named '%s'", base_t->name, n->name);
+            }
+
+            Node *fn = ms->decl;
+            int expected_args = fn->list.len - 1;
+            if (n->list.len != expected_args) {
+                fatal(n->pos, "method '%s.%s' expects %d argument(s), got %d",
+                      base_t->name, n->name, expected_args, n->list.len);
+            }
+
+            for (int i = 0; i < n->list.len; i++) {
+                Type *pt = fn->list.items[i + 1]->type;
+                check_expr(c, n->list.items[i], pt);
+            }
+
+            Type *recv_pt = fn->list.items[0]->type;
+            Node *recv_arg = n->lhs;
+            if (recv_pt->kind == TY_PTR && rt == base_t) {
+                if (recv_arg->is_const ||
+                    (recv_arg->kind != N_IDENT && recv_arg->kind != N_INDEX &&
+                     recv_arg->kind != N_DEREF && recv_arg->kind != N_FIELD)) {
+                    fatal(n->pos, "cannot call pointer-receiver method '%s.%s' on non-addressable '%s' value",
+                          base_t->name, n->name, base_t->name);
+                }
+                check_lvalue_mutable(recv_arg, n->pos);
+                Node *addr = xcalloc(1, sizeof(Node));
+                addr->kind = N_ADDR;
+                addr->pos  = recv_arg->pos;
+                addr->lhs  = recv_arg;
+                addr->type = recv_pt;
+                recv_arg   = addr;
+            } else if (recv_pt == base_t && rt->kind == TY_PTR) {
+                Node *deref = xcalloc(1, sizeof(Node));
+                deref->kind = N_DEREF;
+                deref->pos  = recv_arg->pos;
+                deref->lhs  = recv_arg;
+                deref->type = base_t;
+                recv_arg    = deref;
+            }
+
+            vec_push(n->list, NULL);
+            for (int i = n->list.len - 1; i > 0; i--) {
+                n->list.items[i] = n->list.items[i - 1];
+            }
+            n->list.items[0] = recv_arg;
+            n->lhs  = NULL;
+            n->name = ms->name;
+            n->sym  = ms;
+            n->type = ms->type;
+            if (expected) {
+                if (n->type == &ty_void) {
+                    fatal(n->pos, "method '%s.%s' returns no value", base_t->name, fn->name2);
+                }
+                coerce(n, expected);
+            }
+            return;
+        }
+
         Symbol *s = lookup(c, n->name);
         if (!s) fatal(n->pos, "undeclared function or type '%s'", n->name);
 
@@ -1341,6 +1450,7 @@ static void check_assign(Checker *c, Node *n) {
         if (n->lhs->is_const) {
             fatal(n->pos, "cannot assign to constant or enum variant");
         }
+        check_lvalue_mutable(n->lhs, n->pos);
         target_type = n->lhs->type;
         n->type = target_type;
         if (n->op == T_ASSIGN) {
@@ -2005,6 +2115,19 @@ Program check(NodeVec decls) {
                 if (d->is_extern && (p->type->kind == TY_SLICE || p->type->kind == TY_ARRAY || p->type->kind == TY_STRUCT)) {
                     fatal(p->type_pos, "extern function parameter '%s' cannot have type '%s' by value; pass a pointer instead",
                           p->name, p->type->name);
+                }
+            }
+            if (d->name2) {
+                Type *rt = d->list.items[0]->type;
+                Type *base_t = (rt->kind == TY_PTR) ? rt->elem : rt;
+                if (base_t->kind != TY_STRUCT && base_t->kind != TY_ENUM) {
+                    fatal(d->list.items[0]->type_pos,
+                          "methods can only be defined on struct or enum types (got '%s')", rt->name);
+                }
+                if (find_field(base_t, d->name2)) {
+                    fatal(d->pos, "method '%s' conflicts with %s '%s.%s'",
+                          d->name2, base_t->kind == TY_STRUCT ? "field" : "variant",
+                          base_t->name, d->name2);
                 }
             }
             if (d->is_extern) {

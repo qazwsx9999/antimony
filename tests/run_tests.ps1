@@ -706,4 +706,119 @@ fn main() {
 }
 "@ "1`n4`n8`n8`n16`n8`n16`n7`n42`n123456789`ntrue`n333`n8`ntrue`n-4201`ntrue`ntrue`ntrue`n4`n4`n65`n68`ntrue"
 
+# 13. Phase 8: Methods on Structs & Enums (fn (self: *T) / fn (self: T))
+Test-CompileError "method_on_prim"   "fn (x: i32) foo() {}`nfn main() {}" "methods can only be defined on struct or enum types"
+Test-CompileError "method_field_dup" "struct S { x: i32 }`nfn (s: *S) x() {}`nfn main() {}" "method 'x' conflicts with field 'S.x'"
+Test-CompileError "method_unknown"   "struct S { x: i32 }`nfn main() { var s = S { x: 1 }`ns.nope() }" "type 'S' has no method named 'nope'"
+Test-CompileError "method_lit_ptr"   "struct S { x: i32 }`nfn (s: *S) inc() { s.x += 1 }`nfn main() { (S { x: 1 }).inc() }" "cannot call pointer-receiver method 'S.inc' on non-addressable 'S' value"
+Test-CompileError "method_val_mut"   "struct S { x: i32 }`nfn (s: S) bad() { s.x = 2 }`nfn main() {}" "cannot mutate or take address of read-only parameter 's'"
+
+Test-RunOk "methods_struct_and_enum" @"
+import "std/mem.sb"
+
+enum State {
+    Idle
+    Running
+    Done
+}
+
+fn (s: State) weight(): i32 {
+    match s {
+        State.Idle    { return 1 }
+        State.Running { return 10 }
+        State.Done    { return 100 }
+    }
+}
+
+fn (s: *State) advance() {
+    match *s {
+        State.Idle    { *s = State.Running }
+        State.Running { *s = State.Done }
+        State.Done    { *s = State.Idle }
+    }
+}
+
+struct Vec2 {
+    x: i32
+    y: i32
+}
+
+struct Entity {
+    id: i32
+    pos: Vec2
+}
+
+fn (v: *Vec2) translate(dx: i32, dy: i32) {
+    v.x += dx
+    v.y += dy
+}
+
+fn (v: *Vec2) add_xy(dx: i32, dy: i32): *Vec2 {
+    v.x += dx
+    v.y += dy
+    return v
+}
+
+fn (v: Vec2) length_sq(): i32 {
+    return v.x * v.x + v.y * v.y
+}
+
+fn (v: Vec2) dot(other: Vec2): i32 {
+    return v.x * other.x + v.y * other.y
+}
+
+fn main() {
+    var v = Vec2 { x: 3, y: 4 }
+    print(v.length_sq())
+
+    // Auto-reference value `v` to `*Vec2`
+    v.translate(1, -2)
+    print(v.x)
+    print(v.y)
+
+    // Auto-dereference pointer `pv` to `Vec2`
+    var pv: *Vec2 = &v
+    print(pv.length_sq())
+    pv.translate(2, 1)
+    print(v.x)
+    print(v.y)
+
+    // Chained method calls returning `*Vec2`
+    v.add_xy(4, 3).add_xy(10, 20)
+    print(v.x)
+    print(v.y)
+
+    // Struct value argument to method
+    var w = Vec2 { x: 2, y: 3 }
+    print(v.dot(w))
+
+    // Nested field and array element method calls
+    var e = Entity { id: 1, pos: Vec2 { x: 10, y: 20 } }
+    e.pos.translate(5, 6)
+    print(e.pos.x)
+    print(e.pos.y)
+
+    var arr[2]: Vec2 = [Vec2 { x: 1, y: 2 }, Vec2 { x: 7, y: 8 }]
+    arr[1].translate(3, 2)
+    print(arr[1].length_sq())
+
+    // Enum methods (on variants, values, and pointers)
+    var st = State.Idle
+    print(st.weight())
+    st.advance()
+    print(st.weight())
+    st.advance()
+    print(st.weight())
+    print(State.Running.weight())
+
+    // Arena methods from std/mem.sb (including uninitialized struct receiver init)
+    var arena: Arena
+    arena.init(512)
+    defer arena.free()
+    var p = ptr_cast(*i32, arena.alloc(sizeof(i32), alignof(i32)))
+    *p = 777
+    print(*p)
+}
+"@ "25`n4`n2`n20`n6`n3`n20`n26`n118`n15`n26`n200`n1`n10`n100`n10`n777"
+
 Write-Host "`nAll tests passed."

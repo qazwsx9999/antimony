@@ -92,3 +92,20 @@ fn arena_free(a: *Arena) {
     a.cap  = 0
     a.used = 0
 }
+
+fn (a: *Arena) init(capacity: usize) {
+    arena_init(a, capacity)
+}
+
+fn (a: *Arena) alloc(size: usize, align: usize): *u8 {
+    return arena_alloc(a, size, align)
+}
+
+fn (a: *Arena) reset() {
+    arena_reset(a)
+}
+
+fn (a: *Arena) free() {
+    arena_free(a)
+}
+
