@@ -3,6 +3,36 @@
 
 const char *g_filename = "<input>";
 const char *g_source = "";
+int g_file_id = 0;
+
+typedef struct {
+    const char *filename;
+    const char *source;
+} SourceFile;
+
+static VEC(SourceFile) g_files;
+
+int register_source_file(const char *filename, const char *source) {
+    int id = g_files.len;
+    SourceFile sf = {filename, source};
+    vec_push(g_files, sf);
+    g_filename = filename;
+    g_source = source;
+    g_file_id = id;
+    return id;
+}
+
+const char *file_name_of(Pos pos) {
+    if (pos.file_id >= 0 && pos.file_id < g_files.len)
+        return g_files.items[pos.file_id].filename;
+    return g_filename;
+}
+
+const char *file_source_of(Pos pos) {
+    if (pos.file_id >= 0 && pos.file_id < g_files.len)
+        return g_files.items[pos.file_id].source;
+    return g_source;
+}
 
 void *xmalloc(size_t n) {
     void *p = malloc(n ? n : 1);
@@ -88,16 +118,18 @@ _Noreturn void die(const char *fmt, ...) {
 }
 
 _Noreturn void fatal(Pos pos, const char *fmt, ...) {
+    const char *fname = file_name_of(pos);
+    const char *fsrc  = file_source_of(pos);
     va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "%s:%d:%d: error: ", g_filename, pos.line, pos.col);
+    fprintf(stderr, "%s:%d:%d: error: ", fname, pos.line, pos.col);
     vfprintf(stderr, fmt, ap);
     fprintf(stderr, "\n");
     va_end(ap);
 
     // Print the offending source line with a caret.
-    if (g_source && pos.line > 0) {
-        const char *p = g_source;
+    if (fsrc && pos.line > 0) {
+        const char *p = fsrc;
         int line = 1;
         while (*p && line < pos.line) {
             if (*p++ == '\n') line++;

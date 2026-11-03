@@ -46,11 +46,16 @@ void buf_align(Buf *b, size_t a);
 void buf_put_u32(Buf *b, size_t off, uint32_t v);
 
 typedef struct {
-    int line, col;
+    int line, col, file_id;
 } Pos;
 
 extern const char *g_filename;
 extern const char *g_source;
+extern int g_file_id;
+
+int register_source_file(const char *filename, const char *source);
+const char *file_name_of(Pos pos);
+const char *file_source_of(Pos pos);
 
 _Noreturn void fatal(Pos pos, const char *fmt, ...);
 _Noreturn void die(const char *fmt, ...);
@@ -68,7 +73,8 @@ char *i128_str(i128 v, char *buf);
 typedef enum {
     T_EOF, T_TERM, T_SEMI, T_IDENT, T_INT, T_FLOAT, T_STR,
     // keywords
-    T_VAR, T_CONST, T_FN, T_STRUCT, T_RETURN, T_IF, T_ELSE, T_LOOP, T_IN, T_BY,
+    T_VAR, T_CONST, T_FN, T_STRUCT, T_IMPORT, T_EXTERN,
+    T_RETURN, T_IF, T_ELSE, T_LOOP, T_IN, T_BY,
     T_BREAK, T_CONTINUE, T_TRUE, T_FALSE, T_NULL,
     // punctuation
     T_LPAREN, T_RPAREN, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET,
@@ -158,6 +164,8 @@ typedef struct Symbol {
     bool addr_taken;     // local var: address taken (&x) -> cannot live in register
     int use_score;       // loop-weighted reference count for register allocation
     int hw_reg;          // allocated callee-saved register (RBX, R12..R15), or -1 if stack
+    bool is_extern;      // fn: imported from Windows DLL
+    int iat_slot;        // extern fn: slot index in PE32+ Import Address Table
 } Symbol;
 
 // ---------------------------------------------------------------------------
@@ -172,7 +180,7 @@ typedef enum {
     N_VAR, N_CONST, N_ASSIGN, N_EXPR_STMT, N_IF, N_BLOCK, N_RETURN,
     N_BREAK, N_CONTINUE, N_LOOP_INF, N_LOOP_COND, N_LOOP_RANGE, N_LOOP_ITER, N_LOOP_C,
     // declarations
-    N_FN, N_PARAM, N_STRUCT, N_FIELD_DECL
+    N_FN, N_PARAM, N_STRUCT, N_FIELD_DECL, N_IMPORT
 } NodeKind;
 
 typedef enum { DECL_SCALAR = 0, DECL_ARRAY, DECL_SLICE } DeclKind;
@@ -204,6 +212,8 @@ struct Node {
     Node *lo, *hi, *by;     // range loop / slice bounds
     bool rev;
     bool implicit_slice;    // coercion from fixed array `[N]T` to slice `[]T`
+    bool is_extern;         // N_FN: declared with `extern "dll"`
+    const char *dll_name;   // N_FN: interned DLL name for extern functions
     const char *label;      // loop label
 
     const char *str;        // string literal
@@ -229,9 +239,19 @@ NodeVec parse(Token *toks, int count);
 // ---------------------------------------------------------------------------
 
 typedef struct {
+    const char *dll_name;
+    VEC(const char *) funcs;
+    int first_iat_slot;
+} DllImport;
+
+typedef VEC(DllImport) DllImportVec;
+
+typedef struct {
     NodeVec fns;            // checked function declarations
     VEC(Symbol *) globals;  // global variables, in declaration order
     Symbol *main_fn;
+    DllImportVec dll_imports;
+    int total_iat_slots;
 } Program;
 
 Program check(NodeVec decls);
@@ -339,6 +359,8 @@ typedef struct {
     RipFixup *fixups;
     int nfixups;
     uint32_t entry;       // entry point offset in .text
+    DllImportVec dll_imports;
+    int total_iat_slots;
 } Image;
 
 Image codegen(Program *prog, bool release);

@@ -11,7 +11,7 @@ function Test-CompileError([string]$name, [string]$code, [string]$expectSubstr) 
     if ($LASTEXITCODE -eq 0) {
         throw "FAIL [$name]: expected compile error, but succeeded"
     }
-    if ($out -notlike "*$expectSubstr*") {
+    if (!$out.Contains($expectSubstr)) {
         throw "FAIL [$name]: expected '$expectSubstr' in error output, got:`n$out"
     }
     Write-Host "PASS [compile-error] $name"
@@ -28,7 +28,7 @@ function Test-RunTrap([string]$name, [string]$code, [string]$expectSubstr, [swit
     if ($LASTEXITCODE -eq 0) {
         throw "FAIL [$name]: expected runtime trap, but exited with 0"
     }
-    if ($out -notlike "*$expectSubstr*") {
+    if (!$out.Contains($expectSubstr)) {
         throw "FAIL [$name]: expected '$expectSubstr' in panic output, got:`n$out"
     }
     Write-Host "PASS [runtime-trap]  $name"
@@ -370,5 +370,75 @@ fn main() {
     print(fib_iter(20))
 }
 "@ "-564`n51`n153`n-46`n213`n6765"
+
+# 10. Phase 5: Multi-file imports & Windows DLL FFI (extern fn)
+Test-CompileError "import_missing"    "import `"no_such_module_xyz.sb`"`nfn main() {}" "cannot open imported module"
+Test-CompileError "extern_with_body"  "extern `"kernel32.dll`" fn Foo() {}`nfn main() {}" "cannot have a body"
+Test-CompileError "extern_slice_param" "extern `"kernel32.dll`" fn Foo(s[]: i32)`nfn main() {}" "cannot have type '[]i32' by value"
+
+Test-RunOk "extern_win32_and_msvcrt" @"
+extern "kernel32.dll" fn GetCurrentProcessId(): u32
+extern "kernel32.dll" fn GetTickCount64(): u64
+
+extern "msvcrt.dll" {
+    fn abs(x: i32): i32
+    fn sqrt(x: f64): f64
+    fn pow(x: f64, y: f64): f64
+    fn strlen(s: *u8): usize
+    fn strcmp(a: *u8, b: *u8): i32
+}
+
+fn main() {
+    var pid = GetCurrentProcessId()
+    var ticks = GetTickCount64()
+    print(pid > u32(0))
+    print(ticks > u64(0))
+    print(abs(-42))
+    print(sqrt(2.0))
+    print(pow(3.0, 4.0))
+    print(strlen("Antimony"))
+    print(strcmp("abc", "abc") == 0)
+    print(strcmp("abc", "abd") < 0)
+}
+"@ "true`ntrue`n42`n1.414214`n81.0`n8`ntrue`ntrue"
+
+# Multi-file diamond/circular import test
+Set-Content -Path (Join-Path $tmp "mod_math.sb") -Value @"
+import "mod_geom.sb"
+
+const SCALE = 10
+
+extern "msvcrt.dll" fn abs(x: i32): i32
+
+fn scaled_abs(v: i32): i32 {
+    return abs(v) * SCALE
+}
+"@ -Encoding UTF8
+
+Set-Content -Path (Join-Path $tmp "mod_geom.sb") -Value @"
+import "mod_math"
+
+struct Box {
+    w: i32
+    h: i32
+}
+
+extern "msvcrt.dll" fn abs(x: i32): i32
+
+fn box_area(b: *Box): i32 {
+    return abs(b.w) * abs(b.h)
+}
+"@ -Encoding UTF8
+
+Test-RunOk "multi_file_imports" @"
+import "mod_math.sb"
+import "mod_geom.sb"
+
+fn main() {
+    var b = Box { w: -6, h: 7 }
+    print(box_area(&b))
+    print(scaled_abs(-9))
+}
+"@ "42`n90"
 
 Write-Host "`nAll tests passed."

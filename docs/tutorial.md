@@ -473,19 +473,66 @@ fn main() {
 
 ---
 
-## 11. Built-in Functions
+## 11. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
 
-| Function | Description |
-|---|---|
-| `print(x)` | Prints any integer, `bool`, or `str` followed by a newline |
-| `len(x)` | Returns the length of an array, slice, or string |
-| `exit(code: i32)` | Terminates the program immediately with exit status `code` |
-| `rev(a..b [by s])` | Reverses a range inside a `loop` header |
-| `T(x)` | Explicitly converts `x` to scalar integer type `T` (e.g. `i64(x)`, `u8(x)`) |
+### 11.1 Splitting Code Across Files (`import`)
+Use `import "path.sb"` at the top level to include another Antimony source file (resolved relative to the importing file's directory). Imports are automatically deduplicated, so diamond or circular imports are safe:
+
+```
+// math_utils.sb
+const SCALE = 10
+
+fn scale(x: i32): i32 {
+    return x * SCALE
+}
+```
+
+```
+// main.sb
+import "math_utils.sb"
+
+fn main() {
+    print(scale(7))     // 70
+}
+```
+
+### 11.2 Calling Windows DLLs Directly (`extern`)
+Antimony emits imported functions directly into the PE32+ Import Table—no C compiler, header files, or `.lib` import libraries needed. You can declare a single `extern` function or group multiple imports from the same DLL:
+
+```
+// Single import
+extern "kernel32.dll" fn GetTickCount64(): u64
+
+// Block import from msvcrt.dll
+extern "msvcrt.dll" {
+    fn sqrt(x: f64): f64
+    fn pow(x: f64, y: f64): f64
+    fn strlen(s: *u8): usize
+}
+
+fn main() {
+    print(GetTickCount64() > u64(0))    // true
+    print(sqrt(2.0))                    // 1.414214
+    print(pow(3.0, 4.0))                // 81.0
+    print(strlen("Antimony"))           // 8 (string literals coerce to *u8 C strings)
+}
+```
 
 ---
 
-## 12. Complete Example Program
+## 12. Built-in Functions
+
+| Function | Description |
+|---|---|
+| `print(x)` | Prints any integer, float (`f32`/`f64`), pointer, `bool`, or `str` followed by a newline |
+| `len(x)` | Returns the length of an array, slice, or string |
+| `exit(code: i32)` | Terminates the program immediately with exit status `code` |
+| `rev(a..b [by s])` | Reverses a range inside a `loop` header |
+| `T(x)` | Explicitly converts `x` to scalar integer or float type `T` (e.g. `i64(x)`, `f64(x)`, `u8(x)`) |
+
+---
+
+## 13. Complete Example Program
 
 See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony, or try this prime-counting benchmark:
 

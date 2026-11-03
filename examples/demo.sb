@@ -1,5 +1,7 @@
 const LIMIT = 10
 
+extern "msvcrt.dll" fn sqrt(x: f64): f64
+
 struct Vec2 {
     x: i32
     y: i32
@@ -69,6 +71,7 @@ fn main() {
     var radius = 2.5
     var area = 3.14159265 * radius * radius
     print(area)
+    print(sqrt(2.0))
 
     var total: i64 = 3_000_000_000
     var count = 0

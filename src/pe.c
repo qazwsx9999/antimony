@@ -32,17 +32,15 @@ void write_pe(const char *path, Image *img) {
     // -----------------------------------------------------------------------
     // 1. Build .rdata: Import Directory + ILT + IAT + hint/names + strings
     // -----------------------------------------------------------------------
-    // Layout inside .rdata (offsets from start of .rdata):
-    //   0x00 .. 0x28 : IMAGE_IMPORT_DESCRIPTOR[2] (kernel32 + null terminator)
-    //   0x28 .. 0x48 : ILT (3 x 8-byte entries + 8-byte null)
-    //   0x48 .. 0x68 : IAT (3 x 8-byte entries + 8-byte null)
-    //   0x68 ..      : DLL name ("KERNEL32.dll\0") + Hint/Name entries
-    //   aligned      : string literals from codegen
+    int num_dlls    = img->dll_imports.len;
+    int total_slots = img->total_iat_slots;
+
     const uint32_t IDATA_OFF = 0x00;
-    const uint32_t IDATA_SZ  = 40;
-    const uint32_t ILT_OFF   = 0x28;
-    const uint32_t IAT_OFF   = 0x48;
-    const uint32_t IAT_SZ    = (IMP_COUNT + 1) * 8;
+    const uint32_t IDATA_SZ  = (uint32_t)((num_dlls + 1) * 20);
+    const uint32_t ILT_OFF   = align_up(IDATA_OFF + IDATA_SZ, 8);
+    const uint32_t IAT_SZ    = (uint32_t)(total_slots * 8);
+    const uint32_t IAT_OFF   = ILT_OFF + IAT_SZ;
+    const uint32_t NAMES_OFF = IAT_OFF + IAT_SZ;
 
     uint32_t text_rva  = SECT_ALIGN; // 0x1000
     uint32_t text_vsz  = (uint32_t)img->text.len ? (uint32_t)img->text.len : 1;
@@ -51,42 +49,40 @@ void write_pe(const char *path, Image *img) {
     uint32_t rdata_rva = text_rva + align_up(text_vsz, SECT_ALIGN);
 
     Buf rdata = {0};
-    buf_zero(&rdata, 0x68); // reserve space for descriptors, ILT, IAT
+    buf_zero(&rdata, NAMES_OFF); // reserve space for descriptors, ILT, IAT
 
-    uint32_t dll_name_off = (uint32_t)rdata.len;
-    buf_bytes(&rdata, "KERNEL32.dll\0", 13);
-    buf_align(&rdata, 2);
-
-    static const char *imp_names[IMP_COUNT] = {
-        "GetStdHandle",
-        "WriteFile",
-        "ExitProcess",
-    };
-    uint32_t hn_off[IMP_COUNT];
-    for (int i = 0; i < IMP_COUNT; i++) {
-        hn_off[i] = (uint32_t)rdata.len;
-        buf_u16(&rdata, 0); // Hint
-        buf_bytes(&rdata, imp_names[i], strlen(imp_names[i]) + 1);
+    for (int d = 0; d < num_dlls; d++) {
+        DllImport *di = &img->dll_imports.items[d];
+        uint32_t dll_name_off = (uint32_t)rdata.len;
+        buf_bytes(&rdata, di->dll_name, strlen(di->dll_name) + 1);
         buf_align(&rdata, 2);
+
+        for (int f = 0; f < di->funcs.len; f++) {
+            const char *fn_name = di->funcs.items[f];
+            uint32_t hn_off = (uint32_t)rdata.len;
+            buf_u16(&rdata, 0); // Hint
+            buf_bytes(&rdata, fn_name, strlen(fn_name) + 1);
+            buf_align(&rdata, 2);
+
+            int slot = di->first_iat_slot + f;
+            uint64_t rva = (uint64_t)(rdata_rva + hn_off);
+            memcpy(rdata.data + ILT_OFF + slot * 8, &rva, 8);
+            memcpy(rdata.data + IAT_OFF + slot * 8, &rva, 8);
+        }
+
+        uint32_t desc_off = IDATA_OFF + (uint32_t)(d * 20);
+        uint32_t first_slot_bytes = (uint32_t)(di->first_iat_slot * 8);
+        buf_put_u32(&rdata, desc_off + 0,  rdata_rva + ILT_OFF + first_slot_bytes); // OriginalFirstThunk
+        buf_put_u32(&rdata, desc_off + 4,  0);                                      // TimeDateStamp
+        buf_put_u32(&rdata, desc_off + 8,  0);                                      // ForwarderChain
+        buf_put_u32(&rdata, desc_off + 12, rdata_rva + dll_name_off);               // Name
+        buf_put_u32(&rdata, desc_off + 16, rdata_rva + IAT_OFF + first_slot_bytes); // FirstThunk
     }
 
     buf_align(&rdata, 8);
     uint32_t strings_off = (uint32_t)rdata.len;
     buf_bytes(&rdata, img->strings.data, img->strings.len);
     if (rdata.len == strings_off) buf_u8(&rdata, 0);
-
-    // Fill in the import descriptor and lookup tables now that offsets are known.
-    buf_put_u32(&rdata, IDATA_OFF + 0,  rdata_rva + ILT_OFF);      // OriginalFirstThunk
-    buf_put_u32(&rdata, IDATA_OFF + 4,  0);                        // TimeDateStamp
-    buf_put_u32(&rdata, IDATA_OFF + 8,  0);                        // ForwarderChain
-    buf_put_u32(&rdata, IDATA_OFF + 12, rdata_rva + dll_name_off); // Name
-    buf_put_u32(&rdata, IDATA_OFF + 16, rdata_rva + IAT_OFF);      // FirstThunk
-
-    for (int i = 0; i < IMP_COUNT; i++) {
-        uint64_t rva = (uint64_t)(rdata_rva + hn_off[i]);
-        memcpy(rdata.data + ILT_OFF + i * 8, &rva, 8);
-        memcpy(rdata.data + IAT_OFF + i * 8, &rva, 8);
-    }
 
     uint32_t rdata_vsz = (uint32_t)rdata.len;
     uint32_t rdata_raw = align_up(rdata_vsz, FILE_ALIGN);

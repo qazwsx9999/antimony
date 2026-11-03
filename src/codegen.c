@@ -44,7 +44,7 @@ static void emit_trap_at(CG *cg, Pos pos, const char *reason) {
     int ok = x_label();
     char msg[512];
     int len = snprintf(msg, sizeof(msg), "%s:%d:%d: runtime panic: %s\n",
-                       g_filename, pos.line, pos.col, reason);
+                       file_name_of(pos), pos.line, pos.col, reason);
     if (len < 0) len = 0;
     if (len >= (int)sizeof(msg)) len = (int)sizeof(msg) - 1;
     uint32_t off = add_string(cg, msg, len);
@@ -1104,6 +1104,9 @@ static void gen_expr(CG *cg, Node *n) {
             Type *pt = n->sym->decl->list.items[i]->type;
             if (i < 4) {
                 pop_temp(cg, arg_slots[i], arg_regs[i]);
+                if (n->sym->is_extern && pt->kind == TY_FLOAT) {
+                    x_movq_xmm_gpr(i, arg_regs[i]);
+                }
             } else {
                 pop_temp(cg, arg_slots[i], RAX);
                 x_store(RSP, 32 + (i - 4) * 8, RAX);
@@ -1113,7 +1116,21 @@ static void gen_expr(CG *cg, Node *n) {
             }
         }
         free(arg_slots);
-        x_call(n->sym->label);
+        if (n->sym->is_extern) {
+            x_call_import(n->sym->iat_slot);
+            if (n->type == &ty_f64) {
+                x_movq_gpr_xmm(RAX, 0);
+            } else if (n->type == &ty_f32) {
+                x_movq_gpr_xmm(RAX, 0);
+                x_mov_rr(0, RAX, RAX);
+            } else if (n->type->kind == TY_INT) {
+                normalize_rax(n->type);
+            } else if (n->type == &ty_bool) {
+                x_movzx8(RAX, RAX);
+            }
+        } else {
+            x_call(n->sym->label);
+        }
         return;
     }
 
@@ -2132,12 +2149,14 @@ Image codegen(Program *prog, bool release) {
     x_resolve_labels();
 
     Image img = {0};
-    img.text      = A.code;
-    img.strings   = cg.strings;
-    img.data      = cg.data;
-    img.data_size = (uint32_t)cg.data.len;
-    img.fixups    = A.rip.items;
-    img.nfixups   = A.rip.len;
-    img.entry     = entry;
+    img.text            = A.code;
+    img.strings         = cg.strings;
+    img.data            = cg.data;
+    img.data_size       = (uint32_t)cg.data.len;
+    img.fixups          = A.rip.items;
+    img.nfixups         = A.rip.len;
+    img.entry           = entry;
+    img.dll_imports     = prog->dll_imports;
+    img.total_iat_slots = prog->total_iat_slots;
     return img;
 }

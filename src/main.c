@@ -8,21 +8,122 @@
 #include <windows.h>
 #endif
 
-static char *read_entire_file(const char *path) {
+static char *read_entire_file_or_null(const char *path) {
     FILE *fp = fopen(path, "rb");
-    if (!fp) die("cannot open '%s'", path);
+    if (!fp) return NULL;
     fseek(fp, 0, SEEK_END);
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    if (sz < 0) die("cannot read '%s'", path);
+    if (sz < 0) {
+        fclose(fp);
+        return NULL;
+    }
     char *buf = xmalloc((size_t)sz + 1);
     if (sz > 0 && fread(buf, 1, (size_t)sz, fp) != (size_t)sz) {
         fclose(fp);
-        die("failed to read '%s'", path);
+        free(buf);
+        return NULL;
     }
     fclose(fp);
     buf[sz] = '\0';
     return buf;
+}
+
+static VEC(const char *) g_loaded_files;
+
+static bool is_already_loaded(const char *canon) {
+    for (int i = 0; i < g_loaded_files.len; i++) {
+        if (_stricmp(g_loaded_files.items[i], canon) == 0) return true;
+    }
+    return false;
+}
+
+static void extract_dir(const char *path, char *dir_out, size_t cap) {
+    const char *s1 = strrchr(path, '/');
+    const char *s2 = strrchr(path, '\\');
+    const char *sep = s1;
+    if (s2 && (!sep || s2 > sep)) sep = s2;
+    if (!sep) {
+        dir_out[0] = '\0';
+        return;
+    }
+    size_t len = (size_t)(sep - path + 1);
+    if (len >= cap) len = cap - 1;
+    memcpy(dir_out, path, len);
+    dir_out[len] = '\0';
+}
+
+static void load_module_recursive(const char *raw_path, const char *base_dir,
+                                  bool is_import, Pos import_pos, NodeVec *all_decls) {
+    char candidate[1024];
+    bool is_abs = (raw_path[0] == '/' || raw_path[0] == '\\' ||
+                   (raw_path[0] && raw_path[1] == ':'));
+    if (!is_abs && base_dir && base_dir[0]) {
+        snprintf(candidate, sizeof(candidate), "%s%s", base_dir, raw_path);
+    } else {
+        snprintf(candidate, sizeof(candidate), "%s", raw_path);
+    }
+
+    char *src = read_entire_file_or_null(candidate);
+    if (!src) {
+        // If no '.sb' extension was given, try appending '.sb'.
+        size_t clen = strlen(candidate);
+        if (clen < 3 || _stricmp(candidate + clen - 3, ".sb") != 0) {
+            char with_ext[1032];
+            snprintf(with_ext, sizeof(with_ext), "%s.sb", candidate);
+            src = read_entire_file_or_null(with_ext);
+            if (src) snprintf(candidate, sizeof(candidate), "%s", with_ext);
+        }
+    }
+    if (!src) {
+        if (is_import) {
+            fatal(import_pos, "cannot open imported module '%s'", raw_path);
+        } else {
+            die("cannot open '%s'", raw_path);
+        }
+    }
+
+    char full_buf[1024];
+#ifdef _WIN32
+    const char *canon_str = _fullpath(full_buf, candidate, sizeof(full_buf)) ? full_buf : candidate;
+#else
+    const char *canon_str = candidate;
+#endif
+    const char *canon = intern(canon_str, (int)strlen(canon_str));
+    if (is_already_loaded(canon)) {
+        free(src);
+        return;
+    }
+    vec_push(g_loaded_files, canon);
+
+    const char *disp_name = intern(candidate, (int)strlen(candidate));
+    int saved_file_id = g_file_id;
+    const char *saved_filename = g_filename;
+    const char *saved_source = g_source;
+
+    register_source_file(disp_name, src);
+
+    int ntoks = 0;
+    Token *toks = lex(src, &ntoks);
+    NodeVec file_decls = parse(toks, ntoks);
+    free(toks);
+
+    char cur_dir[1024];
+    extract_dir(candidate, cur_dir, sizeof(cur_dir));
+
+    for (int i = 0; i < file_decls.len; i++) {
+        Node *d = file_decls.items[i];
+        if (d->kind == N_IMPORT) {
+            load_module_recursive(d->str, cur_dir, true, d->pos, all_decls);
+        } else {
+            vec_push(*all_decls, d);
+        }
+    }
+    free(file_decls.items);
+
+    g_file_id = saved_file_id;
+    g_filename = saved_filename;
+    g_source = saved_source;
 }
 
 static char *default_output_path(const char *input) {
@@ -80,12 +181,9 @@ int main(int argc, char **argv) {
     QueryPerformanceCounter(&t0);
 #endif
 
-    g_filename = input;
-    g_source = read_entire_file(input);
-
-    int ntoks = 0;
-    Token *toks = lex(g_source, &ntoks);
-    NodeVec decls = parse(toks, ntoks);
+    NodeVec decls = {0};
+    Pos root_pos = {1, 1, 0};
+    load_module_recursive(input, "", false, root_pos, &decls);
     Program prog = check(decls);
     Image img = codegen(&prog, release);
     write_pe(output, &img);

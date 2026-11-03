@@ -35,6 +35,7 @@ static bool triggers_term(TokKind k) {
 static TokKind lookup_keyword(const char *s, int len) {
     static const struct { const char *kw; TokKind kind; } tab[] = {
         {"var", T_VAR}, {"const", T_CONST}, {"fn", T_FN}, {"struct", T_STRUCT},
+        {"import", T_IMPORT}, {"extern", T_EXTERN},
         {"return", T_RETURN}, {"if", T_IF}, {"else", T_ELSE}, {"loop", T_LOOP},
         {"in", T_IN}, {"by", T_BY}, {"break", T_BREAK}, {"continue", T_CONTINUE},
         {"true", T_TRUE}, {"false", T_FALSE}, {"null", T_NULL},
@@ -58,7 +59,7 @@ Token *lex(const char *src, int *count) {
 #define ADV()         do { if (*p == '\n') { line++; col = 1; } else { col++; } p++; } while (0)
 
     while (*p) {
-        Pos pos = {line, col};
+        Pos pos = {line, col, g_file_id};
         char c = *p;
 
         if (c == ' ' || c == '\t' || c == '\r') {
@@ -285,7 +286,7 @@ Token *lex(const char *src, int *count) {
         PUSH(single, pos);
     }
 
-    Pos end_pos = {line, col};
+    Pos end_pos = {line, col, g_file_id};
     if (out.len > 0 && triggers_term(out.items[out.len - 1].kind)) {
         PUSH(T_TERM, end_pos);
     }
@@ -331,6 +332,8 @@ const char *tok_name(TokKind k) {
     case T_CONST: return "'const'";
     case T_FN: return "'fn'";
     case T_STRUCT: return "'struct'";
+    case T_IMPORT: return "'import'";
+    case T_EXTERN: return "'extern'";
     case T_RETURN: return "'return'";
     case T_IF: return "'if'";
     case T_ELSE: return "'else'";

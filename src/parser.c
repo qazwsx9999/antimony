@@ -732,7 +732,7 @@ static Node *parse_block(Parser *p) {
     return b;
 }
 
-static Node *parse_fn(Parser *p) {
+static Node *parse_fn_header(Parser *p) {
     Token *kw = expect(p, T_FN);
     Token *id = expect(p, T_IDENT);
     Node *fn = new_node(N_FN, kw->pos);
@@ -761,9 +761,38 @@ static Node *parse_fn(Parser *p) {
     if (match(p, T_COLON)) {
         fn->type_name = parse_type_spec(p, &fn->type_pos, &fn->decl_kind, &fn->len_expr, &fn->ptr_depth);
     }
+    return fn;
+}
+
+static Node *parse_fn(Parser *p) {
+    Node *fn = parse_fn_header(p);
     fn->body = parse_block(p);
     expect_term(p);
     return fn;
+}
+
+static Node *parse_extern_fn(Parser *p, const char *dll_name) {
+    Node *fn = parse_fn_header(p);
+    fn->is_extern = true;
+    fn->dll_name  = dll_name;
+    if (cur(p)->kind == T_LBRACE) {
+        fatal(cur(p)->pos, "extern function '%s' cannot have a body", fn->name);
+    }
+    expect_term(p);
+    return fn;
+}
+
+static Node *parse_import(Parser *p) {
+    Token *kw = expect(p, T_IMPORT);
+    Token *s  = expect(p, T_STR);
+    if (s->str_len == 0) {
+        fatal(s->pos, "import path cannot be empty");
+    }
+    expect_term(p);
+    Node *n = new_node(N_IMPORT, kw->pos);
+    n->str     = intern(s->str, s->str_len);
+    n->str_len = s->str_len;
+    return n;
 }
 
 static Node *parse_struct(Parser *p) {
@@ -798,7 +827,27 @@ NodeVec parse(Token *toks, int count) {
     skip_terms(&p);
     while (cur(&p)->kind != T_EOF) {
         Token *t = cur(&p);
-        if (t->kind == T_FN) {
+        if (t->kind == T_IMPORT) {
+            vec_push(decls, parse_import(&p));
+        } else if (t->kind == T_EXTERN) {
+            next(&p); // consume 'extern'
+            Token *dll_tok = expect(&p, T_STR);
+            if (dll_tok->str_len == 0) {
+                fatal(dll_tok->pos, "extern DLL name cannot be empty");
+            }
+            const char *dll_name = intern(dll_tok->str, dll_tok->str_len);
+            if (match(&p, T_LBRACE)) {
+                skip_terms(&p);
+                while (cur(&p)->kind != T_RBRACE && cur(&p)->kind != T_EOF) {
+                    vec_push(decls, parse_extern_fn(&p, dll_name));
+                    skip_terms(&p);
+                }
+                expect(&p, T_RBRACE);
+                expect_term(&p);
+            } else {
+                vec_push(decls, parse_extern_fn(&p, dll_name));
+            }
+        } else if (t->kind == T_FN) {
             vec_push(decls, parse_fn(&p));
         } else if (t->kind == T_STRUCT) {
             vec_push(decls, parse_struct(&p));
@@ -811,7 +860,7 @@ NodeVec parse(Token *toks, int count) {
             expect_term(&p);
             vec_push(decls, n);
         } else {
-            fatal(t->pos, "expected 'fn', 'var', or 'const' at top level, got %s", tok_name(t->kind));
+            fatal(t->pos, "expected 'import', 'extern', 'fn', 'struct', 'var', or 'const' at top level, got %s", tok_name(t->kind));
         }
         skip_terms(&p);
     }

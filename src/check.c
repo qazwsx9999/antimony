@@ -345,6 +345,12 @@ static void coerce(Node *n, Type *target) {
         n->type = target;
         return;
     }
+    // `str` coerces to `*u8` or `*i8` (null-terminated C string pointer for FFI).
+    if (target->kind == TY_PTR && (target->elem == &ty_u8 || target->elem == &ty_i8) &&
+        n->type == &ty_str) {
+        n->type = target;
+        return;
+    }
     if (n->type == &ty_untyped_float) {
         if (target->kind != TY_FLOAT) {
             fatal(n->pos, "cannot use float constant as '%s'", target->name);
@@ -1592,7 +1598,7 @@ static void register_builtins(Checker *c) {
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
         Type *t = types[i];
         t->name = intern(t->name, (int)strlen(t->name));
-        Symbol *s = define(c, SYM_TYPE, t->name, t, (Pos){0, 0});
+        Symbol *s = define(c, SYM_TYPE, t->name, t, (Pos){0, 0, 0});
         (void)s;
     }
     struct { const char *name; int id; } builtins[] = {
@@ -1600,9 +1606,44 @@ static void register_builtins(Checker *c) {
     };
     for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
         const char *nm = intern(builtins[i].name, (int)strlen(builtins[i].name));
-        Symbol *s = define(c, SYM_BUILTIN, nm, &ty_void, (Pos){0, 0});
+        Symbol *s = define(c, SYM_BUILTIN, nm, &ty_void, (Pos){0, 0, 0});
         s->builtin = builtins[i].id;
     }
+}
+
+static void register_dll_import(Program *prog, const char *dll_name, const char *fn_name) {
+    int d_idx = -1;
+    for (int i = 0; i < prog->dll_imports.len; i++) {
+        if (_stricmp(prog->dll_imports.items[i].dll_name, dll_name) == 0) {
+            d_idx = i;
+            break;
+        }
+    }
+    if (d_idx < 0) {
+        DllImport di = {0};
+        di.dll_name = dll_name;
+        vec_push(prog->dll_imports, di);
+        d_idx = prog->dll_imports.len - 1;
+    }
+    DllImport *di = &prog->dll_imports.items[d_idx];
+    for (int j = 0; j < di->funcs.len; j++) {
+        if (strcmp(di->funcs.items[j], fn_name) == 0) return;
+    }
+    vec_push(di->funcs, fn_name);
+}
+
+static int find_iat_slot(Program *prog, const char *dll_name, const char *fn_name) {
+    for (int i = 0; i < prog->dll_imports.len; i++) {
+        DllImport *di = &prog->dll_imports.items[i];
+        if (_stricmp(di->dll_name, dll_name) == 0) {
+            for (int j = 0; j < di->funcs.len; j++) {
+                if (strcmp(di->funcs.items[j], fn_name) == 0) {
+                    return di->first_iat_slot + j;
+                }
+            }
+        }
+    }
+    die("internal error: extern function '%s' not found in DLL import table", fn_name);
 }
 
 Program check(NodeVec decls) {
@@ -1610,7 +1651,12 @@ Program check(NodeVec decls) {
     c.global = push_scope(&c, false);
     register_builtins(&c);
 
+    // Seed built-in KERNEL32.dll imports at IAT slots 0, 1, 2.
     Program prog = {0};
+    const char *k32 = intern("KERNEL32.dll", 12);
+    register_dll_import(&prog, k32, intern("GetStdHandle", 12));
+    register_dll_import(&prog, k32, intern("WriteFile", 9));
+    register_dll_import(&prog, k32, intern("ExitProcess", 11));
 
     // Pass 1: register all top-level names so structs, constants, and functions
     // can be referenced in any declaration order (spec §5.3).
@@ -1639,6 +1685,7 @@ Program check(NodeVec decls) {
         if (d->kind == N_STRUCT) layout_struct(&c, d->type);
     }
 
+    VEC(Symbol *) extern_syms = {0};
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
         if (d->kind == N_FN) {
@@ -1651,14 +1698,45 @@ Program check(NodeVec decls) {
                 Node *p = d->list.items[j];
                 p->type = resolve_decl_type(&c, p);
                 if (p->type == &ty_str) {
-                    fatal(p->type_pos, "'str' parameters are not supported yet");
+                    fatal(p->type_pos, "'str' parameters are not supported yet (use '*u8' for C strings)");
+                }
+                if (d->is_extern && (p->type->kind == TY_SLICE || p->type->kind == TY_ARRAY || p->type->kind == TY_STRUCT)) {
+                    fatal(p->type_pos, "extern function parameter '%s' cannot have type '%s' by value; pass a pointer instead",
+                          p->name, p->type->name);
                 }
             }
-            Symbol *s = define(&c, SYM_FN, d->name, ret, d->pos);
-            s->decl = d;
-            d->sym = s;
-            d->type = ret;
-            vec_push(prog.fns, d);
+            if (d->is_extern) {
+                Symbol *existing = lookup_in(c.global, d->name);
+                if (existing && existing->kind == SYM_FN && existing->is_extern &&
+                    existing->type == ret && existing->decl->list.len == d->list.len &&
+                    _stricmp(existing->decl->dll_name, d->dll_name) == 0) {
+                    bool same_params = true;
+                    for (int j = 0; j < d->list.len; j++) {
+                        if (existing->decl->list.items[j]->type != d->list.items[j]->type) {
+                            same_params = false;
+                            break;
+                        }
+                    }
+                    if (same_params) {
+                        d->sym = existing;
+                        d->type = ret;
+                        continue;
+                    }
+                }
+                Symbol *s = define(&c, SYM_FN, d->name, ret, d->pos);
+                s->is_extern = true;
+                s->decl = d;
+                d->sym = s;
+                d->type = ret;
+                register_dll_import(&prog, d->dll_name, d->name);
+                vec_push(extern_syms, s);
+            } else {
+                Symbol *s = define(&c, SYM_FN, d->name, ret, d->pos);
+                s->decl = d;
+                d->sym = s;
+                d->type = ret;
+                vec_push(prog.fns, d);
+            }
         } else if (d->kind == N_VAR) {
             Symbol *s = define(&c, SYM_VAR, d->name, NULL, d->pos);
             s->decl = d;
@@ -1666,6 +1744,19 @@ Program check(NodeVec decls) {
             vec_push(prog.globals, s);
         }
     }
+
+    // Assign IAT slot indices for all imported DLL functions.
+    int cur_iat_slot = 0;
+    for (int i = 0; i < prog.dll_imports.len; i++) {
+        prog.dll_imports.items[i].first_iat_slot = cur_iat_slot;
+        cur_iat_slot += prog.dll_imports.items[i].funcs.len + 1; // +1 for null terminator entry
+    }
+    prog.total_iat_slots = cur_iat_slot;
+    for (int i = 0; i < extern_syms.len; i++) {
+        Symbol *es = extern_syms.items[i];
+        es->iat_slot = find_iat_slot(&prog, es->decl->dll_name, es->name);
+    }
+    free(extern_syms.items);
 
     // Pass 3: check top-level variables (initializer must be constant, spec §4.6).
     for (int i = 0; i < decls.len; i++) {
