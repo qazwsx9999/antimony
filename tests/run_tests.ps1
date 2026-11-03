@@ -441,4 +441,151 @@ fn main() {
 }
 "@ "42`n90"
 
+# 11. Phase 6: Enums & Pattern Matching (enum & match)
+Test-CompileError "enum_empty"           "enum E {}`nfn main() {}" "must have at least one variant"
+Test-CompileError "enum_dup_variant"     "enum E { A, B, A }`nfn main() {}" "duplicate variant 'A'"
+Test-CompileError "enum_dup_discrim"     "enum E { A = 1, B = 1 }`nfn main() {}" "duplicate discriminant value 1"
+Test-CompileError "enum_no_variant"      "enum E { A, B }`nfn main() { var x = E.C }" "has no variant named 'C'"
+Test-CompileError "enum_assign_variant"  "enum E { A, B }`nfn main() { E.A = E.B }" "cannot assign to constant or enum variant"
+Test-CompileError "match_non_exhaustive_enum" @"
+enum Color { Red, Green, Blue }
+fn main() {
+    var c = Color.Red
+    match c {
+        Color.Red { print(1) }
+        Color.Green { print(2) }
+    }
+}
+"@ "variant 'Color.Blue' is not covered"
+Test-CompileError "match_non_exhaustive_int" @"
+fn main() {
+    var x = 10
+    match x {
+        1 { print(1) }
+        2 { print(2) }
+    }
+}
+"@ "non-exhaustive 'match' on integer type 'i32'"
+Test-CompileError "match_dup_pattern" @"
+enum Color { Red, Green }
+fn main() {
+    var c = Color.Red
+    match c {
+        Color.Red { print(1) }
+        Color.Red, Color.Green { print(2) }
+    }
+}
+"@ "duplicate match pattern"
+Test-CompileError "match_unreachable_else" @"
+enum Color { Red, Green }
+fn main() {
+    var c = Color.Red
+    match c {
+        Color.Red { print(1) }
+        Color.Green { print(2) }
+        else { print(3) }
+    }
+}
+"@ "unreachable 'else' arm"
+Test-CompileError "match_uninit_arm" @"
+enum Color { Red, Green }
+fn main() {
+    var c = Color.Red
+    var y: i32
+    match c {
+        Color.Red { y = 10 }
+        Color.Green { print(0) }
+    }
+    print(y)
+}
+"@ "variable 'y' may be read before it is assigned"
+
+Test-RunOk "enums_and_match" @"
+const BASE_CODE = 100
+
+enum Status {
+    Idle
+    Running
+    Paused = 10
+    Done
+    Error = BASE_CODE + 5
+}
+
+struct Task {
+    id: i32
+    state: Status
+}
+
+fn describe_status(s: Status): i32 {
+    match s {
+        Status.Idle {
+            return 0
+        }
+        Status.Running, Status.Paused {
+            return 1
+        }
+        Status.Done {
+            return 2
+        }
+        Status.Error {
+            return -1
+        }
+    }
+}
+
+fn classify_code(x: i32): i32 {
+    var out: i32
+    match x {
+        0 {
+            out = 10
+        }
+        1, 2, 3 {
+            out = 20
+        }
+        else {
+            out = 99
+        }
+    }
+    return out
+}
+
+fn main() {
+    var s = Status.Idle
+    print(i32(s))
+    print(i32(Status.Running))
+    print(i32(Status.Paused))
+    print(i32(Status.Done))
+    print(i32(Status.Error))
+
+    var states[5]: Status = [
+        Status.Idle,
+        Status.Running,
+        Status.Paused,
+        Status.Done,
+        Status.Error
+    ]
+    var sum = 0
+    loop st in states {
+        sum += describe_status(st)
+    }
+    print(sum)
+
+    var t = Task { id: 7, state: Status.Paused }
+    if t.state == Status.Paused && t.state != Status.Done {
+        t.state = Status.Done
+    }
+    print(describe_status(t.state))
+
+    print(classify_code(0))
+    print(classify_code(2))
+    print(classify_code(42))
+
+    var flag = true
+    match flag {
+        true { print(111) }
+        false { print(222) }
+    }
+}
+"@ "0`n1`n10`n11`n105`n3`n2`n10`n20`n99`n111"
+
 Write-Host "`nAll tests passed."

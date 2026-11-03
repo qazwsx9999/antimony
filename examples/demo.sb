@@ -2,9 +2,26 @@ const LIMIT = 10
 
 extern "msvcrt.dll" fn sqrt(x: f64): f64
 
+enum Mode {
+    Fast
+    Safe
+    Custom = 10
+}
+
 struct Vec2 {
     x: i32
     y: i32
+}
+
+fn mode_weight(m: Mode): i32 {
+    match m {
+        Mode.Fast {
+            return 1
+        }
+        Mode.Safe, Mode.Custom {
+            return 2
+        }
+    }
 }
 
 fn translate(v: *Vec2, dx: i32, dy: i32) {
@@ -67,6 +84,7 @@ fn main() {
     translate(&pt, 5, -3)
     print(pt.x)
     print(pt.y)
+    print(mode_weight(Mode.Custom))
 
     var radius = 2.5
     var area = 3.14159265 * radius * radius

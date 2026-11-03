@@ -473,9 +473,74 @@ fn main() {
 
 ---
 
-## 11. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
+## 11. Enums (`enum`) & Pattern Matching (`match`)
 
-### 11.1 Splitting Code Across Files (`import`)
+### 11.1 Declaring Enums
+An `enum` defines a distinct 32-bit signed nominal type (`i32` representation) with named variants. Variants auto-increment from `0` unless given an explicit compile-time constant value (`= expr`), and variants are accessed with `.` (`EnumName.Variant`):
+
+```
+enum Status {
+    Idle
+    Running
+    Paused = 10
+    Done
+    Error = -1
+}
+
+fn main() {
+    var s = Status.Running
+    if s != Status.Done {
+        s = Status.Done
+    }
+    print(i32(s))           // 11 (explicit conversion to integer)
+}
+```
+
+### 11.2 Exhaustive Pattern Matching (`match`)
+`match` compares an `enum`, integer, or `bool` value against compile-time constant patterns. Arms can match a single value or multiple comma-separated values (`pat1, pat2 { ... }`), with an optional `else { ... }` catch-all arm at the end.
+
+Every `match` in Antimony is **checked for exhaustiveness at compile time**:
+- Matching on an `enum` without an `else` branch must cover every variant of the enum (if you add a new variant later, the compiler tells you which `match` is missing it!).
+- Duplicate patterns and unreachable `else` branches are compile-time errors.
+- Definite-assignment and return-path analysis flow through exhaustive `match` statements just like `if / else`.
+
+```
+fn status_code(s: Status): i32 {
+    match s {
+        Status.Idle {
+            return 0
+        }
+        Status.Running, Status.Paused {
+            return 1
+        }
+        Status.Done {
+            return 2
+        }
+        Status.Error {
+            return -1
+        }
+    }
+}
+
+fn classify_http(code: i32) {
+    var ok: bool
+    match code {
+        200, 201, 204 {
+            ok = true
+        }
+        else {
+            ok = false
+        }
+    }
+    print(ok)
+}
+```
+
+---
+
+## 12. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
+
+### 12.1 Splitting Code Across Files (`import`)
 Use `import "path.sb"` at the top level to include another Antimony source file (resolved relative to the importing file's directory). Imports are automatically deduplicated, so diamond or circular imports are safe:
 
 ```
@@ -496,7 +561,7 @@ fn main() {
 }
 ```
 
-### 11.2 Calling Windows DLLs Directly (`extern`)
+### 12.2 Calling Windows DLLs Directly (`extern`)
 Antimony emits imported functions directly into the PE32+ Import Table—no C compiler, header files, or `.lib` import libraries needed. You can declare a single `extern` function or group multiple imports from the same DLL:
 
 ```
@@ -520,19 +585,19 @@ fn main() {
 
 ---
 
-## 12. Built-in Functions
+## 13. Built-in Functions
 
 | Function | Description |
 |---|---|
-| `print(x)` | Prints any integer, float (`f32`/`f64`), pointer, `bool`, or `str` followed by a newline |
+| `print(x)` | Prints any integer, float (`f32`/`f64`), enum, pointer, `bool`, or `str` followed by a newline |
 | `len(x)` | Returns the length of an array, slice, or string |
 | `exit(code: i32)` | Terminates the program immediately with exit status `code` |
 | `rev(a..b [by s])` | Reverses a range inside a `loop` header |
-| `T(x)` | Explicitly converts `x` to scalar integer or float type `T` (e.g. `i64(x)`, `f64(x)`, `u8(x)`) |
+| `T(x)` | Explicitly converts `x` to scalar integer, float, or enum type `T` (e.g. `i64(x)`, `f64(x)`, `i32(Status.Done)`) |
 
 ---
 
-## 13. Complete Example Program
+## 14. Complete Example Program
 
 See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony, or try this prime-counting benchmark:
 

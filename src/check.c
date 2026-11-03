@@ -152,6 +152,7 @@ static Symbol *define(Checker *c, SymKind kind, const char *name, Type *type, Po
 static void check_expr(Checker *c, Node *n, Type *expected);
 static void resolve_global_const(Checker *c, Symbol *s);
 static void layout_struct(Checker *c, Type *st);
+static void layout_enum(Checker *c, Type *et);
 
 static Type *resolve_type(Checker *c, const char *name, Pos pos) {
     Symbol *s = lookup_in(c->global, name);
@@ -257,6 +258,8 @@ static Type *resolve_decl_type(Checker *c, Node *d) {
     Type *base = resolve_type(c, d->type_name, d->type_pos);
     if (d->ptr_depth == 0 && base->kind == TY_STRUCT && base->state != 2) {
         layout_struct(c, base);
+    } else if (base->kind == TY_ENUM && base->state != 2) {
+        layout_enum(c, base);
     }
     for (int i = 0; i < d->ptr_depth; i++) {
         base = make_ptr_type(base, d->type_pos);
@@ -269,6 +272,54 @@ static Type *resolve_decl_type(Checker *c, Node *d) {
         return make_slice_type(base, d->pos);
     }
     return base;
+}
+
+static void layout_enum(Checker *c, Type *et) {
+    if (et->state == 2) return;
+    if (et->state == 1) {
+        fatal(et->decl->pos, "cyclic enum definition involving '%s'", et->name);
+    }
+    et->state = 1;
+    Node *d = et->decl;
+    if (d->list.len == 0) {
+        fatal(d->pos, "enum '%s' must have at least one variant", et->name);
+    }
+    i128 next_val = 0;
+    for (int i = 0; i < d->list.len; i++) {
+        Node *vd = d->list.items[i];
+        for (int j = 0; j < et->fields.len; j++) {
+            if (et->fields.items[j].name == vd->name) {
+                fatal(vd->pos, "duplicate variant '%s' in enum '%s'", vd->name, et->name);
+            }
+        }
+        i128 val = next_val;
+        if (vd->rhs) {
+            check_expr(c, vd->rhs, &ty_i32);
+            if (!vd->rhs->is_const) {
+                fatal(vd->rhs->pos, "enum discriminant for '%s.%s' must be a compile-time constant",
+                      et->name, vd->name);
+            }
+            val = vd->rhs->cval;
+        }
+        if (!fits(val, &ty_i32)) {
+            char buf[48];
+            fatal(vd->pos, "enum discriminant %s for '%s.%s' overflows 'i32'",
+                  i128_str(val, buf), et->name, vd->name);
+        }
+        for (int j = 0; j < et->fields.len; j++) {
+            if (et->fields.items[j].offset == (int)val) {
+                fatal(vd->pos, "duplicate discriminant value %d for '%s.%s' (already used by '%s.%s')",
+                      (int)val, et->name, vd->name, et->name, et->fields.items[j].name);
+            }
+        }
+        StructField sf = {vd->name, et, (int)val, vd->pos};
+        vec_push(et->fields, sf);
+        next_val = val + 1;
+    }
+    et->size = 4;
+    et->align = 4;
+    et->is_signed = true;
+    et->state = 2;
 }
 
 static void layout_struct(Checker *c, Type *st) {
@@ -524,6 +575,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             opd->type = s->type;
         } else if (opd->kind == N_INDEX || opd->kind == N_DEREF || opd->kind == N_FIELD) {
             check_expr(c, opd, NULL);
+            if (opd->is_const) {
+                fatal(n->pos, "cannot take address '&' of constant or enum variant");
+            }
         } else {
             fatal(n->pos, "operand of '&' must be a variable, array element, struct field, or pointer dereference");
         }
@@ -575,10 +629,24 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     }
 
     case N_FIELD: {
-        // If `lhs` is an uninitialized variable `var p: Point`, allow writing `p.x = 1`,
-        // and mark `p` as assigned on first field access.
+        // Check for enum variant access `EnumName.Variant` before checking `n->lhs` as a value.
         if (n->lhs->kind == N_IDENT) {
             Symbol *s = lookup(c, n->lhs->name);
+            if (s && s->kind == SYM_TYPE && s->type->kind == TY_ENUM) {
+                Type *et = s->type;
+                if (et->state != 2) layout_enum(c, et);
+                StructField *sf = find_field(et, n->name);
+                if (!sf) {
+                    fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
+                }
+                n->type = et;
+                n->is_const = true;
+                n->cval = sf->offset;
+                if (expected) coerce(n, expected);
+                return;
+            }
+            // If `lhs` is an uninitialized variable `var p: Point`, allow writing `p.x = 1`,
+            // and mark `p` as assigned on first field access.
             if (s && s->kind == SYM_VAR && !s->is_global && s->var_index >= 0 &&
                 s->type && s->type->kind == TY_STRUCT) {
                 c->assigned |= (1ULL << s->var_index);
@@ -936,7 +1004,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         Type *ot = n->lhs->type;
         if (is_cmp) {
             if (op == T_EQ || op == T_NE) {
-                if (!is_int(ot) && ot != &ty_bool) {
+                if (!is_int(ot) && ot != &ty_bool && ot->kind != TY_ENUM) {
                     fatal(n->pos, "operator %s is not defined for '%s'", tok_name(op), ot->name);
                 }
             } else {
@@ -1011,8 +1079,8 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 if (expected) coerce(n, expected);
                 return;
             }
-            if (arg->type == &ty_untyped_int) {
-                coerce(arg, s->type);
+            if (arg->type == &ty_untyped_int && (is_int(s->type) || s->type->kind == TY_ENUM)) {
+                coerce(arg, (s->type->kind == TY_ENUM) ? &ty_i32 : s->type);
             } else if (is_float(arg->type) && is_int(s->type)) {
                 materialize(arg);
                 n->kind = N_CONV;
@@ -1024,14 +1092,16 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 }
                 if (expected) coerce(n, expected);
                 return;
-            } else if (!is_int(arg->type) || !is_int(s->type)) {
+            } else if (!((is_int(arg->type) || arg->type->kind == TY_ENUM) &&
+                         (is_int(s->type)  || s->type->kind == TY_ENUM))) {
                 fatal(n->pos, "cannot convert '%s' to '%s'", arg->type->name, s->type->name);
             }
             n->kind = N_CONV;
             n->lhs = arg;
             n->type = s->type;
             if (arg->is_const) {
-                if (!fits(arg->cval, s->type)) {
+                Type *fit_t = (s->type->kind == TY_ENUM) ? &ty_i32 : s->type;
+                if (!fits(arg->cval, fit_t)) {
                     char buf[48];
                     fatal(n->pos, "constant %s out of range for '%s'",
                           i128_str(arg->cval, buf), s->type->name);
@@ -1138,6 +1208,11 @@ static bool loop_has_break_to(Node *stmt, Node *target) {
         return false;
     case N_IF:
         return loop_has_break_to(stmt->body, target) || loop_has_break_to(stmt->els, target);
+    case N_MATCH:
+        for (int i = 0; i < stmt->list.len; i++) {
+            if (loop_has_break_to(stmt->list.items[i]->body, target)) return true;
+        }
+        return loop_has_break_to(stmt->els, target);
     case N_LOOP_INF:
     case N_LOOP_COND:
     case N_LOOP_RANGE:
@@ -1161,6 +1236,10 @@ static bool body_assigns_var(Node *stmt, Symbol *v) {
         return false;
     case N_IF:
         return body_assigns_var(stmt->body, v) || body_assigns_var(stmt->els, v);
+    case N_MATCH:
+        for (int i = 0; i < stmt->list.len; i++)
+            if (body_assigns_var(stmt->list.items[i]->body, v)) return true;
+        return body_assigns_var(stmt->els, v);
     case N_LOOP_INF:
     case N_LOOP_COND:
     case N_LOOP_RANGE:
@@ -1177,6 +1256,9 @@ static void check_assign(Checker *c, Node *n) {
     if (n->lhs && (n->lhs->kind == N_INDEX || n->lhs->kind == N_DEREF || n->lhs->kind == N_FIELD)) {
         // Element, field, or dereference assignment: `arr[i] = val`, `p.x = val`, `*p = val`
         check_expr(c, n->lhs, NULL);
+        if (n->lhs->is_const) {
+            fatal(n->pos, "cannot assign to constant or enum variant");
+        }
         target_type = n->lhs->type;
         n->type = target_type;
         if (n->op == T_ASSIGN) {
@@ -1416,6 +1498,102 @@ static bool check_stmt(Checker *c, Node *n) {
             c->assigned = before;
             return false;
         }
+    }
+
+    case N_MATCH: {
+        check_expr(c, n->cond, NULL);
+        materialize(n->cond);
+        Type *st = n->cond->type;
+        if (st->kind != TY_ENUM && st->kind != TY_INT && st != &ty_bool) {
+            fatal(n->cond->pos, "'match' expression must be an enum, integer, or bool (got '%s')", st->name);
+        }
+        if (n->list.len == 0 && !n->els) {
+            fatal(n->pos, "'match' statement must have at least one arm");
+        }
+
+        VEC(i128) seen_vals = {0};
+        VEC(Pos)  seen_pos  = {0};
+        AssignSet before = c->assigned;
+        AssignSet after_all = ALL_ASSIGNED;
+        bool all_ret = true;
+
+        for (int i = 0; i < n->list.len; i++) {
+            Node *arm = n->list.items[i];
+            for (int j = 0; j < arm->list.len; j++) {
+                Node *pat = arm->list.items[j];
+                check_expr(c, pat, st);
+                if (!pat->is_const) {
+                    fatal(pat->pos, "match pattern must be a compile-time constant");
+                }
+                for (int k = 0; k < seen_vals.len; k++) {
+                    if (seen_vals.items[k] == pat->cval) {
+                        fatal(pat->pos, "duplicate match pattern (already matched at line %d)",
+                              seen_pos.items[k].line);
+                    }
+                }
+                vec_push(seen_vals, pat->cval);
+                vec_push(seen_pos, pat->pos);
+            }
+            c->assigned = before;
+            bool arm_ret = check_block(c, arm->body, true);
+            after_all &= c->assigned;
+            if (!arm_ret) all_ret = false;
+        }
+
+        bool exhaustive = false;
+        if (n->els) {
+            if (st->kind == TY_ENUM && seen_vals.len == st->fields.len) {
+                fatal(n->els->pos, "unreachable 'else' arm: all variants of enum '%s' are already covered", st->name);
+            }
+            if (st == &ty_bool && seen_vals.len == 2) {
+                fatal(n->els->pos, "unreachable 'else' arm: both 'true' and 'false' are already covered");
+            }
+            c->assigned = before;
+            bool els_ret = check_block(c, n->els, true);
+            after_all &= c->assigned;
+            if (!els_ret) all_ret = false;
+            exhaustive = true;
+        } else if (st->kind == TY_ENUM) {
+            for (int i = 0; i < st->fields.len; i++) {
+                int v = st->fields.items[i].offset;
+                bool covered = false;
+                for (int k = 0; k < seen_vals.len; k++) {
+                    if (seen_vals.items[k] == v) {
+                        covered = true;
+                        break;
+                    }
+                }
+                if (!covered) {
+                    free(seen_vals.items);
+                    free(seen_pos.items);
+                    fatal(n->pos, "non-exhaustive 'match': variant '%s.%s' is not covered (add an arm or 'else' branch)",
+                          st->name, st->fields.items[i].name);
+                }
+            }
+            exhaustive = true;
+        } else if (st == &ty_bool) {
+            bool has_true = false, has_false = false;
+            for (int k = 0; k < seen_vals.len; k++) {
+                if (seen_vals.items[k] != 0) has_true = true;
+                else has_false = true;
+            }
+            if (!has_true || !has_false) {
+                free(seen_vals.items);
+                free(seen_pos.items);
+                fatal(n->pos, "non-exhaustive 'match' on 'bool': missing '%s' arm (or 'else' branch)",
+                      !has_true ? "true" : "false");
+            }
+            exhaustive = true;
+        } else {
+            free(seen_vals.items);
+            free(seen_pos.items);
+            fatal(n->pos, "non-exhaustive 'match' on integer type '%s': an 'else' branch is required", st->name);
+        }
+
+        free(seen_vals.items);
+        free(seen_pos.items);
+        c->assigned = exhaustive ? after_all : before;
+        return exhaustive && all_ret;
     }
 
     case N_LOOP_INF: {
@@ -1658,7 +1836,7 @@ Program check(NodeVec decls) {
     register_dll_import(&prog, k32, intern("WriteFile", 9));
     register_dll_import(&prog, k32, intern("ExitProcess", 11));
 
-    // Pass 1: register all top-level names so structs, constants, and functions
+    // Pass 1: register all top-level names so structs, enums, constants, and functions
     // can be referenced in any declaration order (spec §5.3).
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
@@ -1670,11 +1848,26 @@ Program check(NodeVec decls) {
             Symbol *s = define(&c, SYM_TYPE, d->name, st, d->pos);
             d->sym = s;
             d->type = st;
+        } else if (d->kind == N_ENUM) {
+            Type *et = xcalloc(1, sizeof(Type));
+            et->kind = TY_ENUM;
+            et->name = d->name;
+            et->decl = d;
+            et->size = 4;
+            et->align = 4;
+            et->is_signed = true;
+            Symbol *s = define(&c, SYM_TYPE, d->name, et, d->pos);
+            d->sym = s;
+            d->type = et;
         } else if (d->kind == N_CONST) {
             Symbol *s = define(&c, SYM_CONST, d->name, &ty_untyped_int, d->pos);
             s->decl = d;
             d->sym = s;
         }
+    }
+    for (int i = 0; i < decls.len; i++) {
+        Node *d = decls.items[i];
+        if (d->kind == N_ENUM) layout_enum(&c, d->type);
     }
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];

@@ -35,7 +35,7 @@ static bool triggers_term(TokKind k) {
 static TokKind lookup_keyword(const char *s, int len) {
     static const struct { const char *kw; TokKind kind; } tab[] = {
         {"var", T_VAR}, {"const", T_CONST}, {"fn", T_FN}, {"struct", T_STRUCT},
-        {"import", T_IMPORT}, {"extern", T_EXTERN},
+        {"enum", T_ENUM}, {"match", T_MATCH}, {"import", T_IMPORT}, {"extern", T_EXTERN},
         {"return", T_RETURN}, {"if", T_IF}, {"else", T_ELSE}, {"loop", T_LOOP},
         {"in", T_IN}, {"by", T_BY}, {"break", T_BREAK}, {"continue", T_CONTINUE},
         {"true", T_TRUE}, {"false", T_FALSE}, {"null", T_NULL},
@@ -332,6 +332,8 @@ const char *tok_name(TokKind k) {
     case T_CONST: return "'const'";
     case T_FN: return "'fn'";
     case T_STRUCT: return "'struct'";
+    case T_ENUM: return "'enum'";
+    case T_MATCH: return "'match'";
     case T_IMPORT: return "'import'";
     case T_EXTERN: return "'extern'";
     case T_RETURN: return "'return'";

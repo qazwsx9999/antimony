@@ -606,6 +606,43 @@ static Node *parse_loop(Parser *p, const char *label) {
     return n;
 }
 
+static Node *parse_match(Parser *p) {
+    Token *kw = expect(p, T_MATCH);
+    Node *n = new_node(N_MATCH, kw->pos);
+    p->no_struct_lit = true;
+    n->cond = parse_expr(p);
+    p->no_struct_lit = false;
+    expect(p, T_LBRACE);
+    skip_terms(p);
+    while (cur(p)->kind != T_RBRACE && cur(p)->kind != T_EOF) {
+        if (cur(p)->kind == T_ELSE) {
+            if (n->els) {
+                fatal(cur(p)->pos, "duplicate 'else' branch in 'match'");
+            }
+            next(p); // consume 'else'
+            n->els = parse_block(p);
+            skip_terms(p);
+            if (cur(p)->kind != T_RBRACE) {
+                fatal(cur(p)->pos, "'else' branch must be the last arm in 'match'");
+            }
+            break;
+        }
+        Node *arm = new_node(N_MATCH_ARM, cur(p)->pos);
+        p->no_struct_lit = true;
+        for (;;) {
+            vec_push(arm->list, parse_expr(p));
+            if (!match(p, T_COMMA)) break;
+            skip_terms(p);
+        }
+        p->no_struct_lit = false;
+        arm->body = parse_block(p);
+        vec_push(n->list, arm);
+        skip_terms(p);
+    }
+    expect(p, T_RBRACE);
+    return n;
+}
+
 static Node *parse_stmt(Parser *p) {
     Token *t = cur(p);
     switch (t->kind) {
@@ -621,6 +658,11 @@ static Node *parse_stmt(Parser *p) {
     }
     case T_IF: {
         Node *n = parse_if(p);
+        expect_term(p);
+        return n;
+    }
+    case T_MATCH: {
+        Node *n = parse_match(p);
         expect_term(p);
         return n;
     }
@@ -821,6 +863,32 @@ static Node *parse_struct(Parser *p) {
     return st;
 }
 
+static Node *parse_enum(Parser *p) {
+    Token *kw = expect(p, T_ENUM);
+    Token *id = expect(p, T_IDENT);
+    Node *en = new_node(N_ENUM, kw->pos);
+    en->name = id->name;
+    expect(p, T_LBRACE);
+    skip_terms(p);
+    while (cur(p)->kind != T_RBRACE && cur(p)->kind != T_EOF) {
+        Token *vid = expect(p, T_IDENT);
+        Node *ev = new_node(N_ENUM_VAR, vid->pos);
+        ev->name = vid->name;
+        if (match(p, T_ASSIGN)) {
+            ev->rhs = parse_expr(p);
+        }
+        vec_push(en->list, ev);
+        if (match(p, T_COMMA)) {
+            skip_terms(p);
+        } else {
+            expect_term(p);
+        }
+    }
+    expect(p, T_RBRACE);
+    expect_term(p);
+    return en;
+}
+
 NodeVec parse(Token *toks, int count) {
     Parser p = {toks, count, 0, false};
     NodeVec decls = {0};
@@ -851,6 +919,8 @@ NodeVec parse(Token *toks, int count) {
             vec_push(decls, parse_fn(&p));
         } else if (t->kind == T_STRUCT) {
             vec_push(decls, parse_struct(&p));
+        } else if (t->kind == T_ENUM) {
+            vec_push(decls, parse_enum(&p));
         } else if (t->kind == T_VAR) {
             Node *n = parse_var_no_term(&p);
             expect_term(&p);
@@ -860,7 +930,7 @@ NodeVec parse(Token *toks, int count) {
             expect_term(&p);
             vec_push(decls, n);
         } else {
-            fatal(t->pos, "expected 'import', 'extern', 'fn', 'struct', 'var', or 'const' at top level, got %s", tok_name(t->kind));
+            fatal(t->pos, "expected 'import', 'extern', 'fn', 'struct', 'enum', 'var', or 'const' at top level, got %s", tok_name(t->kind));
         }
         skip_terms(&p);
     }

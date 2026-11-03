@@ -63,7 +63,7 @@ static void emit_trap_if(CG *cg, int cc, Pos pos, const char *reason) {
 
 // Truncates `reg` to `t` (sign-extending signed types, zero-extending unsigned).
 static void normalize_reg(int reg, Type *t) {
-    if (!t || t->kind != TY_INT) return;
+    if (!t || (t->kind != TY_INT && t->kind != TY_ENUM)) return;
     if (t->is_signed) {
         if (t->size == 1)      x_movsx8(reg, reg);
         else if (t->size == 2) x_movsx16(reg, reg);
@@ -178,7 +178,7 @@ static uint64_t fval_bits(double v, Type *t) {
     return u;
 }
 
-// Returns true if `n` is a compile-time constant integer/bool/null whose
+// Returns true if `n` is a compile-time constant integer/enum/bool/null whose
 // 64-bit register representation equals sign-extended `int32_t *out`.
 static bool fits_imm32(Node *n, int32_t *out) {
     if (!n) return false;
@@ -186,7 +186,7 @@ static bool fits_imm32(Node *n, int32_t *out) {
         *out = 0;
         return true;
     }
-    if (n->is_const && (n->type->kind == TY_INT || n->type == &ty_bool)) {
+    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_ENUM || n->type == &ty_bool)) {
         int64_t v = (int64_t)n->cval;
         if (n->type->is_signed) {
             if (v >= INT32_MIN && v <= INT32_MAX) {
@@ -207,7 +207,8 @@ static bool fits_imm32(Node *n, int32_t *out) {
 // `gen_simple_into_reg` without clobbering any other register or having side effects.
 static bool is_simple_expr(Node *n) {
     if (!n) return false;
-    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_FLOAT || n->type == &ty_bool))
+    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_ENUM ||
+                        n->type->kind == TY_FLOAT || n->type == &ty_bool))
         return true;
     switch (n->kind) {
     case N_INT:
@@ -218,7 +219,8 @@ static bool is_simple_expr(Node *n) {
     case N_IDENT: {
         Type *t = n->sym->type;
         return !n->implicit_slice &&
-               (t->kind == TY_INT || t->kind == TY_BOOL || t->kind == TY_FLOAT || t->kind == TY_PTR);
+               (t->kind == TY_INT || t->kind == TY_ENUM || t->kind == TY_BOOL ||
+                t->kind == TY_FLOAT || t->kind == TY_PTR);
     }
     default:
         return false;
@@ -230,7 +232,7 @@ static void gen_simple_into_reg(Node *n, int reg) {
         x_mov_ri(reg, fval_bits(n->fval, n->type));
         return;
     }
-    if (n->is_const && (n->type->kind == TY_INT || n->type == &ty_bool)) {
+    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_ENUM || n->type == &ty_bool)) {
         x_mov_ri(reg, (uint64_t)(int64_t)n->cval);
         normalize_reg(reg, n->type);
         return;
@@ -673,7 +675,7 @@ static void gen_expr(CG *cg, Node *n) {
         x_mov_ri(RAX, fval_bits(n->fval, n->type));
         return;
     }
-    if (n->is_const && (n->type->kind == TY_INT || n->type == &ty_bool)) {
+    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_ENUM || n->type == &ty_bool)) {
         x_mov_ri(RAX, (uint64_t)(int64_t)n->cval);
         normalize_rax(n->type);
         return;
@@ -1581,6 +1583,46 @@ static void gen_stmt(CG *cg, Node *n) {
         return;
     }
 
+    case N_MATCH: {
+        int l_end = x_label();
+        int *l_arms = n->list.len ? xmalloc((size_t)n->list.len * sizeof(int)) : NULL;
+        int scrut_reg = RAX;
+        if (n->cond->kind == N_IDENT && !n->cond->implicit_slice && n->cond->sym->hw_reg >= 0) {
+            scrut_reg = n->cond->sym->hw_reg;
+        } else {
+            gen_expr(cg, n->cond);
+        }
+        for (int i = 0; i < n->list.len; i++) {
+            l_arms[i] = x_label();
+            Node *arm = n->list.items[i];
+            for (int j = 0; j < arm->list.len; j++) {
+                Node *pat = arm->list.items[j];
+                int32_t imm32 = 0;
+                if (fits_imm32(pat, &imm32)) {
+                    x_alu_ri(ALU_CMP, 1, scrut_reg, imm32);
+                } else {
+                    x_mov_ri(RCX, (uint64_t)(int64_t)pat->cval);
+                    x_alu_rr(ALU_CMP, 1, scrut_reg, RCX);
+                }
+                x_jcc(CC_E, l_arms[i]);
+            }
+        }
+        int l_else = n->els ? x_label() : l_end;
+        x_jmp(l_else);
+        for (int i = 0; i < n->list.len; i++) {
+            x_bind(l_arms[i]);
+            gen_block(cg, n->list.items[i]->body);
+            x_jmp(l_end);
+        }
+        if (n->els) {
+            x_bind(l_else);
+            gen_block(cg, n->els);
+        }
+        x_bind(l_end);
+        free(l_arms);
+        return;
+    }
+
     case N_LOOP_INF: {
         int l_top = x_label(), l_brk = x_label();
         n->label_continue = l_top;
@@ -1759,7 +1801,7 @@ static int alloc_fn_regs(Node *fn, int out_regs[5]) {
             Symbol *s = locals.items[i];
             if (s->hw_reg >= 0 || s->addr_taken || s->use_score < 2) continue;
             Type *t = s->type;
-            if (!t || (t->kind != TY_INT && t->kind != TY_BOOL &&
+            if (!t || (t->kind != TY_INT && t->kind != TY_ENUM && t->kind != TY_BOOL &&
                        t->kind != TY_FLOAT && t->kind != TY_PTR)) continue;
             if (!best || s->use_score > best->use_score) {
                 best = s;
