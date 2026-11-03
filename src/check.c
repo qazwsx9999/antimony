@@ -144,6 +144,7 @@ static Symbol *define(Checker *c, SymKind kind, const char *name, Type *type, Po
     sym->pos = pos;
     sym->is_global = (c->cur == c->global);
     sym->var_index = -1;
+    sym->hw_reg = -1;
     vec_push(c->cur->syms, sym);
     return sym;
 }

@@ -155,6 +155,9 @@ typedef struct Symbol {
     int builtin;         // BuiltinId
     int label;           // fn: code label
     double fval;         // SYM_CONST float value
+    bool addr_taken;     // local var: address taken (&x) -> cannot live in register
+    int use_score;       // loop-weighted reference count for register allocation
+    int hw_reg;          // allocated callee-saved register (RBX, R12..R15), or -1 if stack
 } Symbol;
 
 // ---------------------------------------------------------------------------

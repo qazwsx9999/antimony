@@ -311,4 +311,64 @@ fn main() {
 }
 "@ "3.75`n-3.75`ntrue`nfalse`n1.5`n3`n3.5`n12.566371`n7.0"
 
+# 9. Phase 4 optimizations: register allocation (RBX, R12..R15), branch fusion, immediate ops, fast indexing
+Test-RunOk "phase4_reg_alloc_and_opt" @"
+fn helper(x: i64, y: i64): i64 {
+    var a = x + 10
+    var b = y * 2
+    var c = a - b
+    var d = c ^ 0x55
+    var e = (d << 2) >> 1
+    return e + a + b
+}
+
+fn fib_iter(n: i32): i64 {
+    var a: i64 = 0
+    var b: i64 = 1
+    loop i in 0..n {
+        var next = a + b
+        a = b
+        b = next
+    }
+    return a
+}
+
+fn main() {
+    // 8 active local variables across nested loops and function calls
+    // (5 promoted to RBX, R12..R15 + 3 on stack, plus 1 address-taken variable)
+    var v1: i64 = 1
+    var v2: i64 = 2
+    var v3: i64 = 3
+    var v4: i64 = 4
+    var v5: i64 = 5
+    var v6: i64 = 6
+    var v7: i64 = 7
+    var pinned: i64 = 100
+    var p: *i64 = &pinned
+
+    var acc: i64 = 0
+    loop i in 0..10 {
+        loop j in 0..5 {
+            if !(i == 9 && j == 4) && (i < 5 || j >= 2) {
+                acc += helper(v1 + i64(i), v2 + i64(j))
+            }
+            v1 += 1
+            v2 += 2
+            v3 +%= 3
+            v4 -= 1
+            v5 ^= 1
+            v6 += 1
+            v7 += 1
+        }
+    }
+    *p += v6 + v7
+    print(acc)
+    print(v1)
+    print(v3)
+    print(v4)
+    print(pinned)
+    print(fib_iter(20))
+}
+"@ "-564`n51`n153`n-46`n213`n6765"
+
 Write-Host "`nAll tests passed."

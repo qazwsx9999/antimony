@@ -61,18 +61,22 @@ static void emit_trap_if(CG *cg, int cc, Pos pos, const char *reason) {
     x_bind(ok);
 }
 
-// Truncates RAX to `t` (sign-extending signed types, zero-extending unsigned).
-static void normalize_rax(Type *t) {
+// Truncates `reg` to `t` (sign-extending signed types, zero-extending unsigned).
+static void normalize_reg(int reg, Type *t) {
     if (!t || t->kind != TY_INT) return;
     if (t->is_signed) {
-        if (t->size == 1)      x_movsx8(RAX, RAX);
-        else if (t->size == 2) x_movsx16(RAX, RAX);
-        else if (t->size == 4) x_movsxd(RAX, RAX);
+        if (t->size == 1)      x_movsx8(reg, reg);
+        else if (t->size == 2) x_movsx16(reg, reg);
+        else if (t->size == 4) x_movsxd(reg, reg);
     } else {
-        if (t->size == 1)      x_movzx8(RAX, RAX);
-        else if (t->size == 2) x_movzx16(RAX, RAX);
-        else if (t->size == 4) x_mov_rr(0, RAX, RAX); // 32-bit mov zero-extends
+        if (t->size == 1)      x_movzx8(reg, reg);
+        else if (t->size == 2) x_movzx16(reg, reg);
+        else if (t->size == 4) x_mov_rr(0, reg, reg); // 32-bit mov zero-extends
     }
+}
+
+static void normalize_rax(Type *t) {
+    normalize_reg(RAX, t);
 }
 
 // Checks that the 64-bit value in RAX (with source signedness `src_signed`)
@@ -109,6 +113,10 @@ static void check_and_normalize_sub64(CG *cg, Type *dst, bool src_signed, Pos po
 }
 
 static void load_var(Symbol *s, int reg) {
+    if (s->hw_reg >= 0) {
+        x_mov_rr(1, reg, s->hw_reg);
+        return;
+    }
     if (s->type->kind == TY_ARRAY || s->type->kind == TY_STRUCT) {
         // Evaluating a fixed-size array or struct produces its base pointer in `reg`.
         if (s->is_global) {
@@ -132,6 +140,10 @@ static void load_var(Symbol *s, int reg) {
 }
 
 static void store_var(Symbol *s, int reg) {
+    if (s->hw_reg >= 0) {
+        x_mov_rr(1, s->hw_reg, reg);
+        return;
+    }
     if (s->type->kind == TY_SLICE || s->type == &ty_str) {
         x_store(RBP, slot_disp(s->slot), RAX);
         x_store(RBP, slot_disp(s->slot) + 8, RDX);
@@ -164,6 +176,93 @@ static uint64_t fval_bits(double v, Type *t) {
     uint64_t u = 0;
     memcpy(&u, &v, 8);
     return u;
+}
+
+// Returns true if `n` is a compile-time constant integer/bool/null whose
+// 64-bit register representation equals sign-extended `int32_t *out`.
+static bool fits_imm32(Node *n, int32_t *out) {
+    if (!n) return false;
+    if (n->kind == N_NULL) {
+        *out = 0;
+        return true;
+    }
+    if (n->is_const && (n->type->kind == TY_INT || n->type == &ty_bool)) {
+        int64_t v = (int64_t)n->cval;
+        if (n->type->is_signed) {
+            if (v >= INT32_MIN && v <= INT32_MAX) {
+                *out = (int32_t)v;
+                return true;
+            }
+        } else {
+            if ((uint64_t)v <= (uint64_t)INT32_MAX) {
+                *out = (int32_t)v;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Returns true if `n` can be loaded directly into an arbitrary GPR via
+// `gen_simple_into_reg` without clobbering any other register or having side effects.
+static bool is_simple_expr(Node *n) {
+    if (!n) return false;
+    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_FLOAT || n->type == &ty_bool))
+        return true;
+    switch (n->kind) {
+    case N_INT:
+    case N_BOOL:
+    case N_NULL:
+    case N_FLOAT:
+        return true;
+    case N_IDENT: {
+        Type *t = n->sym->type;
+        return !n->implicit_slice &&
+               (t->kind == TY_INT || t->kind == TY_BOOL || t->kind == TY_FLOAT || t->kind == TY_PTR);
+    }
+    default:
+        return false;
+    }
+}
+
+static void gen_simple_into_reg(Node *n, int reg) {
+    if (n->is_const && n->type->kind == TY_FLOAT) {
+        x_mov_ri(reg, fval_bits(n->fval, n->type));
+        return;
+    }
+    if (n->is_const && (n->type->kind == TY_INT || n->type == &ty_bool)) {
+        x_mov_ri(reg, (uint64_t)(int64_t)n->cval);
+        normalize_reg(reg, n->type);
+        return;
+    }
+    switch (n->kind) {
+    case N_INT:
+    case N_BOOL:
+    case N_NULL:
+        x_mov_ri(reg, (uint64_t)(int64_t)n->cval);
+        return;
+    case N_FLOAT:
+        x_mov_ri(reg, fval_bits(n->fval, n->type));
+        return;
+    case N_IDENT:
+        load_var(n->sym, reg);
+        return;
+    default:
+        die("internal error: non-simple expr in gen_simple_into_reg");
+    }
+}
+
+// Multiplies `reg` by `size`, using fast shifts for powers of two (1, 2, 4, 8, 16, 32, 64).
+static void scale_reg_by_size(int reg, int size, int scratch) {
+    if (size <= 1) return;
+    if (size == 2)  { x_shift_imm(4, 1, reg, 1); return; }
+    if (size == 4)  { x_shift_imm(4, 1, reg, 2); return; }
+    if (size == 8)  { x_shift_imm(4, 1, reg, 3); return; }
+    if (size == 16) { x_shift_imm(4, 1, reg, 4); return; }
+    if (size == 32) { x_shift_imm(4, 1, reg, 5); return; }
+    if (size == 64) { x_shift_imm(4, 1, reg, 6); return; }
+    x_mov_ri(scratch, (uint64_t)size);
+    x_imul_rr(1, reg, scratch);
 }
 
 // Loads float value (f32 or f64) from GPR `gpr` into `xmm` as a 64-bit double.
@@ -405,13 +504,51 @@ static void gen_index_addr(CG *cg, Node *n) {
             x_test_rr(1, RAX, RAX);
             emit_trap_if(cg, CC_E, n->pos, "null pointer dereference");
         }
-        int s_ptr = push_temp(cg);
-        gen_expr(cg, n->rhs); // RAX = idx
-        pop_temp(cg, s_ptr, RCX); // RCX = ptr
-        if (elem_t->size > 1) {
-            x_mov_ri(RDX, (uint64_t)elem_t->size);
-            x_imul_rr(1, RAX, RDX);
+        if (is_simple_expr(n->rhs)) {
+            x_mov_rr(1, RCX, RAX);
+            gen_simple_into_reg(n->rhs, RAX);
+        } else {
+            int s_ptr = push_temp(cg);
+            gen_expr(cg, n->rhs); // RAX = idx
+            pop_temp(cg, s_ptr, RCX); // RCX = ptr
         }
+        scale_reg_by_size(RAX, elem_t->size, RDX);
+        x_alu_rr(ALU_ADD, 1, RAX, RCX);
+        return;
+    }
+
+    // Fast path for fixed-size array variable `arr[idx]`: zero stack spills.
+    if (n->lhs->kind == N_IDENT && bt->kind == TY_ARRAY && !n->lhs->implicit_slice) {
+        Symbol *s = n->lhs->sym;
+        if (n->rhs->is_const) {
+            // Bounds already verified at compile time by check.c.
+            int32_t off = (int32_t)((int64_t)n->rhs->cval * elem_t->size);
+            if (!s->is_global && s->kind != SYM_PARAM) {
+                x_lea(RAX, RBP, slot_disp(s->slot) + off);
+            } else {
+                load_var(s, RAX);
+                if (off != 0) x_alu_ri(ALU_ADD, 1, RAX, off);
+            }
+            return;
+        }
+        gen_expr(cg, n->rhs); // RAX = idx
+        x_alu_ri(ALU_CMP, 1, RAX, bt->array_len);
+        emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        scale_reg_by_size(RAX, elem_t->size, RDX);
+        load_var(s, RCX);
+        x_alu_rr(ALU_ADD, 1, RAX, RCX);
+        return;
+    }
+
+    // Fast path for slice variable `s[idx]` with simple index: zero stack spills.
+    if (n->lhs->kind == N_IDENT && bt->kind == TY_SLICE && is_simple_expr(n->rhs)) {
+        Symbol *s = n->lhs->sym;
+        gen_simple_into_reg(n->rhs, RAX);
+        x_load(RDX, RBP, slot_disp(s->slot) + 8);
+        x_alu_rr(ALU_CMP, 1, RAX, RDX);
+        emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        scale_reg_by_size(RAX, elem_t->size, RDX);
+        x_load(RCX, RBP, slot_disp(s->slot));
         x_alu_rr(ALU_ADD, 1, RAX, RCX);
         return;
     }
@@ -429,10 +566,7 @@ static void gen_index_addr(CG *cg, Node *n) {
     x_alu_rr(ALU_CMP, 1, RAX, RDX);
     emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
 
-    if (elem_t->size > 1) {
-        x_mov_ri(RDX, (uint64_t)elem_t->size);
-        x_imul_rr(1, RAX, RDX);
-    }
+    scale_reg_by_size(RAX, elem_t->size, RDX);
     x_alu_rr(ALU_ADD, 1, RAX, RCX); // RAX = base_ptr + idx * elem_size
 }
 
@@ -643,10 +777,7 @@ static void gen_expr(CG *cg, Node *n) {
             x_mov_rr(1, RDX, R8);
             x_alu_rr(ALU_SUB, 1, RDX, RCX);
             x_mov_rr(1, RAX, RCX);
-            if (elem_t->size > 1) {
-                x_mov_ri(RCX, (uint64_t)elem_t->size);
-                x_imul_rr(1, RAX, RCX);
-            }
+            scale_reg_by_size(RAX, elem_t->size, RCX);
             x_alu_rr(ALU_ADD, 1, RAX, R9);
             return;
         }
@@ -690,10 +821,7 @@ static void gen_expr(CG *cg, Node *n) {
         x_mov_rr(1, RDX, R8);
         x_alu_rr(ALU_SUB, 1, RDX, RCX);
         x_mov_rr(1, RAX, RCX);
-        if (elem_t->size > 1) {
-            x_mov_ri(RCX, (uint64_t)elem_t->size);
-            x_imul_rr(1, RAX, RCX);
-        }
+        scale_reg_by_size(RAX, elem_t->size, RCX);
         x_alu_rr(ALU_ADD, 1, RAX, R9);
         return;
     }
@@ -796,19 +924,91 @@ static void gen_expr(CG *cg, Node *n) {
             return;
         }
 
-        // Evaluate left to right (spec §7.2).
-        gen_expr(cg, n->lhs);
-        int slot = push_temp(cg);
-        gen_expr(cg, n->rhs);
-        x_mov_rr(1, RCX, RAX);
-        pop_temp(cg, slot, RAX);
+        // Fast immediate specialization for shifts by a compile-time constant.
+        if ((n->op == T_SHL || n->op == T_SHR) && n->rhs->is_const && n->lhs->type->kind == TY_INT) {
+            int bits = n->lhs->type->size * 8;
+            if (n->rhs->cval >= 0 && n->rhs->cval < bits) {
+                gen_expr(cg, n->lhs);
+                if (n->rhs->cval > 0) {
+                    int ext = (n->op == T_SHL) ? 4 : (n->lhs->type->is_signed ? 7 : 5);
+                    x_shift_imm(ext, 1, RAX, (uint8_t)n->rhs->cval);
+                }
+                normalize_rax(n->lhs->type);
+                return;
+            }
+        }
+
+        // Fast immediate specialization for 32-bit signed constant RHS.
+        int32_t imm32 = 0;
+        if (n->lhs->type->kind != TY_FLOAT && fits_imm32(n->rhs, &imm32)) {
+            Type *lt = n->lhs->type;
+            if (n->op == T_EQ || n->op == T_NE || n->op == T_LT ||
+                n->op == T_LE || n->op == T_GT || n->op == T_GE) {
+                gen_expr(cg, n->lhs);
+                x_alu_ri(ALU_CMP, 1, RAX, imm32);
+                int cc = CC_E;
+                bool s = lt->is_signed;
+                switch (n->op) {
+                case T_EQ: cc = CC_E; break;
+                case T_NE: cc = CC_NE; break;
+                case T_LT: cc = s ? CC_L  : CC_B;  break;
+                case T_LE: cc = s ? CC_LE : CC_BE; break;
+                case T_GT: cc = s ? CC_G  : CC_A;  break;
+                case T_GE: cc = s ? CC_GE : CC_AE; break;
+                default: break;
+                }
+                x_setcc(cc, RAX);
+                x_movzx8(RAX, RAX);
+                return;
+            }
+            if (lt->kind == TY_INT && (n->op == T_AMP || n->op == T_PIPE || n->op == T_CARET)) {
+                gen_expr(cg, n->lhs);
+                int alu = (n->op == T_AMP) ? ALU_AND : (n->op == T_PIPE) ? ALU_OR : ALU_XOR;
+                x_alu_ri(alu, 1, RAX, imm32);
+                normalize_rax(lt);
+                return;
+            }
+            if (lt->kind == TY_INT &&
+                (n->op == T_PLUS || n->op == T_PLUSW || n->op == T_MINUS || n->op == T_MINUSW)) {
+                bool is_wrap = (n->op == T_PLUSW || n->op == T_MINUSW);
+                int alu = (n->op == T_PLUS || n->op == T_PLUSW) ? ALU_ADD : ALU_SUB;
+                if (is_wrap || cg->release) {
+                    gen_expr(cg, n->lhs);
+                    x_alu_ri(alu, 1, RAX, imm32);
+                    normalize_rax(lt);
+                    return;
+                }
+                if (lt->size == 8) {
+                    gen_expr(cg, n->lhs);
+                    x_alu_ri(alu, 1, RAX, imm32);
+                    emit_trap_if(cg, lt->is_signed ? CC_O : CC_B, n->pos,
+                                 alu == ALU_ADD ? "integer addition overflow" : "integer subtraction overflow");
+                    return;
+                }
+            }
+        }
+
+        // Evaluate left to right (spec §7.2); skip stack spill when RHS is a leaf operand.
+        if (is_simple_expr(n->rhs)) {
+            gen_expr(cg, n->lhs);
+            gen_simple_into_reg(n->rhs, RCX);
+        } else {
+            gen_expr(cg, n->lhs);
+            int slot = push_temp(cg);
+            gen_expr(cg, n->rhs);
+            x_mov_rr(1, RCX, RAX);
+            pop_temp(cg, slot, RAX);
+        }
 
         if (n->lhs->type->kind == TY_PTR && (n->op == T_PLUS || n->op == T_MINUS)) {
             int esz = n->lhs->type->elem->size;
             if (n->op == T_MINUS && n->rhs->type == n->lhs->type) {
                 // `p - q` -> (p - q) / elem_size
                 x_alu_rr(ALU_SUB, 1, RAX, RCX);
-                if (esz > 1) {
+                if (esz == 2)      x_shift_imm(7, 1, RAX, 1);
+                else if (esz == 4) x_shift_imm(7, 1, RAX, 2);
+                else if (esz == 8) x_shift_imm(7, 1, RAX, 3);
+                else if (esz > 1) {
                     x_mov_ri(RCX, (uint64_t)esz);
                     x_cqo();
                     x_f7(7, 1, RCX); // idiv rcx
@@ -816,10 +1016,7 @@ static void gen_expr(CG *cg, Node *n) {
                 return;
             }
             // `p + offset` or `p - offset`: scale RCX by elem_size.
-            if (esz > 1) {
-                x_mov_ri(RDX, (uint64_t)esz);
-                x_imul_rr(1, RCX, RDX);
-            }
+            scale_reg_by_size(RCX, esz, RDX);
             x_alu_rr(n->op == T_PLUS ? ALU_ADD : ALU_SUB, 1, RAX, RCX);
             return;
         }
@@ -949,11 +1146,7 @@ static void gen_assign(CG *cg, Node *n) {
         int s_addr2 = push_temp(cg); // preserve R8 across gen_int_op if needed
         x_store(RBP, slot_disp(s_addr2), R8);
         if (elem_t->kind == TY_PTR) {
-            int esz = elem_t->elem->size;
-            if (esz > 1) {
-                x_mov_ri(RDX, (uint64_t)esz);
-                x_imul_rr(1, RCX, RDX);
-            }
+            scale_reg_by_size(RCX, elem_t->elem->size, RDX);
             x_alu_rr(n->op == T_PLUS_ASSIGN ? ALU_ADD : ALU_SUB, 1, RAX, RCX);
         } else if (elem_t->kind == TY_FLOAT) {
             gen_float_op(assign_to_binop(n->op), elem_t);
@@ -980,19 +1173,66 @@ static void gen_assign(CG *cg, Node *n) {
             store_var(s, RAX);
             return;
         }
+        if (s->hw_reg >= 0 && is_simple_expr(n->rhs)) {
+            gen_simple_into_reg(n->rhs, s->hw_reg);
+            return;
+        }
         gen_expr(cg, n->rhs);
         store_var(s, RAX);
         return;
     }
-    gen_expr(cg, n->rhs);
-    x_mov_rr(1, RCX, RAX);
-    load_var(s, RAX);
-    if (s->type->kind == TY_PTR) {
-        int esz = s->type->elem->size;
-        if (esz > 1) {
-            x_mov_ri(RDX, (uint64_t)esz);
-            x_imul_rr(1, RCX, RDX);
+
+    // Fast in-register compound assignment (`i += 1`, `x -= 2`, `mask |= 4`, `x <<= 1`, ...).
+    int32_t imm32 = 0;
+    if (s->hw_reg >= 0 && s->type->kind == TY_INT) {
+        int r = s->hw_reg;
+        TokKind binop = assign_to_binop(n->op);
+        if ((binop == T_SHL || binop == T_SHR) && n->rhs->is_const) {
+            int bits = s->type->size * 8;
+            if (n->rhs->cval >= 0 && n->rhs->cval < bits) {
+                if (n->rhs->cval > 0) {
+                    int ext = (binop == T_SHL) ? 4 : (s->type->is_signed ? 7 : 5);
+                    x_shift_imm(ext, 1, r, (uint8_t)n->rhs->cval);
+                }
+                normalize_reg(r, s->type);
+                return;
+            }
         }
+        if (fits_imm32(n->rhs, &imm32)) {
+            if (binop == T_AMP || binop == T_PIPE || binop == T_CARET) {
+                int alu = (binop == T_AMP) ? ALU_AND : (binop == T_PIPE) ? ALU_OR : ALU_XOR;
+                x_alu_ri(alu, 1, r, imm32);
+                normalize_reg(r, s->type);
+                return;
+            }
+            if (binop == T_PLUS || binop == T_PLUSW || binop == T_MINUS || binop == T_MINUSW) {
+                bool is_wrap = (binop == T_PLUSW || binop == T_MINUSW);
+                int alu = (binop == T_PLUS || binop == T_PLUSW) ? ALU_ADD : ALU_SUB;
+                if (is_wrap || cg->release) {
+                    x_alu_ri(alu, 1, r, imm32);
+                    normalize_reg(r, s->type);
+                    return;
+                }
+                if (s->type->size == 8) {
+                    x_alu_ri(alu, 1, r, imm32);
+                    emit_trap_if(cg, s->type->is_signed ? CC_O : CC_B, n->pos,
+                                 alu == ALU_ADD ? "integer addition overflow" : "integer subtraction overflow");
+                    return;
+                }
+            }
+        }
+    }
+
+    if (is_simple_expr(n->rhs)) {
+        load_var(s, RAX);
+        gen_simple_into_reg(n->rhs, RCX);
+    } else {
+        gen_expr(cg, n->rhs);
+        x_mov_rr(1, RCX, RAX);
+        load_var(s, RAX);
+    }
+    if (s->type->kind == TY_PTR) {
+        scale_reg_by_size(RCX, s->type->elem->size, RDX);
         x_alu_rr(n->op == T_PLUS_ASSIGN ? ALU_ADD : ALU_SUB, 1, RAX, RCX);
     } else if (s->type->kind == TY_FLOAT) {
         gen_float_op(assign_to_binop(n->op), s->type);
@@ -1000,6 +1240,92 @@ static void gen_assign(CG *cg, Node *n) {
         gen_int_op(cg, assign_to_binop(n->op), s->type, n->pos);
     }
     store_var(s, RAX);
+}
+
+// Emits a fused conditional jump to `target` when `cond` evaluates to `jump_if_true`.
+static void gen_cond_jump(CG *cg, Node *cond, int target, bool jump_if_true) {
+    if (cond->kind == N_UNARY && cond->op == T_BANG) {
+        gen_cond_jump(cg, cond->lhs, target, !jump_if_true);
+        return;
+    }
+    if (cond->kind == N_BINARY && cond->op == T_ANDAND) {
+        if (!jump_if_true) {
+            gen_cond_jump(cg, cond->lhs, target, false);
+            gen_cond_jump(cg, cond->rhs, target, false);
+        } else {
+            int l_skip = x_label();
+            gen_cond_jump(cg, cond->lhs, l_skip, false);
+            gen_cond_jump(cg, cond->rhs, target, true);
+            x_bind(l_skip);
+        }
+        return;
+    }
+    if (cond->kind == N_BINARY && cond->op == T_OROR) {
+        if (jump_if_true) {
+            gen_cond_jump(cg, cond->lhs, target, true);
+            gen_cond_jump(cg, cond->rhs, target, true);
+        } else {
+            int l_true = x_label();
+            gen_cond_jump(cg, cond->lhs, l_true, true);
+            gen_cond_jump(cg, cond->rhs, target, false);
+            x_bind(l_true);
+        }
+        return;
+    }
+    if (cond->kind == N_BINARY && cond->lhs->type->kind != TY_FLOAT &&
+        (cond->op == T_EQ || cond->op == T_NE || cond->op == T_LT ||
+         cond->op == T_LE || cond->op == T_GT || cond->op == T_GE)) {
+        int cc = CC_E;
+        bool s = cond->lhs->type->is_signed;
+        switch (cond->op) {
+        case T_EQ: cc = CC_E; break;
+        case T_NE: cc = CC_NE; break;
+        case T_LT: cc = s ? CC_L  : CC_B;  break;
+        case T_LE: cc = s ? CC_LE : CC_BE; break;
+        case T_GT: cc = s ? CC_G  : CC_A;  break;
+        case T_GE: cc = s ? CC_GE : CC_AE; break;
+        default: break;
+        }
+        if (!jump_if_true) cc ^= 1;
+
+        int32_t imm32 = 0;
+        bool lhs_in_reg = (cond->lhs->kind == N_IDENT && !cond->lhs->implicit_slice &&
+                           cond->lhs->sym->hw_reg >= 0);
+        bool rhs_in_reg = (cond->rhs->kind == N_IDENT && !cond->rhs->implicit_slice &&
+                           cond->rhs->sym->hw_reg >= 0);
+
+        if (lhs_in_reg && fits_imm32(cond->rhs, &imm32)) {
+            x_alu_ri(ALU_CMP, 1, cond->lhs->sym->hw_reg, imm32);
+        } else if (lhs_in_reg && rhs_in_reg) {
+            x_alu_rr(ALU_CMP, 1, cond->lhs->sym->hw_reg, cond->rhs->sym->hw_reg);
+        } else if (fits_imm32(cond->rhs, &imm32)) {
+            gen_expr(cg, cond->lhs);
+            x_alu_ri(ALU_CMP, 1, RAX, imm32);
+        } else if (is_simple_expr(cond->rhs)) {
+            gen_expr(cg, cond->lhs);
+            gen_simple_into_reg(cond->rhs, RCX);
+            x_alu_rr(ALU_CMP, 1, RAX, RCX);
+        } else {
+            gen_expr(cg, cond->lhs);
+            int slot = push_temp(cg);
+            gen_expr(cg, cond->rhs);
+            x_mov_rr(1, RCX, RAX);
+            pop_temp(cg, slot, RAX);
+            x_alu_rr(ALU_CMP, 1, RAX, RCX);
+        }
+        x_jcc(cc, target);
+        return;
+    }
+
+    if (cond->kind == N_IDENT && !cond->implicit_slice && cond->sym->hw_reg >= 0) {
+        x_test_rr(0, cond->sym->hw_reg, cond->sym->hw_reg);
+        x_jcc(jump_if_true ? CC_NE : CC_E, target);
+        return;
+    }
+
+    gen_expr(cg, cond);
+    x_test_rr(0, RAX, RAX);
+    x_jcc(jump_if_true ? CC_NE : CC_E, target);
 }
 
 // Spec §6.6: range loop `loop i in a..b [by s]` and `rev(...)`.
@@ -1010,6 +1336,55 @@ static void gen_range_loop(CG *cg, Node *n) {
     int s_start = n->slot_start;
     int s_end   = n->slot_end;
     int s_step  = n->slot_step;
+
+    int l_cond = x_label();
+    int l_cont = x_label();
+    int l_brk  = x_label();
+    n->label_continue = l_cont;
+    n->label_break    = l_brk;
+
+    // Fast path for forward unit-step range loops `loop i in a..b`:
+    // No division needed; increments `i` by 1 until `i == end`.
+    if (!n->rev && (!n->by || (n->by->is_const && n->by->cval == 1))) {
+        gen_expr(cg, n->lo);
+        x_store(RBP, slot_disp(s_start), RAX);
+        gen_expr(cg, n->hi);
+        x_store(RBP, slot_disp(s_end), RAX);
+        x_mov_rr(1, RCX, RAX);
+        x_load(RAX, RBP, slot_disp(s_start));
+        x_alu_rr(ALU_CMP, 1, RAX, RCX);
+        x_jcc(t->is_signed ? CC_GE : CC_AE, l_brk);
+
+        store_var(n->sym, RAX);
+
+        x_bind(l_cond);
+        gen_block(cg, n->body);
+
+        x_bind(l_cont);
+        int32_t end_imm = 0;
+        if (n->sym->hw_reg >= 0) {
+            int r = n->sym->hw_reg;
+            x_alu_ri(ALU_ADD, 1, r, 1);
+            if (fits_imm32(n->hi, &end_imm)) {
+                x_alu_ri(ALU_CMP, 1, r, end_imm);
+            } else {
+                x_alu_rm(ALU_CMP, 1, r, RBP, slot_disp(s_end));
+            }
+            x_jcc(CC_NE, l_cond);
+        } else {
+            load_var(n->sym, RAX);
+            x_alu_ri(ALU_ADD, 1, RAX, 1);
+            store_var(n->sym, RAX);
+            if (fits_imm32(n->hi, &end_imm)) {
+                x_alu_ri(ALU_CMP, 1, RAX, end_imm);
+            } else {
+                x_alu_rm(ALU_CMP, 1, RAX, RBP, slot_disp(s_end));
+            }
+            x_jcc(CC_NE, l_cond);
+        }
+        x_bind(l_brk);
+        return;
+    }
 
     // 1. Evaluate `lo`, `hi`, `by` once, in order.
     gen_expr(cg, n->lo);
@@ -1032,12 +1407,6 @@ static void gen_range_loop(CG *cg, Node *n) {
     }
     x_store(RBP, slot_disp(s_step), RAX);
 
-    int l_cond = x_label();
-    int l_cont = x_label();
-    int l_brk  = x_label();
-    n->label_continue = l_cont;
-    n->label_break    = l_brk;
-
     // 2. If start >= end, skip the loop entirely.
     x_load(RAX, RBP, slot_disp(s_start));
     x_load(RCX, RBP, slot_disp(s_end));
@@ -1059,14 +1428,14 @@ static void gen_range_loop(CG *cg, Node *n) {
         x_imul_rr(1, RAX, RCX);
         x_alu_rm(ALU_ADD, 1, RAX, RBP, slot_disp(s_start));
         normalize_rax(t);
-        x_store(RBP, slot_disp(n->sym->slot), RAX);     // i = last element
+        store_var(n->sym, RAX);                         // i = last element
         x_alu_ri(ALU_ADD, 1, R8, 1);
         x_store(RBP, slot_disp(s_end), R8);             // s_end holds remaining count
     } else {
         x_alu_ri(ALU_ADD, 1, RAX, 1);
         x_store(RBP, slot_disp(s_end), RAX);            // s_end holds remaining count
         x_load(RAX, RBP, slot_disp(s_start));
-        x_store(RBP, slot_disp(n->sym->slot), RAX);     // i = start
+        store_var(n->sym, RAX);                         // i = start
     }
 
     // 4. Loop body & step.
@@ -1079,11 +1448,11 @@ static void gen_range_loop(CG *cg, Node *n) {
     x_jcc(CC_E, l_brk);
     x_store(RBP, slot_disp(s_end), RAX);
 
-    x_load(RAX, RBP, slot_disp(n->sym->slot));
+    load_var(n->sym, RAX);
     if (n->rev) x_alu_rm(ALU_SUB, 1, RAX, RBP, slot_disp(s_step));
     else        x_alu_rm(ALU_ADD, 1, RAX, RBP, slot_disp(s_step));
     normalize_rax(t);
-    x_store(RBP, slot_disp(n->sym->slot), RAX);
+    store_var(n->sym, RAX);
     x_jmp(l_cond);
 
     x_bind(l_brk);
@@ -1115,12 +1484,9 @@ static void gen_iter_loop(CG *cg, Node *n) {
     // Load current element `ptr[idx]`.
     if (n->sym2) {
         // `loop i, x in arr`: n->sym = i, n->sym2 = x
-        x_store(RBP, slot_disp(n->sym->slot), RAX);
+        store_var(n->sym, RAX);
     }
-    if (elem_t->size > 1) {
-        x_mov_ri(RDX, (uint64_t)elem_t->size);
-        x_imul_rr(1, RAX, RDX);
-    }
+    scale_reg_by_size(RAX, elem_t->size, RDX);
     x_load(RCX, RBP, slot_disp(s_ptr));
     x_alu_rr(ALU_ADD, 1, RAX, RCX);
     Symbol *val_sym = n->sym2 ? n->sym2 : n->sym;
@@ -1131,7 +1497,7 @@ static void gen_iter_loop(CG *cg, Node *n) {
         x_rep_movsb();
     } else {
         x_load_sized(RAX, RAX, 0, elem_t->size, elem_t->is_signed);
-        x_store(RBP, slot_disp(val_sym->slot), RAX);
+        store_var(val_sym, RAX);
     }
 
     gen_block(cg, n->body);
@@ -1186,9 +1552,7 @@ static void gen_stmt(CG *cg, Node *n) {
 
     case N_IF: {
         int l_else = x_label(), l_end = x_label();
-        gen_expr(cg, n->cond);
-        x_test_rr(0, RAX, RAX);
-        x_jcc(CC_E, n->els ? l_else : l_end);
+        gen_cond_jump(cg, n->cond, n->els ? l_else : l_end, false);
         gen_block(cg, n->body);
         if (n->els) {
             x_jmp(l_end);
@@ -1216,9 +1580,7 @@ static void gen_stmt(CG *cg, Node *n) {
         n->label_continue = l_cond;
         n->label_break    = l_brk;
         x_bind(l_cond);
-        gen_expr(cg, n->cond);
-        x_test_rr(0, RAX, RAX);
-        x_jcc(CC_E, l_brk);
+        gen_cond_jump(cg, n->cond, l_brk, false);
         gen_block(cg, n->body);
         x_jmp(l_cond);
         x_bind(l_brk);
@@ -1239,9 +1601,7 @@ static void gen_stmt(CG *cg, Node *n) {
         n->label_break    = l_brk;
         gen_stmt(cg, n->init);
         x_bind(l_cond);
-        gen_expr(cg, n->cond);
-        x_test_rr(0, RAX, RAX);
-        x_jcc(CC_E, l_brk);
+        gen_cond_jump(cg, n->cond, l_brk, false);
         gen_block(cg, n->body);
         x_bind(l_cont);
         gen_assign(cg, n->step);
@@ -1265,20 +1625,159 @@ static void gen_block(CG *cg, Node *b) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Loop-weighted callee-saved register allocator (RBX, R12, R13, R14, R15)
+// ---------------------------------------------------------------------------
+
+typedef VEC(Symbol *) SymVec;
+
+static void record_local_sym(SymVec *locals, Symbol *s) {
+    if (!s || s->is_global) return;
+    if (s->kind != SYM_VAR && s->kind != SYM_PARAM) return;
+    for (int i = 0; i < locals->len; i++) {
+        if (locals->items[i] == s) return;
+    }
+    s->addr_taken = false;
+    s->use_score  = 0;
+    s->hw_reg     = -1;
+    vec_push(*locals, s);
+}
+
+static void add_sym_score(SymVec *locals, Symbol *s, int delta) {
+    if (!s || s->is_global) return;
+    if (s->kind != SYM_VAR && s->kind != SYM_PARAM) return;
+    record_local_sym(locals, s);
+    if (s->use_score < 100000000) {
+        s->use_score += delta;
+    }
+}
+
+static void scan_node_vars(SymVec *locals, Node *n, int weight) {
+    if (!n) return;
+    int loop_w = (weight < 100000) ? weight * 8 : weight;
+
+    switch (n->kind) {
+    case N_ADDR: {
+        Node *base = n->lhs;
+        while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
+            base = base->lhs;
+        }
+        if (base && base->kind == N_IDENT && base->sym) {
+            record_local_sym(locals, base->sym);
+            base->sym->addr_taken = true;
+        }
+        scan_node_vars(locals, n->lhs, weight);
+        return;
+    }
+    case N_IDENT:
+        add_sym_score(locals, n->sym, weight);
+        return;
+    case N_VAR:
+        record_local_sym(locals, n->sym);
+        if (n->rhs) {
+            add_sym_score(locals, n->sym, weight);
+            scan_node_vars(locals, n->rhs, weight);
+        }
+        return;
+    case N_ASSIGN:
+        if (n->sym) {
+            add_sym_score(locals, n->sym, (n->op == T_ASSIGN ? 1 : 2) * weight);
+        }
+        scan_node_vars(locals, n->lhs, weight);
+        scan_node_vars(locals, n->rhs, weight);
+        return;
+    case N_LOOP_INF:
+        scan_node_vars(locals, n->body, loop_w);
+        return;
+    case N_LOOP_COND:
+        scan_node_vars(locals, n->cond, loop_w);
+        scan_node_vars(locals, n->body, loop_w);
+        return;
+    case N_LOOP_RANGE:
+        scan_node_vars(locals, n->lo, weight);
+        scan_node_vars(locals, n->hi, weight);
+        scan_node_vars(locals, n->by, weight);
+        add_sym_score(locals, n->sym, 2 * loop_w);
+        scan_node_vars(locals, n->body, loop_w);
+        return;
+    case N_LOOP_ITER:
+        scan_node_vars(locals, n->lhs, weight);
+        add_sym_score(locals, n->sym, loop_w);
+        if (n->sym2) add_sym_score(locals, n->sym2, loop_w);
+        scan_node_vars(locals, n->body, loop_w);
+        return;
+    case N_LOOP_C:
+        scan_node_vars(locals, n->init, weight);
+        scan_node_vars(locals, n->cond, loop_w);
+        scan_node_vars(locals, n->step, loop_w);
+        scan_node_vars(locals, n->body, loop_w);
+        return;
+    default:
+        scan_node_vars(locals, n->lhs, weight);
+        scan_node_vars(locals, n->rhs, weight);
+        scan_node_vars(locals, n->cond, weight);
+        scan_node_vars(locals, n->body, weight);
+        scan_node_vars(locals, n->els, weight);
+        scan_node_vars(locals, n->lo, weight);
+        scan_node_vars(locals, n->hi, weight);
+        for (int i = 0; i < n->list.len; i++) {
+            scan_node_vars(locals, n->list.items[i], weight);
+        }
+        return;
+    }
+}
+
+static int alloc_fn_regs(Node *fn, int out_regs[5]) {
+    static const int callee_regs[5] = {RBX, R12, R13, R14, R15};
+    SymVec locals = {0};
+    for (int i = 0; i < fn->list.len; i++) {
+        record_local_sym(&locals, fn->list.items[i]->sym);
+    }
+    scan_node_vars(&locals, fn->body, 1);
+
+    int n_alloc = 0;
+    for (int k = 0; k < 5; k++) {
+        Symbol *best = NULL;
+        for (int i = 0; i < locals.len; i++) {
+            Symbol *s = locals.items[i];
+            if (s->hw_reg >= 0 || s->addr_taken || s->use_score < 2) continue;
+            Type *t = s->type;
+            if (!t || (t->kind != TY_INT && t->kind != TY_BOOL &&
+                       t->kind != TY_FLOAT && t->kind != TY_PTR)) continue;
+            if (!best || s->use_score > best->use_score) {
+                best = s;
+            }
+        }
+        if (!best) break;
+        best->hw_reg = callee_regs[k];
+        out_regs[n_alloc++] = callee_regs[k];
+    }
+    free(locals.items);
+    return n_alloc;
+}
+
 static void gen_fn(CG *cg, Node *fn) {
+    int saved_regs[5];
+    int num_saved = alloc_fn_regs(fn, saved_regs);
+
     x_bind(fn->sym->label);
     x_push(RBP);
     x_mov_rr(1, RBP, RSP);
     uint32_t patch = x_sub_rsp_patchable();
 
     cg->cur_epilogue = x_label();
-    cg->base_slots = fn->num_slots;
+    cg->base_slots = fn->num_slots + num_saved;
     cg->temp_depth = 0;
     cg->max_temp_depth = 0;
     cg->max_out_stack_args = 0;
 
-    // Save non-volatile registers RSI and RDI in case array copy/zero uses rep movsb/stosb.
-    // Spill incoming parameters (Microsoft x64 ABI: RCX, RDX, R8, R9, then [RBP+48+...]).
+    // Save allocated non-volatile registers (RBX, R12..R15).
+    for (int k = 0; k < num_saved; k++) {
+        x_store(RBP, slot_disp(fn->num_slots + 1 + k), saved_regs[k]);
+    }
+
+    // Move incoming parameters into their allocated registers or stack slots
+    // (Microsoft x64 ABI: RCX, RDX, R8, R9, then [RBP+48+...]).
     static const int arg_regs[4] = {RCX, RDX, R8, R9};
     for (int i = 0; i < fn->list.len; i++) {
         Symbol *ps = fn->list.items[i]->sym;
@@ -1295,19 +1794,22 @@ static void gen_fn(CG *cg, Node *fn) {
             x_store(RBP, slot_disp(ps->slot), R10);
             x_store(RBP, slot_disp(ps->slot) + 8, R11);
         } else {
-            x_store(RBP, slot_disp(ps->slot), reg);
+            store_var(ps, reg);
         }
     }
 
     gen_block(cg, fn->body);
 
     x_bind(cg->cur_epilogue);
+    for (int k = 0; k < num_saved; k++) {
+        x_load(saved_regs[k], RBP, slot_disp(fn->num_slots + 1 + k));
+    }
     x_leave();
     x_ret();
 
-    // Frame size: local slots + expression temp slots + 32-byte shadow space +
-    // outgoing stack arguments, rounded up to 16 bytes.
-    int total_locals = (fn->num_slots + cg->max_temp_depth) * 8;
+    // Frame size: local slots + saved callee-saved reg slots + expression temp slots +
+    // 32-byte shadow space + outgoing stack arguments, rounded up to 16 bytes.
+    int total_locals = (cg->base_slots + cg->max_temp_depth) * 8;
     int out_area = 32 + cg->max_out_stack_args * 8;
     int frame = total_locals + out_area;
     if (frame % 16 != 0) frame += 16 - (frame % 16);
