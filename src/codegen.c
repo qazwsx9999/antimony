@@ -16,6 +16,7 @@ typedef struct {
     int rt_write;             // (rcx=ptr, rdx=len) -> writes to stdout
     int rt_print_i64;         // (rcx=val)
     int rt_print_u64;         // (rcx=val)
+    int rt_print_f64;         // (rcx=f64 bits)
     int rt_print_bool;        // (rcx=0/1)
     int rt_print_str;         // (rcx=ptr, rdx=len)
     int rt_trap;              // (rcx=msg_ptr, rdx=msg_len) -> stderr + ExitProcess(101)
@@ -153,9 +154,92 @@ static void pop_temp(CG *cg, int slot, int reg) {
     cg->temp_depth--;
 }
 
-// ---------------------------------------------------------------------------
-// Arithmetic core: combines RAX (left) and RCX (right) of type `t` -> RAX
-// ---------------------------------------------------------------------------
+static uint64_t fval_bits(double v, Type *t) {
+    if (t == &ty_f32) {
+        float f = (float)v;
+        uint32_t u = 0;
+        memcpy(&u, &f, 4);
+        return (uint64_t)u;
+    }
+    uint64_t u = 0;
+    memcpy(&u, &v, 8);
+    return u;
+}
+
+// Loads float value (f32 or f64) from GPR `gpr` into `xmm` as a 64-bit double.
+static void gpr_to_xmm_f64(int xmm, int gpr, Type *t) {
+    x_movq_xmm_gpr(xmm, gpr);
+    if (t == &ty_f32) {
+        x_cvtss2sd(xmm, xmm);
+    }
+}
+
+// Converts `xmm` (64-bit double) back into `gpr` in the representation of `t` (f32 or f64).
+static void xmm_f64_to_gpr(int gpr, int xmm, Type *t) {
+    if (t == &ty_f32) {
+        x_cvtsd2ss(xmm, xmm);
+    }
+    x_movq_gpr_xmm(gpr, xmm);
+    if (t == &ty_f32) {
+        x_mov_rr(0, gpr, gpr); // zero-extend 32-bit float bits
+    }
+}
+
+// Combines RAX (left) and RCX (right) of float type `t` -> RAX.
+static void gen_float_op(TokKind op, Type *t) {
+    gpr_to_xmm_f64(0, RAX, t); // XMM0 = lhs
+    gpr_to_xmm_f64(1, RCX, t); // XMM1 = rhs
+
+    switch (op) {
+    case T_PLUS:
+        x_sse_sd(0x58, 0, 1); // addsd xmm0, xmm1
+        xmm_f64_to_gpr(RAX, 0, t);
+        return;
+    case T_MINUS:
+        x_sse_sd(0x5C, 0, 1); // subsd xmm0, xmm1
+        xmm_f64_to_gpr(RAX, 0, t);
+        return;
+    case T_STAR:
+        x_sse_sd(0x59, 0, 1); // mulsd xmm0, xmm1
+        xmm_f64_to_gpr(RAX, 0, t);
+        return;
+    case T_SLASH:
+        x_sse_sd(0x5E, 0, 1); // divsd xmm0, xmm1
+        xmm_f64_to_gpr(RAX, 0, t);
+        return;
+    case T_EQ: case T_NE: case T_LT: case T_LE: case T_GT: case T_GE: {
+        // ucomisd sets ZF/PF/CF; for `<` and `<=`, swap operands and use `>` / `>=`
+        // so unordered NaN comparisons return false properly.
+        if (op == T_LT) {
+            x_ucomisd(1, 0);
+            x_setcc(CC_A, RAX);
+        } else if (op == T_LE) {
+            x_ucomisd(1, 0);
+            x_setcc(CC_AE, RAX);
+        } else if (op == T_GT) {
+            x_ucomisd(0, 1);
+            x_setcc(CC_A, RAX);
+        } else if (op == T_GE) {
+            x_ucomisd(0, 1);
+            x_setcc(CC_AE, RAX);
+        } else if (op == T_EQ) {
+            x_ucomisd(0, 1);
+            x_setcc(CC_E, RAX);
+            x_setcc(CC_NP, RCX);
+            x_alu_rr(ALU_AND, 0, RAX, RCX);
+        } else { // T_NE
+            x_ucomisd(0, 1);
+            x_setcc(CC_NE, RAX);
+            x_setcc(CC_P, RCX);
+            x_alu_rr(ALU_OR, 0, RAX, RCX);
+        }
+        x_movzx8(RAX, RAX);
+        return;
+    }
+    default:
+        die("internal error: unhandled float op in codegen");
+    }
+}
 
 static void gen_int_op(CG *cg, TokKind op, Type *t, Pos pos) {
     bool is_wrap = (op == T_PLUSW || op == T_MINUSW || op == T_STARW);
@@ -451,6 +535,10 @@ static void gen_init_at_addr(CG *cg, int addr_slot, Node *rhs, Type *t) {
 }
 
 static void gen_expr(CG *cg, Node *n) {
+    if (n->is_const && n->type->kind == TY_FLOAT) {
+        x_mov_ri(RAX, fval_bits(n->fval, n->type));
+        return;
+    }
     if (n->is_const && (n->type->kind == TY_INT || n->type == &ty_bool)) {
         x_mov_ri(RAX, (uint64_t)(int64_t)n->cval);
         normalize_rax(n->type);
@@ -462,6 +550,10 @@ static void gen_expr(CG *cg, Node *n) {
     case N_BOOL:
     case N_NULL:
         x_mov_ri(RAX, (uint64_t)(int64_t)n->cval);
+        return;
+
+    case N_FLOAT:
+        x_mov_ri(RAX, fval_bits(n->fval, n->type));
         return;
 
     case N_ADDR:
@@ -614,6 +706,13 @@ static void gen_expr(CG *cg, Node *n) {
             x_f7(2, 1, RAX); // not rax
             normalize_rax(n->type);
         } else if (n->op == T_MINUS) {
+            if (n->type->kind == TY_FLOAT) {
+                // Flip the IEEE-754 sign bit (bit 31 for f32, bit 63 for f64).
+                uint64_t sign_mask = (n->type == &ty_f32) ? (1ULL << 31) : (1ULL << 63);
+                x_mov_ri(RCX, sign_mask);
+                x_alu_rr(ALU_XOR, 1, RAX, RCX);
+                return;
+            }
             if (!cg->release) {
                 if (n->type->size == 8) {
                     x_f7(3, 1, RAX); // neg rax
@@ -634,6 +733,27 @@ static void gen_expr(CG *cg, Node *n) {
         Type *dst = n->type;
         gen_expr(cg, n->lhs);
         if (src == dst) return;
+        if (src->kind == TY_FLOAT && dst->kind == TY_FLOAT) {
+            // f32 <-> f64
+            gpr_to_xmm_f64(0, RAX, src);
+            xmm_f64_to_gpr(RAX, 0, dst);
+            return;
+        }
+        if (src->kind == TY_INT && dst->kind == TY_FLOAT) {
+            // integer -> f32/f64
+            x_cvtsi2sd(0, RAX);
+            xmm_f64_to_gpr(RAX, 0, dst);
+            return;
+        }
+        if (src->kind == TY_FLOAT && dst->kind == TY_INT) {
+            // f32/f64 -> integer (truncating toward zero)
+            gpr_to_xmm_f64(0, RAX, src);
+            x_cvttsd2si(RAX, 0);
+            if (dst->size < 8) {
+                check_and_normalize_sub64(cg, dst, true, n->pos, "float to integer conversion out of range");
+            }
+            return;
+        }
         if (dst->size == 8) {
             if (!cg->release && src->is_signed && !dst->is_signed) {
                 // signed -> u64/usize: negative values are out of range
@@ -704,6 +824,11 @@ static void gen_expr(CG *cg, Node *n) {
             return;
         }
 
+        if (n->lhs->type->kind == TY_FLOAT) {
+            gen_float_op(n->op, n->lhs->type);
+            return;
+        }
+
         gen_int_op(cg, n->op, n->lhs->type, n->pos);
         return;
     }
@@ -718,6 +843,10 @@ static void gen_expr(CG *cg, Node *n) {
             } else if (arg->type == &ty_bool) {
                 x_mov_rr(1, RCX, RAX);
                 x_call(cg->rt_print_bool);
+            } else if (arg->type->kind == TY_FLOAT) {
+                gpr_to_xmm_f64(0, RAX, arg->type);
+                x_movq_gpr_xmm(RCX, 0);
+                x_call(cg->rt_print_f64);
             } else if (arg->type->kind == TY_PTR) {
                 x_mov_rr(1, RCX, RAX);
                 x_call(cg->rt_print_u64);
@@ -826,6 +955,8 @@ static void gen_assign(CG *cg, Node *n) {
                 x_imul_rr(1, RCX, RDX);
             }
             x_alu_rr(n->op == T_PLUS_ASSIGN ? ALU_ADD : ALU_SUB, 1, RAX, RCX);
+        } else if (elem_t->kind == TY_FLOAT) {
+            gen_float_op(assign_to_binop(n->op), elem_t);
         } else {
             gen_int_op(cg, assign_to_binop(n->op), elem_t, n->pos);
         }
@@ -863,6 +994,8 @@ static void gen_assign(CG *cg, Node *n) {
             x_imul_rr(1, RCX, RDX);
         }
         x_alu_rr(n->op == T_PLUS_ASSIGN ? ALU_ADD : ALU_SUB, 1, RAX, RCX);
+    } else if (s->type->kind == TY_FLOAT) {
+        gen_float_op(assign_to_binop(n->op), s->type);
     } else {
         gen_int_op(cg, assign_to_binop(n->op), s->type, n->pos);
     }
@@ -1189,6 +1322,7 @@ static void emit_runtime(CG *cg) {
     cg->rt_write      = x_label();
     cg->rt_print_i64  = x_label();
     cg->rt_print_u64  = x_label();
+    cg->rt_print_f64  = x_label();
     cg->rt_print_bool = x_label();
     cg->rt_print_str  = x_label();
     cg->rt_trap       = x_label();
@@ -1273,6 +1407,105 @@ static void emit_runtime(CG *cg) {
     x_leave();
     x_ret();
 
+    // rt_print_f64(rcx = f64 IEEE-754 bits):
+    // Formats with 6 decimal digits (rounded to nearest millionth), trimming trailing
+    // zeros up to at least 1 digit after '.', e.g. `3.141593`, `2.5`, `-0.25`.
+    x_bind(cg->rt_print_f64);
+    x_push(RBP);
+    x_mov_rr(1, RBP, RSP);
+    x_alu_ri(ALU_SUB, 1, RSP, 64);
+    x_mov_rr(1, RAX, RCX);
+    x_mov_ri(R10, 0);        // sign flag
+    x_test_rr(1, RAX, RAX);  // bit 63 = IEEE-754 sign bit
+    int f_pos = x_label();
+    x_jcc(CC_NS, f_pos);
+    x_mov_ri(RCX, 1ULL << 63);
+    x_alu_rr(ALU_XOR, 1, RAX, RCX); // clear sign bit -> abs(x)
+    x_mov_ri(R10, 1);
+    x_bind(f_pos);
+
+    // Multiply abs(x) by 1,000,000 and add 0.5 for rounding, then cvttsd2si -> RAX.
+    x_movq_xmm_gpr(0, RAX);
+    uint64_t scale_bits = fval_bits(1000000.0, &ty_f64);
+    uint64_t half_bits  = fval_bits(0.5, &ty_f64);
+    x_mov_ri(RCX, scale_bits);
+    x_movq_xmm_gpr(1, RCX);
+    x_sse_sd(0x59, 0, 1);    // mulsd xmm0, 1e6
+    x_mov_ri(RCX, half_bits);
+    x_movq_xmm_gpr(1, RCX);
+    x_sse_sd(0x58, 0, 1);    // addsd xmm0, 0.5
+    x_cvttsd2si(RAX, 0);     // RAX = integer millionths
+
+    // Split RAX into integer part (RAX / 1_000_000) and fractional part (RAX % 1_000_000).
+    x_mov_ri(RDX, 0);
+    x_mov_ri(R9, 1000000);
+    x_f7(6, 1, R9);          // RAX = int_part, RDX = frac_part (0..999999)
+    x_mov_rr(1, R11, RAX);   // save int_part in R11
+    x_mov_rr(1, RAX, RDX);   // RAX = frac_part
+
+    x_lea(R8, RBP, -1);
+    x_store8_imm(R8, 0, '\n');
+    x_mov_ri(R9, 10);
+
+    // Strip trailing zeros from frac_part (keeping at least 1 fractional digit).
+    x_mov_ri(RCX, 6);        // number of fractional digits remaining
+    int strip_loop = x_label(), strip_done = x_label();
+    x_bind(strip_loop);
+    x_alu_ri(ALU_CMP, 1, RCX, 1);
+    x_jcc(CC_LE, strip_done);
+    x_mov_ri(RDX, 0);
+    x_f7(6, 1, R9);          // RAX = quot, RDX = rem
+    x_test_rr(1, RDX, RDX);
+    int not_zero = x_label();
+    x_jcc(CC_NE, not_zero);
+    x_alu_ri(ALU_SUB, 1, RCX, 1);
+    x_jmp(strip_loop);
+    x_bind(not_zero);
+    // Restore RAX = RAX * 10 + RDX
+    x_imul_rr(1, RAX, R9);
+    x_alu_rr(ALU_ADD, 1, RAX, RDX);
+    x_bind(strip_done);
+
+    // Emit the `RCX` fractional digits.
+    int frac_loop = x_label();
+    x_bind(frac_loop);
+    x_alu_ri(ALU_SUB, 1, R8, 1);
+    x_mov_ri(RDX, 0);
+    x_f7(6, 1, R9);
+    x_alu_ri(ALU_ADD, 0, RDX, '0');
+    x_store8(R8, 0, RDX);
+    x_alu_ri(ALU_SUB, 1, RCX, 1);
+    x_jcc(CC_NE, frac_loop);
+
+    // Emit '.'
+    x_alu_ri(ALU_SUB, 1, R8, 1);
+    x_store8_imm(R8, 0, '.');
+
+    // Emit integer part from R11.
+    x_mov_rr(1, RAX, R11);
+    int fi_loop = x_label();
+    x_bind(fi_loop);
+    x_alu_ri(ALU_SUB, 1, R8, 1);
+    x_mov_ri(RDX, 0);
+    x_f7(6, 1, R9);
+    x_alu_ri(ALU_ADD, 0, RDX, '0');
+    x_store8(R8, 0, RDX);
+    x_test_rr(1, RAX, RAX);
+    x_jcc(CC_NE, fi_loop);
+
+    x_test_rr(1, R10, R10);
+    int f_no_minus = x_label();
+    x_jcc(CC_E, f_no_minus);
+    x_alu_ri(ALU_SUB, 1, R8, 1);
+    x_store8_imm(R8, 0, '-');
+    x_bind(f_no_minus);
+    x_mov_rr(1, RCX, R8);
+    x_mov_rr(1, RDX, RBP);
+    x_alu_rr(ALU_SUB, 1, RDX, R8);
+    x_call(cg->rt_write);
+    x_leave();
+    x_ret();
+
     // rt_print_bool(rcx = 0 or 1).
     uint32_t s_true  = add_string(cg, "true\n", 5);
     uint32_t s_false = add_string(cg, "false\n", 6);
@@ -1344,7 +1577,12 @@ Image codegen(Program *prog, bool release) {
             Node *rhs = g->decl->rhs;
             int init_n = rhs ? rhs->list.len : 0;
             for (int j = 0; j < g->type->array_len; j++) {
-                uint64_t v = (j < init_n) ? (uint64_t)(int64_t)rhs->list.items[j]->cval : 0;
+                uint64_t v = 0;
+                if (j < init_n) {
+                    Node *el = rhs->list.items[j];
+                    v = (elem_t->kind == TY_FLOAT) ? fval_bits(el->fval, elem_t)
+                                                   : (uint64_t)(int64_t)el->cval;
+                }
                 if (elem_t->size == 1)      buf_u8(&cg.data, (uint8_t)v);
                 else if (elem_t->size == 2) buf_u16(&cg.data, (uint16_t)v);
                 else if (elem_t->size == 4) buf_u32(&cg.data, (uint32_t)v);
@@ -1357,10 +1595,14 @@ Image codegen(Program *prog, bool release) {
             if (rhs && rhs->kind == N_STRUCT_LIT) {
                 for (int j = 0; j < rhs->list.len; j++) {
                     Node *fi = rhs->list.items[j];
-                    uint64_t v = (uint64_t)(int64_t)fi->rhs->cval;
+                    uint64_t v = (fi->type->kind == TY_FLOAT)
+                        ? fval_bits(fi->rhs->fval, fi->type)
+                        : (uint64_t)(int64_t)fi->rhs->cval;
                     memcpy(cg.data.data + base_off + fi->field_offset, &v, (size_t)fi->type->size);
                 }
             }
+        } else if (g->type->kind == TY_FLOAT) {
+            buf_u64(&cg.data, fval_bits(g->fval, g->type));
         } else {
             buf_u64(&cg.data, (uint64_t)(int64_t)g->cval);
         }

@@ -154,6 +154,7 @@ typedef struct Symbol {
     int state;           // global const resolution: 0 todo, 1 in progress, 2 done
     int builtin;         // BuiltinId
     int label;           // fn: code label
+    double fval;         // SYM_CONST float value
 } Symbol;
 
 // ---------------------------------------------------------------------------
@@ -209,6 +210,7 @@ struct Node {
     Symbol *sym2;           // N_LOOP_ITER: value symbol when both index and value are present
     Node *target;           // break/continue: loop node
     int builtin;            // call to builtin
+    double fval;            // constant float value
 
     // filled by checker for codegen
     int field_offset;                     // N_FIELD / N_FIELD_INIT: byte offset inside struct
@@ -231,6 +233,7 @@ typedef struct {
 
 Program check(NodeVec decls);
 bool is_int(Type *t);
+bool is_float(Type *t);
 bool fits(i128 v, Type *t);
 
 // ---------------------------------------------------------------------------
@@ -309,6 +312,16 @@ void x_ret(void);
 void x_leave(void);
 uint32_t x_sub_rsp_patchable(void);     // returns offset of imm32
 void x_rep_movsb(void);
+void x_rep_stosb(void);
+// SSE2 scalar double/float helpers (XMM0, XMM1 <-> RAX, RCX)
+void x_movq_xmm_gpr(int xmm, int gpr);
+void x_movq_gpr_xmm(int gpr, int xmm);
+void x_cvtss2sd(int xmm_dst, int xmm_src);
+void x_cvtsd2ss(int xmm_dst, int xmm_src);
+void x_cvtsi2sd(int xmm_dst, int gpr_src);
+void x_cvttsd2si(int gpr_dst, int xmm_src);
+void x_sse_sd(uint8_t op, int xmm_dst, int xmm_src); // addsd=0x58 mulsd=0x59 subsd=0x5C divsd=0x5E
+void x_ucomisd(int xmm_a, int xmm_b);
 void x_resolve_labels(void);
 
 // ---------------------------------------------------------------------------

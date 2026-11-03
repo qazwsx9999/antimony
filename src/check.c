@@ -26,6 +26,10 @@ bool is_int(Type *t) {
     return t && (t->kind == TY_INT || t->kind == TY_UNTYPED_INT);
 }
 
+bool is_float(Type *t) {
+    return t && (t->kind == TY_FLOAT || t->kind == TY_UNTYPED_FLOAT);
+}
+
 static void type_bounds(Type *t, i128 *lo, i128 *hi) {
     int bits = t->size * 8;
     if (t->is_signed) {
@@ -152,9 +156,6 @@ static Type *resolve_type(Checker *c, const char *name, Pos pos) {
     Symbol *s = lookup_in(c->global, name);
     if (!s || s->kind != SYM_TYPE) {
         fatal(pos, "unknown type '%s'", name);
-    }
-    if (s->type->kind == TY_FLOAT) {
-        fatal(pos, "floating-point type '%s' is not supported in the native backend yet", name);
     }
     return s->type;
 }
@@ -343,6 +344,30 @@ static void coerce(Node *n, Type *target) {
         n->type = target;
         return;
     }
+    if (n->type == &ty_untyped_float) {
+        if (target->kind != TY_FLOAT) {
+            fatal(n->pos, "cannot use float constant as '%s'", target->name);
+        }
+        if (n->kind == N_UNARY) {
+            coerce(n->lhs, target);
+        } else if (n->kind == N_BINARY) {
+            coerce(n->lhs, target);
+            coerce(n->rhs, target);
+        }
+        n->type = target;
+        return;
+    }
+    if (n->type == &ty_untyped_int && target->kind == TY_FLOAT) {
+        if (n->kind == N_UNARY) {
+            coerce(n->lhs, target);
+        } else if (n->kind == N_BINARY) {
+            coerce(n->lhs, target);
+            coerce(n->rhs, target);
+        }
+        n->fval = (double)n->cval;
+        n->type = target;
+        return;
+    }
     if (n->type == &ty_untyped_int) {
         if (target->kind != TY_INT) {
             fatal(n->pos, "cannot use integer constant as '%s'", target->name);
@@ -375,6 +400,8 @@ static void coerce(Node *n, Type *target) {
 static void materialize(Node *n) {
     if (n->type == &ty_untyped_int) {
         coerce(n, &ty_i32);
+    } else if (n->type == &ty_untyped_float) {
+        coerce(n, &ty_f64);
     } else if (n->type == &ty_null) {
         fatal(n->pos, "'null' requires an explicit pointer type (e.g. 'var p: *i32 = null')");
     }
@@ -446,6 +473,12 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     switch (n->kind) {
     case N_INT:
         n->type = &ty_untyped_int;
+        n->is_const = true;
+        if (expected) coerce(n, expected);
+        return;
+
+    case N_FLOAT:
+        n->type = &ty_untyped_float;
         n->is_const = true;
         if (expected) coerce(n, expected);
         return;
@@ -692,6 +725,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         if (s->kind == SYM_CONST) {
             n->is_const = true;
             n->cval = s->cval;
+            n->fval = s->fval;
         }
         if (expected) coerce(n, expected);
         return;
@@ -711,6 +745,15 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         // Unary '-' or '~': do not force expected onto lhs before negation
         // so that `-2147483648` works for i32.
         check_expr(c, n->lhs, NULL);
+        if (n->op == T_MINUS && is_float(n->lhs->type)) {
+            n->type = n->lhs->type;
+            if (n->lhs->is_const) {
+                n->is_const = true;
+                n->fval = -n->lhs->fval;
+            }
+            if (expected) coerce(n, expected);
+            return;
+        }
         if (!is_int(n->lhs->type)) {
             fatal(n->pos, "operator %s requires an integer operand, got '%s'",
                   tok_name(n->op), n->lhs->type->name);
@@ -826,6 +869,51 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         if (sub_expect) coerce(n->rhs, sub_expect);
 
         // Unify operand types using the untyped-constant rule (§3.3).
+        if (is_float(n->lhs->type) || is_float(n->rhs->type)) {
+            if (n->lhs->type->kind == TY_FLOAT && (n->rhs->type == &ty_untyped_float || n->rhs->type == &ty_untyped_int)) {
+                coerce(n->rhs, n->lhs->type);
+            } else if (n->rhs->type->kind == TY_FLOAT && (n->lhs->type == &ty_untyped_float || n->lhs->type == &ty_untyped_int)) {
+                coerce(n->lhs, n->rhs->type);
+            } else if (n->lhs->type == &ty_untyped_float && n->rhs->type == &ty_untyped_int) {
+                coerce(n->rhs, &ty_untyped_float);
+                n->rhs->fval = (double)n->rhs->cval;
+            } else if (n->rhs->type == &ty_untyped_float && n->lhs->type == &ty_untyped_int) {
+                coerce(n->lhs, &ty_untyped_float);
+                n->lhs->fval = (double)n->lhs->cval;
+            } else if (n->lhs->type != n->rhs->type) {
+                fatal(n->pos, "mismatched types '%s' and '%s' in %s (use explicit conversion)",
+                      n->lhs->type->name, n->rhs->type->name, tok_name(op));
+            }
+            if (is_cmp && n->lhs->type == &ty_untyped_float) {
+                coerce(n->lhs, &ty_f64);
+                coerce(n->rhs, &ty_f64);
+            }
+            if (!is_cmp && op != T_PLUS && op != T_MINUS && op != T_STAR && op != T_SLASH) {
+                fatal(n->pos, "operator %s is not defined for floating-point type '%s'",
+                      tok_name(op), n->lhs->type->name);
+            }
+            n->type = is_cmp ? &ty_bool : n->lhs->type;
+            if (n->lhs->is_const && n->rhs->is_const) {
+                n->is_const = true;
+                double a = n->lhs->fval, b = n->rhs->fval;
+                switch (op) {
+                case T_PLUS:  n->fval = a + b; break;
+                case T_MINUS: n->fval = a - b; break;
+                case T_STAR:  n->fval = a * b; break;
+                case T_SLASH: n->fval = a / b; break;
+                case T_EQ:    n->cval = (a == b); break;
+                case T_NE:    n->cval = (a != b); break;
+                case T_LT:    n->cval = (a <  b); break;
+                case T_LE:    n->cval = (a <= b); break;
+                case T_GT:    n->cval = (a >  b); break;
+                case T_GE:    n->cval = (a >= b); break;
+                default: break;
+                }
+            }
+            if (expected) coerce(n, expected);
+            return;
+        }
+
         if (n->lhs->type == &ty_untyped_int && n->rhs->type->kind == TY_INT) {
             coerce(n->lhs, n->rhs->type);
         } else if (n->rhs->type == &ty_untyped_int && n->lhs->type->kind == TY_INT) {
@@ -893,18 +981,42 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         Symbol *s = lookup(c, n->name);
         if (!s) fatal(n->pos, "undeclared function or type '%s'", n->name);
 
-        // Type conversion: `i64(x)` (spec §2.2, §2.3)
+        // Type conversion: `i64(x)`, `f64(x)`, `f32(x)` (spec §2.2, §2.3)
         if (s->kind == SYM_TYPE) {
-            if (s->type->kind == TY_FLOAT) {
-                fatal(n->pos, "floating-point conversions are not supported yet");
-            }
             if (n->list.len != 1) {
                 fatal(n->pos, "type conversion '%s(...)' takes exactly 1 argument", n->name);
             }
             Node *arg = n->list.items[0];
             check_expr(c, arg, NULL);
+            if (s->type->kind == TY_FLOAT) {
+                if (arg->type == &ty_untyped_float || arg->type == &ty_untyped_int) {
+                    coerce(arg, s->type);
+                } else if (!is_int(arg->type) && !is_float(arg->type)) {
+                    fatal(n->pos, "cannot convert '%s' to '%s'", arg->type->name, s->type->name);
+                }
+                n->kind = N_CONV;
+                n->lhs = arg;
+                n->type = s->type;
+                if (arg->is_const) {
+                    n->is_const = true;
+                    n->fval = is_float(arg->type) ? arg->fval : (double)arg->cval;
+                }
+                if (expected) coerce(n, expected);
+                return;
+            }
             if (arg->type == &ty_untyped_int) {
                 coerce(arg, s->type);
+            } else if (is_float(arg->type) && is_int(s->type)) {
+                materialize(arg);
+                n->kind = N_CONV;
+                n->lhs = arg;
+                n->type = s->type;
+                if (arg->is_const) {
+                    n->is_const = true;
+                    n->cval = (i128)(int64_t)arg->fval;
+                }
+                if (expected) coerce(n, expected);
+                return;
             } else if (!is_int(arg->type) || !is_int(s->type)) {
                 fatal(n->pos, "cannot convert '%s' to '%s'", arg->type->name, s->type->name);
             }
@@ -1100,6 +1212,17 @@ static void check_assign(Checker *c, Node *n) {
         return;
     }
 
+    // Float compound assignment (`x += 1.5`, `x -= y`, `x *= 2.0`, `x /= 3.0`).
+    if (target_type->kind == TY_FLOAT) {
+        if (n->op != T_PLUS_ASSIGN && n->op != T_MINUS_ASSIGN &&
+            n->op != T_STAR_ASSIGN && n->op != T_SLASH_ASSIGN) {
+            fatal(n->pos, "compound assignment %s is not defined for float type '%s'",
+                  tok_name(n->op), target_type->name);
+        }
+        check_expr(c, n->rhs, target_type);
+        return;
+    }
+
     if (!is_int(target_type)) {
         fatal(n->pos, "compound assignment %s requires an integer target, got '%s'",
               tok_name(n->op), target_type->name);
@@ -1212,6 +1335,7 @@ static bool check_stmt(Checker *c, Node *n) {
         Symbol *s = define(c, SYM_CONST, n->name, ct, n->pos);
         s->decl = n;
         s->cval = n->rhs->cval;
+        s->fval = n->rhs->fval;
         s->state = 2;
         n->sym = s;
         n->type = ct;
@@ -1453,6 +1577,7 @@ static void resolve_global_const(Checker *c, Symbol *s) {
     }
     s->type = decl_t ? decl_t : n->rhs->type;
     s->cval = n->rhs->cval;
+    s->fval = n->rhs->fval;
     s->state = 2;
     n->type = s->type;
 }
@@ -1580,6 +1705,7 @@ Program check(NodeVec decls) {
                     decl_t = d->rhs->type;
                 }
                 d->sym->cval = d->rhs->cval;
+                d->sym->fval = d->rhs->fval;
             }
         } else if (!decl_t) {
             fatal(d->pos, "top-level variable '%s' requires a type or initializer", d->name);

@@ -269,4 +269,46 @@ fn main() {
 }
 "@ "22`n12`ntrue`n7`n0`n19`n60"
 
+# 8. Floating-point f32 and f64: SSE2 arithmetic, comparisons, conversions, arrays, structs
+Test-RunOk "floats_f32_f64" @"
+const PI = 3.141592653589793
+
+struct Circle {
+    r: f64
+}
+
+fn circle_area(c: *Circle): f64 {
+    return PI * c.r * c.r
+}
+
+fn main() {
+    var a = 2.5
+    var b: f64 = 1.25
+    a += b
+    print(a)
+    print(-a)
+    print(a > 3.0)
+    print(a < 2.0)
+
+    var f: f32 = 0.5
+    f *= 3.0
+    print(f)
+
+    var n = i32(3.9)
+    print(n)
+    var d = f64(n) + 0.5
+    print(d)
+
+    var c = Circle { r: 2.0 }
+    print(circle_area(&c))
+
+    var vals[3]: f64 = [1.5, 2.5, 3.0]
+    var sum = 0.0
+    loop v in vals {
+        sum += v
+    }
+    print(sum)
+}
+"@ "3.75`n-3.75`ntrue`nfalse`n1.5`n3`n3.5`n12.566371`n7.0"
+
 Write-Host "`nAll tests passed."

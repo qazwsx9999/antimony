@@ -66,6 +66,10 @@ fn main() {
     print(pt.x)
     print(pt.y)
 
+    var radius = 2.5
+    var area = 3.14159265 * radius * radius
+    print(area)
+
     var total: i64 = 3_000_000_000
     var count = 0
     var flag: bool

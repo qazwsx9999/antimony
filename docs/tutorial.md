@@ -103,6 +103,7 @@ x *= 2      // 30
 |---|---|---|
 | Signed integers | `i8`, `i16`, `i32`, `i64`, `isize` | Two's-complement signed integers (`isize` is 64-bit pointer size) |
 | Unsigned integers | `u8`, `u16`, `u32`, `u64`, `usize` | Unsigned integers (`usize` is 64-bit pointer size) |
+| Floating-point | `f32`, `f64` | IEEE-754 single (`f32`) and double (`f64`) precision floats |
 | Booleans | `bool` | `true` or `false` |
 | Strings | `str` | Immutable UTF-8 string literals, e.g. `"hello\n"` |
 
@@ -116,6 +117,27 @@ var a = 42                      // i32 (default)
 var b: i64 = 3_000_000_000      // OK: context is i64
 // var c = 3_000_000_000        // COMPILE ERROR: exceeds i32
 // var d: u8 = 300              // COMPILE ERROR: 300 does not fit in u8
+```
+
+### Floating-Point Literals (`f32`, `f64`)
+- Unsuffixed floating-point literals (e.g. `3.14159`, `2.5`) adapt to `f32` or `f64` from context, or default to `f64` when unconstrained.
+- Floating-point operations (`+`, `-`, `*`, `/`, `<`, `<=`, `>`, `>=`, `==`, `!=`) compile directly to native x86-64 SSE2 instructions.
+- Use explicit conversions `f64(x)`, `f32(x)`, `i32(f)`, `i64(f)` to convert between integers and floats:
+
+```
+const PI = 3.141592653589793
+
+fn circle_area(r: f64): f64 {
+    return PI * r * r
+}
+
+fn main() {
+    var r32: f32 = 2.5
+    var area: f64 = circle_area(f64(r32))
+    print(area)                 // 19.634954
+    var trunc: i32 = i32(area)  // 19
+    print(trunc)
+}
 ```
 
 ### Explicit Type Conversions

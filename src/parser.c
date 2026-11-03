@@ -124,7 +124,9 @@ static Node *parse_primary_base(Parser *p) {
     }
     case T_FLOAT: {
         next(p);
-        fatal(t->pos, "floating-point expressions are not supported in the native backend yet");
+        Node *n = new_node(N_FLOAT, t->pos);
+        n->fval = t->fval;
+        return n;
     }
     case T_STR: {
         next(p);

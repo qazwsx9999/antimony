@@ -353,6 +353,78 @@ void x_rep_stosb(void) {
     emit8(0xAA);
 }
 
+// movq xmm, gpr: 66 REX.W 0F 6E /r
+void x_movq_xmm_gpr(int xmm, int gpr) {
+    emit8(0x66);
+    emit_rex(1, xmm, 0, gpr);
+    emit8(0x0F);
+    emit8(0x6E);
+    modrm(3, xmm, gpr);
+}
+
+// movq gpr, xmm: 66 REX.W 0F 7E /r
+void x_movq_gpr_xmm(int gpr, int xmm) {
+    emit8(0x66);
+    emit_rex(1, xmm, 0, gpr);
+    emit8(0x0F);
+    emit8(0x7E);
+    modrm(3, xmm, gpr);
+}
+
+// cvtss2sd xmm_dst, xmm_src: F3 0F 5A /r
+void x_cvtss2sd(int xmm_dst, int xmm_src) {
+    emit8(0xF3);
+    emit_rex(0, xmm_dst, 0, xmm_src);
+    emit8(0x0F);
+    emit8(0x5A);
+    modrm(3, xmm_dst, xmm_src);
+}
+
+// cvtsd2ss xmm_dst, xmm_src: F2 0F 5A /r
+void x_cvtsd2ss(int xmm_dst, int xmm_src) {
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, 0, xmm_src);
+    emit8(0x0F);
+    emit8(0x5A);
+    modrm(3, xmm_dst, xmm_src);
+}
+
+// cvtsi2sd xmm_dst, gpr_src (64-bit signed int -> double): F2 REX.W 0F 2A /r
+void x_cvtsi2sd(int xmm_dst, int gpr_src) {
+    emit8(0xF2);
+    emit_rex(1, xmm_dst, 0, gpr_src);
+    emit8(0x0F);
+    emit8(0x2A);
+    modrm(3, xmm_dst, gpr_src);
+}
+
+// cvttsd2si gpr_dst, xmm_src (double -> 64-bit signed int, truncating): F2 REX.W 0F 2C /r
+void x_cvttsd2si(int gpr_dst, int xmm_src) {
+    emit8(0xF2);
+    emit_rex(1, gpr_dst, 0, xmm_src);
+    emit8(0x0F);
+    emit8(0x2C);
+    modrm(3, gpr_dst, xmm_src);
+}
+
+// Scalar double arithmetic: F2 0F <op> /r (addsd=0x58, mulsd=0x59, subsd=0x5C, divsd=0x5E)
+void x_sse_sd(uint8_t op, int xmm_dst, int xmm_src) {
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, 0, xmm_src);
+    emit8(0x0F);
+    emit8(op);
+    modrm(3, xmm_dst, xmm_src);
+}
+
+// ucomisd xmm_a, xmm_b: 66 0F 2E /r
+void x_ucomisd(int xmm_a, int xmm_b) {
+    emit8(0x66);
+    emit_rex(0, xmm_a, 0, xmm_b);
+    emit8(0x0F);
+    emit8(0x2E);
+    modrm(3, xmm_a, xmm_b);
+}
+
 void x_resolve_labels(void) {
     for (int i = 0; i < A.fixups.len; i++) {
         uint32_t pos = A.fixups.items[i].pos;
