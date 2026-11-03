@@ -1,0 +1,8 @@
+# Compiled binaries and build artifacts
+*.exe
+*.obj
+*.o
+*.pdb
+
+# Temporary test outputs
+tests/tmp/

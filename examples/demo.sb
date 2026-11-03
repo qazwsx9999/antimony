@@ -1,0 +1,103 @@
+const LIMIT = 10
+
+struct Vec2 {
+    x: i32
+    y: i32
+}
+
+fn translate(v: *Vec2, dx: i32, dy: i32) {
+    v.x += dx
+    v.y += dy
+}
+
+fn add(a: i32, b: i32): i32 {
+    return a + b
+}
+
+fn fact(n: i32): i64 {
+    if n <= 1 {
+        return 1
+    }
+    return i64(n) * fact(n - 1)
+}
+
+fn hash(x: u32): u32 {
+    return x *% 2654435761
+}
+
+fn swap(a: *i32, b: *i32) {
+    var tmp = *a
+    *a = *b
+    *b = tmp
+}
+
+fn sum_slice(s[]: i32): i32 {
+    var s_total = 0
+    loop x in s {
+        s_total += x
+    }
+    return s_total
+}
+
+fn main() {
+    print("Hello from Antimony!")
+
+    var arr[5]: i32 = [10, 20, 30]
+    arr[3] = 40
+    arr[4] += 5
+    print(len(arr))
+    print(sum_slice(arr))
+    print(sum_slice(arr[1..4]))
+
+    loop idx, val in arr[..3] {
+        print(idx * 100 + i64(val))
+    }
+
+    swap(&arr[0], &arr[3])
+    var p: *i32 = &arr[0]
+    p += 1
+    *p += 5
+    print(arr[0])
+    print(arr[1])
+    print(arr[3])
+
+    var pt = Vec2 { x: 10, y: 20 }
+    translate(&pt, 5, -3)
+    print(pt.x)
+    print(pt.y)
+
+    var total: i64 = 3_000_000_000
+    var count = 0
+    var flag: bool
+
+    loop i in 0..LIMIT {
+        if i == 5 {
+            continue
+        }
+        count += 1
+    }
+
+    loop var i = 1; i < 16; i *= 2 {
+        print(i)
+    }
+
+    loop i in rev(0..6 by 2) {
+        print(i)
+    }
+
+    loop count > 0 {
+        count -= 1
+    }
+
+    if count == 0 {
+        flag = true
+    } else {
+        flag = false
+    }
+
+    print(flag)
+    print(add(2, 3))
+    print(fact(20))
+    print(hash(42))
+    print(total)
+}
