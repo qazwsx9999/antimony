@@ -961,4 +961,99 @@ fn main() {
 }
 "@ "111`n222`n333`n8`n66`n4`n8`n12`n105`nhello`nAntimony`n104`n65`ntrue`ntrue`ntrue`n498`nmain`ntrue`n2`n20`n30`n42`n2`n30`n40`ntrue`ntrue`nfast systems`n1`n-98765"
 
+# 15. Phase 10: match on str, str([]u8) views, StringBuilder, std/os.sb
+Test-CompileError "match_str_no_else"   "fn main() { var s = `"a`"`nmatch s {`n`"a`" { print(1) }`n} }" "non-exhaustive 'match' on 'str': an 'else' branch is required"
+Test-CompileError "match_str_dup"       "fn main() { var s = `"a`"`nmatch s {`n`"a`" { print(1) }`n`"b`", `"a`" { print(2) }`nelse { print(3) }`n} }" "duplicate match pattern"
+Test-CompileError "match_str_nonlit"    "fn main() { var s = `"a`"`nvar t = `"b`"`nmatch s {`nt { print(1) }`nelse { print(2) }`n} }" "string match pattern must be a string literal"
+Test-CompileError "str_conv_bad"        "fn main() { var a[3]: i32 = [1, 2, 3]`nvar s = str(a) }" "cannot convert '[3]i32' to 'str'"
+
+Test-RunOk "phase10_strings_and_os" @"
+import "std/str.sb"
+import "std/os.sb"
+import "std/io.sb"
+
+fn command_id(cmd: str): i32 {
+    match cmd {
+        "build", "b" {
+            return 1
+        }
+        "run", "r" {
+            return 2
+        }
+        "" {
+            return 3
+        }
+        else {
+            return 0
+        }
+    }
+}
+
+fn main() {
+    // 1. match on str
+    print(command_id("build"))
+    print(command_id("b"))
+    print(command_id("run"))
+    print(command_id("r"))
+    print(command_id(""))
+    print(command_id("test"))
+    print(command_id("buil"))
+
+    // 2. zero-copy str views over byte arrays/slices
+    var bytes[5]: u8 = [72, 101, 108, 108, 111]
+    var view = str(bytes)
+    print(view)
+    print(view == "Hello")
+    print(str(bytes[1..4]))
+    print(len(str(bytes[2..])))
+
+    // 3. StringBuilder
+    var sb: StringBuilder
+    sb.init(4)
+    defer sb.free()
+    sb.append("value=")
+    sb.append_i64(-1234567)
+    sb.append_byte(59)
+    sb.append(" ok")
+    loop i in 0..20 {
+        sb.append_byte(u8(97 + i % 26))
+    }
+    print(sb.as_str())
+    print(i64(sb.len))
+    print(sb.as_str()[0..6] == "value=")
+    sb.clear()
+    sb.append_i64(0)
+    sb.append_i64(9223372036854775807)
+    print(sb.as_str())
+
+    // 4. C string <-> str interop
+    print(cstr_to_str(sb.cstr()) == sb.as_str())
+    print(len(str_from_ptr(ptr_cast(*u8, "abcdef"), 3)))
+
+    // 5. command-line parsing helpers (deterministic input)
+    var line = "prog.exe  build \"C:\\My Dir\\a.sb\" -o out.exe"
+    print(parse_arg_count(line))
+    print(parse_arg_at(line, 0))
+    print(parse_arg_at(line, 1))
+    print(parse_arg_at(line, 2))
+    print(parse_arg_at(line, 4))
+    print(parse_arg_at(line, 9) == "")
+    print(arg_count() >= 1)
+
+    // 6. raw stdout/stderr and file I/O with str
+    print_raw("raw-")
+    print_raw("output\n")
+    eprint("this goes to stderr")
+    var path = "phase10_tmp.txt"
+    print(write_file_str(path, "Antimony str file"))
+    print(file_size(path))
+    print(delete_file(path))
+
+    // 7. environment variables
+    var envbuf[260]: u8
+    print(len(getenv_into("SystemRoot", envbuf)) > 0)
+    print(getenv_into("ANTIMONY_SURELY_UNSET_VAR_42", envbuf) == "")
+}
+"@ "1`n1`n2`n2`n3`n0`n0`nHello`ntrue`nell`n3`nvalue=-1234567; okabcdefghijklmnopqrst`n38`ntrue`n09223372036854775807`ntrue`n3`n5`nprog.exe`nbuild`nC:\My Dir\a.sb`nout.exe`ntrue`ntrue`nraw-output`ntrue`n17`ntrue`ntrue`ntrue"
+
 Write-Host "`nAll tests passed."

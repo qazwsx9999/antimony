@@ -1,0 +1,134 @@
+// std/os.sb - Native Win32 console streams, command-line arguments, and environment utilities.
+
+import "std/str.sb"
+
+const STD_OUTPUT_HANDLE_ID: u32 = 0xFFFFFFF5
+const STD_ERROR_HANDLE_ID: u32  = 0xFFFFFFF4
+
+extern "kernel32.dll" {
+    fn GetStdHandle(nStdHandle: u32): isize
+    fn WriteFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
+    fn GetCommandLineA(): *u8
+    fn GetEnvironmentVariableA(lpName: *u8, lpBuffer: *u8, nSize: u32): u32
+}
+
+// Writes `s` to stdout without appending a trailing newline.
+fn print_raw(s: str) {
+    if len(s) == 0 {
+        return
+    }
+    var h = GetStdHandle(STD_OUTPUT_HANDLE_ID)
+    var written: u32 = 0
+    WriteFile(h, ptr_cast(*u8, s), u32(len(s)), &written, 0)
+}
+
+// Writes `s` to stderr without appending a trailing newline.
+fn eprint_raw(s: str) {
+    if len(s) == 0 {
+        return
+    }
+    var h = GetStdHandle(STD_ERROR_HANDLE_ID)
+    var written: u32 = 0
+    WriteFile(h, ptr_cast(*u8, s), u32(len(s)), &written, 0)
+}
+
+// Writes `s` followed by '\n' to stderr.
+fn eprint(s: str) {
+    eprint_raw(s)
+    eprint_raw("\n")
+}
+
+// Returns the raw command line of the current process as a `str`.
+fn cmd_line(): str {
+    return cstr_to_str(GetCommandLineA())
+}
+
+// Returns the number of whitespace/quote-delimited arguments in `line`.
+fn parse_arg_count(line: str): i32 {
+    var n = len(line)
+    var i: i64 = 0
+    var count: i32 = 0
+    loop i < n {
+        loop i < n && is_space(line[i]) {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        count += 1
+        if line[i] == 34 {
+            i += 1
+            loop i < n && line[i] != 34 {
+                i += 1
+            }
+            if i < n {
+                i += 1
+            }
+        } else {
+            loop i < n && !is_space(line[i]) {
+                i += 1
+            }
+        }
+    }
+    return count
+}
+
+// Returns the `index`-th argument from `line` (stripping surrounding quotes if present).
+fn parse_arg_at(line: str, index: i32): str {
+    var n = len(line)
+    var i: i64 = 0
+    var cur: i32 = 0
+    loop i < n {
+        loop i < n && is_space(line[i]) {
+            i += 1
+        }
+        if i >= n {
+            break
+        }
+        var start = i
+        var end = i
+        if line[i] == 34 {
+            i += 1
+            start = i
+            loop i < n && line[i] != 34 {
+                i += 1
+            }
+            end = i
+            if i < n {
+                i += 1
+            }
+        } else {
+            loop i < n && !is_space(line[i]) {
+                i += 1
+            }
+            end = i
+        }
+        if cur == index {
+            return line[start..end]
+        }
+        cur += 1
+    }
+    return ""
+}
+
+// Returns the number of command-line arguments passed to the current process.
+fn arg_count(): i32 {
+    return parse_arg_count(cmd_line())
+}
+
+// Returns the `index`-th command-line argument of the current process.
+fn arg_at(index: i32): str {
+    return parse_arg_at(cmd_line(), index)
+}
+
+// Reads environment variable `name` into `buf[]` and returns the populated `str` slice (or "" if unset).
+fn getenv_into(name: *u8, buf[]: u8): str {
+    if len(buf) == 0 {
+        return ""
+    }
+    var n = GetEnvironmentVariableA(name, &buf[0], u32(len(buf)))
+    if n == 0 || i64(n) >= len(buf) {
+        return ""
+    }
+    return str(buf[0..i64(n)])
+}

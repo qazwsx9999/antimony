@@ -1,8 +1,17 @@
 import "std/mem.sb"
+import "std/str.sb"
 
 const LIMIT = 10
 
 extern "msvcrt.dll" fn sqrt(x: f64): f64
+
+fn mode_from_name(name: str): i32 {
+    match name {
+        "fast" { return 1 }
+        "safe" { return 2 }
+        else   { return 0 }
+    }
+}
 
 enum Mode {
     Fast
@@ -98,6 +107,17 @@ fn main() {
     print(pt.length_sq())
     print(Mode.Custom.weight())
     print("Antimony"[0..4] == "Anti")
+    print(mode_from_name("safe"))
+
+    var sb: StringBuilder
+    sb.init(32)
+    defer sb.free()
+    sb.append("pt2=(")
+    sb.append_i64(i64(pt2.x))
+    sb.append(", ")
+    sb.append_i64(i64(pt2.y))
+    sb.append_byte(41)
+    print(sb.as_str())
 
     var raw_v = alloc(sizeof(Vec2))
     defer free_mem(raw_v)

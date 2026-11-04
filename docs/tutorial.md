@@ -524,6 +524,40 @@ fn main() {
 }
 ```
 
+### 10.5 Matching on `str`, Zero-Copy `str(...)` Views & `StringBuilder`
+- **`match` on `str`:** Arms take string literals (comma-separated alternatives allowed). Duplicate patterns are compile errors, and an `else` arm is required because strings can't be enumerated exhaustively.
+- **`str(bytes)`:** Turns a `[]u8` or `[N]u8` into a `str` view with no copy and no allocation.
+- **`StringBuilder`** (from `std/str.sb`): a growable heap buffer that always keeps a trailing `'\0'`, so `sb.cstr()` can be passed straight to C/Win32 APIs.
+
+```
+import "std/str.sb"
+import "std/os.sb"
+
+fn command_id(cmd: str): i32 {
+    match cmd {
+        "build", "b" { return 1 }
+        "run", "r"   { return 2 }
+        else         { return 0 }
+    }
+}
+
+fn main() {
+    var bytes[5]: u8 = [72, 101, 108, 108, 111]
+    print(str(bytes))               // Hello
+
+    var sb: StringBuilder
+    sb.init(64)
+    defer sb.free()
+    sb.append("answer=")
+    sb.append_i64(42)
+    print(sb.as_str())              // answer=42
+
+    print(command_id(arg_at(1)))    // depends on the first CLI argument
+    print_raw("no newline\n")
+    eprint("written to stderr")
+}
+```
+
 ---
 
 ## 11. Enums (`enum`) & Pattern Matching (`match`)
@@ -684,9 +718,10 @@ fn main() {
 ### 13.3 Standard Library Modules (`std/`)
 Antimony ships with native standard library modules in `std/` that you can import from any directory:
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `realloc_mem`, `free_mem`, `copy_mem`, `set_mem`, `cmp_mem`) and fast bump-pointer `Arena` (`arena_init`, `arena_alloc`, `arena_reset`, `arena_free`).
-- `import "std/io.sb"` — Native Win32 file I/O (`write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
+- `import "std/io.sb"` — Native Win32 file I/O (`write_file_str`, `write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
-- `import "std/str.sb"` — C-string and ASCII byte-slice utilities (`cstr_len`, `cstr_eq`, `is_digit`, `is_alpha`, `is_space`, `parse_i64`).
+- `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification (`is_digit`, `is_alpha`, `is_space`), `str` helpers (`str_starts_with`, `str_ends_with`, `str_trim`, `str_find_byte`, `str_parse_i64`, `parse_i64`), and the growable `StringBuilder` (`init`, `append`, `append_byte`, `append_i64`, `as_str`, `cstr`, `clear`, `free`).
+- `import "std/os.sb"` — Console streams and process environment: `print_raw`, `eprint_raw`, `eprint`, `cmd_line`, `arg_count`, `arg_at`, `parse_arg_count`, `parse_arg_at`, `getenv_into`.
 
 ---
 

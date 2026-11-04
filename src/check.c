@@ -1225,6 +1225,27 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             }
             Node *arg = n->list.items[0];
             check_expr(c, arg, NULL);
+            if (s->type == &ty_str) {
+                if (arg->type == &ty_str) {
+                    n->kind = N_CONV;
+                    n->lhs = arg;
+                    n->type = &ty_str;
+                    if (expected) coerce(n, expected);
+                    return;
+                }
+                if ((arg->type->kind == TY_SLICE || arg->type->kind == TY_ARRAY) &&
+                    arg->type->elem == &ty_u8) {
+                    if (arg->type->kind == TY_ARRAY) {
+                        arg->implicit_slice = true;
+                    }
+                    n->kind = N_CONV;
+                    n->lhs = arg;
+                    n->type = &ty_str;
+                    if (expected) coerce(n, expected);
+                    return;
+                }
+                fatal(n->pos, "cannot convert '%s' to 'str' (expected '[]u8' or '[N]u8')", arg->type->name);
+            }
             if (s->type->kind == TY_FLOAT) {
                 if (arg->type == &ty_untyped_float || arg->type == &ty_untyped_int) {
                     coerce(arg, s->type);
@@ -1361,8 +1382,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     coerce(val, &ty_usize);
                 } else if (val->type == &ty_null) {
                     coerce(val, target_t);
-                } else if (val->type->kind != TY_PTR && !(val->type->kind == TY_INT && val->type->size == 8)) {
-                    fatal(val->pos, "'ptr_cast' source must be a pointer or 64-bit integer ('usize'/'i64'), got '%s'",
+                } else if (val->type->kind != TY_PTR && val->type != &ty_str &&
+                           !(val->type->kind == TY_INT && val->type->size == 8)) {
+                    fatal(val->pos, "'ptr_cast' source must be a pointer, 'str', or 64-bit integer ('usize'/'i64'), got '%s'",
                           val->type->name);
                 }
                 n->kind = N_CONV;
@@ -1776,15 +1798,20 @@ static bool check_stmt(Checker *c, Node *n) {
         check_expr(c, n->cond, NULL);
         materialize(n->cond);
         Type *st = n->cond->type;
-        if (st->kind != TY_ENUM && st->kind != TY_INT && st != &ty_bool) {
-            fatal(n->cond->pos, "'match' expression must be an enum, integer, or bool (got '%s')", st->name);
+        if (st->kind != TY_ENUM && st->kind != TY_INT && st != &ty_bool && st != &ty_str) {
+            fatal(n->cond->pos, "'match' expression must be an enum, integer, bool, or str (got '%s')", st->name);
         }
         if (n->list.len == 0 && !n->els) {
             fatal(n->pos, "'match' statement must have at least one arm");
         }
+        if (st == &ty_str) {
+            n->slot_start = alloc_slot(c); // scrutinee ptr
+            n->slot_end   = alloc_slot(c); // scrutinee len
+        }
 
-        VEC(i128) seen_vals = {0};
-        VEC(Pos)  seen_pos  = {0};
+        VEC(i128)   seen_vals = {0};
+        VEC(Node *) seen_strs = {0};
+        VEC(Pos)    seen_pos  = {0};
         AssignSet before = c->assigned;
         AssignSet after_all = ALL_ASSIGNED;
         bool all_ret = true;
@@ -1794,17 +1821,33 @@ static bool check_stmt(Checker *c, Node *n) {
             for (int j = 0; j < arm->list.len; j++) {
                 Node *pat = arm->list.items[j];
                 check_expr(c, pat, st);
-                if (!pat->is_const) {
-                    fatal(pat->pos, "match pattern must be a compile-time constant");
-                }
-                for (int k = 0; k < seen_vals.len; k++) {
-                    if (seen_vals.items[k] == pat->cval) {
-                        fatal(pat->pos, "duplicate match pattern (already matched at line %d)",
-                              seen_pos.items[k].line);
+                if (st == &ty_str) {
+                    if (pat->kind != N_STR) {
+                        fatal(pat->pos, "string match pattern must be a string literal");
                     }
+                    for (int k = 0; k < seen_strs.len; k++) {
+                        Node *prev = seen_strs.items[k];
+                        if (prev->str_len == pat->str_len &&
+                            memcmp(prev->str, pat->str, (size_t)pat->str_len) == 0) {
+                            fatal(pat->pos, "duplicate match pattern (already matched at line %d)",
+                                  seen_pos.items[k].line);
+                        }
+                    }
+                    vec_push(seen_strs, pat);
+                    vec_push(seen_pos, pat->pos);
+                } else {
+                    if (!pat->is_const) {
+                        fatal(pat->pos, "match pattern must be a compile-time constant");
+                    }
+                    for (int k = 0; k < seen_vals.len; k++) {
+                        if (seen_vals.items[k] == pat->cval) {
+                            fatal(pat->pos, "duplicate match pattern (already matched at line %d)",
+                                  seen_pos.items[k].line);
+                        }
+                    }
+                    vec_push(seen_vals, pat->cval);
+                    vec_push(seen_pos, pat->pos);
                 }
-                vec_push(seen_vals, pat->cval);
-                vec_push(seen_pos, pat->pos);
             }
             c->assigned = before;
             bool arm_ret = check_block(c, arm->body, true);
@@ -1837,6 +1880,7 @@ static bool check_stmt(Checker *c, Node *n) {
                 }
                 if (!covered) {
                     free(seen_vals.items);
+                    free(seen_strs.items);
                     free(seen_pos.items);
                     fatal(n->pos, "non-exhaustive 'match': variant '%s.%s' is not covered (add an arm or 'else' branch)",
                           st->name, st->fields.items[i].name);
@@ -1851,18 +1895,26 @@ static bool check_stmt(Checker *c, Node *n) {
             }
             if (!has_true || !has_false) {
                 free(seen_vals.items);
+                free(seen_strs.items);
                 free(seen_pos.items);
                 fatal(n->pos, "non-exhaustive 'match' on 'bool': missing '%s' arm (or 'else' branch)",
                       !has_true ? "true" : "false");
             }
             exhaustive = true;
+        } else if (st == &ty_str) {
+            free(seen_vals.items);
+            free(seen_strs.items);
+            free(seen_pos.items);
+            fatal(n->pos, "non-exhaustive 'match' on 'str': an 'else' branch is required");
         } else {
             free(seen_vals.items);
+            free(seen_strs.items);
             free(seen_pos.items);
             fatal(n->pos, "non-exhaustive 'match' on integer type '%s': an 'else' branch is required", st->name);
         }
 
         free(seen_vals.items);
+        free(seen_strs.items);
         free(seen_pos.items);
         c->assigned = exhaustive ? after_all : before;
         return exhaustive && all_ret;

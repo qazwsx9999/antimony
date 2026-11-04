@@ -1,8 +1,30 @@
-// std/str.sb - Null-terminated C string and ASCII byte slice utilities.
+// std/str.sb - Null-terminated C string, ASCII byte slice, and StringBuilder utilities.
+
+import "std/mem.sb"
 
 extern "msvcrt.dll" {
     fn strlen(s: *u8): usize
     fn strcmp(a: *u8, b: *u8): i32
+}
+
+// Wraps `n` bytes at `p` as a zero-copy `str`.
+fn str_from_ptr(p: *u8, n: usize): str {
+    if p == null || n == 0 {
+        return ""
+    }
+    return str(p[0..i64(n)])
+}
+
+// Wraps a null-terminated C string `*u8` as a zero-copy `str`.
+fn cstr_to_str(s: *u8): str {
+    if s == null {
+        return ""
+    }
+    var n = strlen(s)
+    if n == 0 {
+        return ""
+    }
+    return str(s[0..i64(n)])
 }
 
 fn cstr_len(s: *u8): usize {
@@ -126,4 +148,105 @@ fn str_parse_i64(s: str): i64 {
         return -acc
     }
     return acc
+}
+
+// Dynamic heap-backed string builder (always keeps a trailing '\0' byte).
+struct StringBuilder {
+    buf: *u8
+    len: usize
+    cap: usize
+}
+
+fn (sb: *StringBuilder) init(initial_cap: usize) {
+    var c = initial_cap
+    if c < 16 {
+        c = 16
+    }
+    sb.buf = alloc(c + 1)
+    sb.len = 0
+    sb.cap = c
+}
+
+fn (sb: *StringBuilder) ensure(extra: usize) {
+    if sb.len + extra <= sb.cap {
+        return
+    }
+    var new_cap = sb.cap * 2
+    if new_cap < 16 {
+        new_cap = 16
+    }
+    loop new_cap < sb.len + extra {
+        new_cap *= 2
+    }
+    sb.buf = realloc_mem(sb.buf, new_cap + 1)
+    sb.cap = new_cap
+}
+
+fn (sb: *StringBuilder) append_byte(b: u8) {
+    sb.ensure(1)
+    sb.buf[sb.len] = b
+    sb.len += 1
+    sb.buf[sb.len] = 0
+}
+
+fn (sb: *StringBuilder) append(s: str) {
+    var n = usize(len(s))
+    if n == 0 {
+        return
+    }
+    sb.ensure(n)
+    copy_mem(sb.buf + sb.len, ptr_cast(*u8, s), n)
+    sb.len += n
+    sb.buf[sb.len] = 0
+}
+
+fn (sb: *StringBuilder) append_i64(val: i64) {
+    if val == 0 {
+        sb.append_byte(48)
+        return
+    }
+    var tmp[24]: u8
+    var k: i64 = 0
+    var u: u64 = 0
+    if val < 0 {
+        sb.append_byte(45)
+        // -(val + 1) never overflows (even for i64 MIN); add 1 back in unsigned space.
+        u = u64(-(val + 1)) + 1
+    } else {
+        u = u64(val)
+    }
+    loop u > 0 {
+        tmp[k] = u8(48 + (u % 10))
+        u /= 10
+        k += 1
+    }
+    loop k > 0 {
+        k -= 1
+        sb.append_byte(tmp[k])
+    }
+}
+
+fn (sb: *StringBuilder) clear() {
+    sb.len = 0
+    if sb.buf != null {
+        sb.buf[0] = 0
+    }
+}
+
+fn (sb: *StringBuilder) free() {
+    free_mem(sb.buf)
+    sb.buf = null
+    sb.len = 0
+    sb.cap = 0
+}
+
+fn (sb: StringBuilder) as_str(): str {
+    if sb.buf == null || sb.len == 0 {
+        return ""
+    }
+    return str(sb.buf[0..i64(sb.len)])
+}
+
+fn (sb: StringBuilder) cstr(): *u8 {
+    return sb.buf
 }

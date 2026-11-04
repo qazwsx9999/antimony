@@ -45,6 +45,14 @@ fn write_file_bytes(path: *u8, data[]: u8): bool {
     return write_file_ptr(path, &data[0], u32(len(data)))
 }
 
+// Writes a `str` directly to `path`.
+fn write_file_str(path: *u8, content: str): bool {
+    if len(content) == 0 {
+        return write_file_ptr(path, null, 0)
+    }
+    return write_file_ptr(path, ptr_cast(*u8, content), u32(len(content)))
+}
+
 // Returns the size in bytes of `path`, or -1 if the file cannot be opened.
 fn file_size(path: *u8): i64 {
     var h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)

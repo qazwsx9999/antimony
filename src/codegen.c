@@ -887,6 +887,10 @@ static void gen_expr(CG *cg, Node *n) {
     case N_CONV: {
         Type *src = n->lhs->type;
         Type *dst = n->type;
+        if (dst == &ty_str) {
+            gen_collection_ptr_len(cg, n->lhs);
+            return;
+        }
         gen_expr(cg, n->lhs);
         if (src == dst || src->kind == TY_PTR || dst->kind == TY_PTR) return;
         if (src->kind == TY_FLOAT && dst->kind == TY_FLOAT) {
@@ -1687,25 +1691,46 @@ static void gen_stmt(CG *cg, Node *n) {
     case N_MATCH: {
         int l_end = x_label();
         int *l_arms = n->list.len ? xmalloc((size_t)n->list.len * sizeof(int)) : NULL;
-        int scrut_reg = RAX;
-        if (n->cond->kind == N_IDENT && !n->cond->implicit_slice && n->cond->sym->hw_reg >= 0) {
-            scrut_reg = n->cond->sym->hw_reg;
-        } else {
-            gen_expr(cg, n->cond);
-        }
-        for (int i = 0; i < n->list.len; i++) {
-            l_arms[i] = x_label();
-            Node *arm = n->list.items[i];
-            for (int j = 0; j < arm->list.len; j++) {
-                Node *pat = arm->list.items[j];
-                int32_t imm32 = 0;
-                if (fits_imm32(pat, &imm32)) {
-                    x_alu_ri(ALU_CMP, 1, scrut_reg, imm32);
-                } else {
-                    x_mov_ri(RCX, (uint64_t)(int64_t)pat->cval);
-                    x_alu_rr(ALU_CMP, 1, scrut_reg, RCX);
+        if (n->cond->type == &ty_str) {
+            gen_expr(cg, n->cond); // RAX = ptr, RDX = len
+            x_store(RBP, slot_disp(n->slot_start), RAX);
+            x_store(RBP, slot_disp(n->slot_end), RDX);
+            for (int i = 0; i < n->list.len; i++) {
+                l_arms[i] = x_label();
+                Node *arm = n->list.items[i];
+                for (int j = 0; j < arm->list.len; j++) {
+                    Node *pat = arm->list.items[j];
+                    uint32_t off = add_string(cg, pat->str, pat->str_len);
+                    x_load(RCX, RBP, slot_disp(n->slot_start));
+                    x_load(RDX, RBP, slot_disp(n->slot_end));
+                    x_lea_rip(R8, SEC_RDATA, off);
+                    x_mov_ri(R9, (uint64_t)pat->str_len);
+                    x_call(cg->rt_str_eq);
+                    x_test_rr(0, RAX, RAX);
+                    x_jcc(CC_NE, l_arms[i]);
                 }
-                x_jcc(CC_E, l_arms[i]);
+            }
+        } else {
+            int scrut_reg = RAX;
+            if (n->cond->kind == N_IDENT && !n->cond->implicit_slice && n->cond->sym->hw_reg >= 0) {
+                scrut_reg = n->cond->sym->hw_reg;
+            } else {
+                gen_expr(cg, n->cond);
+            }
+            for (int i = 0; i < n->list.len; i++) {
+                l_arms[i] = x_label();
+                Node *arm = n->list.items[i];
+                for (int j = 0; j < arm->list.len; j++) {
+                    Node *pat = arm->list.items[j];
+                    int32_t imm32 = 0;
+                    if (fits_imm32(pat, &imm32)) {
+                        x_alu_ri(ALU_CMP, 1, scrut_reg, imm32);
+                    } else {
+                        x_mov_ri(RCX, (uint64_t)(int64_t)pat->cval);
+                        x_alu_rr(ALU_CMP, 1, scrut_reg, RCX);
+                    }
+                    x_jcc(CC_E, l_arms[i]);
+                }
             }
         }
         int l_else = n->els ? x_label() : l_end;
