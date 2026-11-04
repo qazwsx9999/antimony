@@ -821,4 +821,144 @@ fn main() {
 }
 "@ "25`n4`n2`n20`n6`n3`n20`n26`n118`n15`n26`n200`n1`n10`n100`n10`n777"
 
+# 14. Phase 9: Value Returns (struct, str, []T), str Parameters/Fields, and str Indexing/Slicing/Equality
+Test-CompileError "str_index_oob_const"  "fn main() { var b = `"abc`"[3] }" "string index 3 out of bounds"
+Test-CompileError "str_slice_oob_const"  "fn main() { var s = `"abc`"[0..4] }" "slice upper bound 4 exceeds string length 3"
+Test-CompileError "str_index_mutate"     "fn main() { var s = `"abc`"`ns[0] = 65 }" "cannot mutate or take address of byte in immutable 'str'"
+Test-CompileError "ret_local_slice"      "fn bad(): []i32 { var a[3]: i32 = [1, 2, 3]`nreturn a[0..2] }`nfn main() {}" "cannot return slice of local variable 'a'"
+Test-CompileError "ret_fixed_array"      "fn bad(): [3]i32 { var a[3]: i32 = [1, 2, 3]`nreturn a }`nfn main() {}" "returning fixed-size array '[3]i32' by value is not allowed"
+
+Test-RunTrap "str_index_oob_runtime" @"
+fn get_ch(s: str, i: i64): u8 {
+    return s[i]
+}
+fn main() {
+    print(get_ch("hello", 5))
+}
+"@ "index out of bounds"
+
+Test-RunTrap "str_slice_oob_runtime" @"
+fn sub(s: str, a: i64, b: i64): str {
+    return s[a..b]
+}
+fn main() {
+    print(sub("hello", 2, 6))
+}
+"@ "slice upper bound > length"
+
+Test-RunOk "phase9_value_returns_and_strings" @"
+import "std/str.sb"
+
+struct Vec3 {
+    x: i32
+    y: i32
+    z: i32
+}
+
+fn make_vec3(x: i32, y: i32, z: i32): Vec3 {
+    return Vec3 { x: x, y: y, z: z }
+}
+
+fn (a: Vec3) add(b: Vec3): Vec3 {
+    return Vec3 { x: a.x + b.x, y: a.y + b.y, z: a.z + b.z }
+}
+
+fn (a: Vec3) scale_with_defer(k: i32, trace: *i32): Vec3 {
+    defer { *trace += 100 }
+    return Vec3 { x: a.x * k, y: a.y * k, z: a.z * k }
+}
+
+fn (a: Vec3) sum(): i32 {
+    return a.x + a.y + a.z
+}
+
+struct Token {
+    lexeme: str
+    digits: []i32
+    line: i32
+}
+
+fn make_token(src: str, lo: i64, hi: i64, nums[]: i32, ln: i32): Token {
+    return Token {
+        lexeme: src[lo..hi],
+        digits: nums[1..3],
+        line: ln
+    }
+}
+
+fn tail_slice(s[]: i32, start: i64): []i32 {
+    return s[start..]
+}
+
+fn choose_greeting(flag: bool, s: str): str {
+    defer {
+        // verify defer preserves (RAX=ptr, RDX=len) on str return
+        var dummy = 1 + 2
+        if dummy == 0 { print(dummy) }
+    }
+    if flag {
+        return s[0..5]
+    }
+    return s[6..14]
+}
+
+fn main() {
+    // 1. Struct return by value + chained value-returning methods + field access on call
+    var v1 = make_vec3(1, 2, 3)
+    var v2 = make_vec3(10, 20, 30)
+    var v3 = v1.add(v2).add(make_vec3(100, 200, 300))
+    print(v3.x)
+    print(v3.y)
+    print(v3.z)
+    print(make_vec3(7, 8, 9).y)
+    print(v1.add(v2).sum())
+
+    // Self-assignment with value return + defer on struct return
+    var trace = 5
+    v1 = v1.scale_with_defer(4, &trace)
+    print(v1.x)
+    print(v1.y)
+    print(v1.z)
+    print(trace)
+
+    // 2. str parameters, str returns, str slicing, str indexing, str equality, loop over str
+    var msg = "hello Antimony!"
+    print(choose_greeting(true, msg))
+    print(choose_greeting(false, msg))
+    print(msg[0])
+    print(msg[6])
+    print(msg[0..5] == "hello")
+    print(msg[6..14] == "Antimony")
+    print(msg[0..5] != "world")
+
+    var ascii_sum: i64 = 0
+    loop i, ch in "ABC" {
+        ascii_sum += i * 100 + i64(ch)
+    }
+    print(ascii_sum)
+
+    // 3. Struct with str and []i32 fields + returning []i32 slice by value
+    var arr[4]: i32 = [10, 20, 30, 40]
+    var tok = make_token("fn main()", 3, 7, arr, 42)
+    print(tok.lexeme)
+    print(tok.lexeme == "main")
+    print(len(tok.digits))
+    print(tok.digits[0])
+    print(tok.digits[1])
+    print(tok.line)
+
+    var sub[] = tail_slice(arr, 2)
+    print(len(sub))
+    print(sub[0])
+    print(sub[1])
+
+    // 4. std/str.sb rich str utilities
+    print(str_starts_with("antimony.sb", "anti"))
+    print(str_ends_with("antimony.sb", ".sb"))
+    print(str_trim("   fast systems   "))
+    print(str_find_byte("a:b:c", 58))
+    print(str_parse_i64("  -98765  "))
+}
+"@ "111`n222`n333`n8`n66`n4`n8`n12`n105`nhello`nAntimony`n104`n65`ntrue`ntrue`ntrue`n498`nmain`ntrue`n2`n20`n30`n42`n2`n30`n40`ntrue`ntrue`nfast systems`n1`n-98765"
+
 Write-Host "`nAll tests passed."

@@ -486,12 +486,41 @@ fn (v: Vec2) length_sq(): i32 {
     return v.x * v.x + v.y * v.y
 }
 
+fn (v: Vec2) add(other: Vec2): Vec2 {
+    return Vec2 { x: v.x + other.x, y: v.y + other.y }
+}
+
 fn main() {
     var pt = Vec2 { x: 3, y: 4 }
-    print(pt.length_sq())   // 25
-    pt.translate(10, 20)    // auto-references &pt
-    print(pt.x)             // 13
-    print(pt.y)             // 24
+    print(pt.length_sq())       // 25
+    pt.translate(10, 20)        // auto-references &pt
+    var sum = pt.add(Vec2 { x: 1, y: 2 })
+    print(sum.x)                // 14
+    print(sum.y)                // 26
+}
+```
+
+### 10.4 Returning `struct`, `str`, and `[]T` by Value + First-Class `str` Operations
+Functions and methods can return `struct`, `str`, and slice `[]T` values directly by value, and `struct` definitions can hold `str` and `[]T` fields:
+- **Zero-copy `str` slicing & indexing:** `s[i]` returns byte `u8` (bounds-checked), and `s[lo..hi]` returns a sub-string `str` without allocating.
+- **`str` equality & iteration:** Compare strings with `s1 == s2` or `s1 != s2`, and iterate over bytes with `loop b in s` or `loop i, b in s`.
+- **Escape safety:** Returning a slice `[]T` pointing to a local stack variable is rejected at compile time.
+
+```
+struct Token {
+    lexeme: str
+    line: i32
+}
+
+fn scan_ident(src: str, lo: i64, hi: i64, ln: i32): Token {
+    return Token { lexeme: src[lo..hi], line: ln }
+}
+
+fn main() {
+    var tok = scan_ident("fn main()", 3, 7, 1)
+    print(tok.lexeme)               // main
+    print(tok.lexeme == "main")     // true
+    print(tok.lexeme[0])            // 109 ('m')
 }
 ```
 

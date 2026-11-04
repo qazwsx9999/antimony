@@ -60,3 +60,70 @@ fn parse_i64(s[]: u8): i64 {
     }
     return acc
 }
+
+// Returns true if `s` begins with `prefix`.
+fn str_starts_with(s: str, prefix: str): bool {
+    var plen = len(prefix)
+    if len(s) < plen {
+        return false
+    }
+    return s[0..plen] == prefix
+}
+
+// Returns true if `s` ends with `suffix`.
+fn str_ends_with(s: str, suffix: str): bool {
+    var slen = len(s)
+    var xlen = len(suffix)
+    if slen < xlen {
+        return false
+    }
+    return s[slen - xlen..slen] == suffix
+}
+
+// Trims leading and trailing ASCII whitespace from `s`.
+fn str_trim(s: str): str {
+    var lo: i64 = 0
+    var hi: i64 = len(s)
+    loop lo < hi && is_space(s[lo]) {
+        lo += 1
+    }
+    loop hi > lo && is_space(s[hi - 1]) {
+        hi -= 1
+    }
+    return s[lo..hi]
+}
+
+// Returns the first index of byte `b` in `s`, or -1 if not found.
+fn str_find_byte(s: str, b: u8): i64 {
+    loop i, ch in s {
+        if ch == b {
+            return i
+        }
+    }
+    return -1
+}
+
+// Parses a signed decimal integer directly from a `str` slice.
+fn str_parse_i64(s: str): i64 {
+    var t = str_trim(s)
+    var n = len(t)
+    var i: i64 = 0
+    var neg = false
+    if i < n {
+        if t[i] == 45 {
+            neg = true
+            i += 1
+        } else if t[i] == 43 {
+            i += 1
+        }
+    }
+    var acc: i64 = 0
+    loop i < n && is_digit(t[i]) {
+        acc = acc * 10 + i64(t[i] - 48)
+        i += 1
+    }
+    if neg {
+        return -acc
+    }
+    return acc
+}

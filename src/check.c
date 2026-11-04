@@ -371,9 +371,6 @@ static void layout_struct(Checker *c, Type *st) {
             }
         }
         Type *ft = resolve_decl_type(c, fd);
-        if (ft == &ty_str || ft->kind == TY_SLICE) {
-            fatal(fd->pos, "field '%s' of type '%s' is not supported in structs yet", fd->name, ft->name);
-        }
         int a = ft->align ? ft->align : 8;
         if (a > max_align) max_align = a;
         if (offset % a != 0) offset += a - (offset % a);
@@ -396,12 +393,18 @@ static StructField *find_field(Type *st, const char *name) {
 }
 
 // Verifies that an lvalue (`x`, `p.x`, `arr[i]`) is not rooted at a read-only
-// value parameter or range-loop variable without an intervening pointer dereference.
+// value parameter, range-loop variable, or immutable string without an intervening pointer dereference.
 static void check_lvalue_mutable(Node *lval, Pos pos) {
+    if (lval && lval->kind == N_INDEX && lval->lhs->type == &ty_str) {
+        fatal(pos, "cannot mutate or take address of byte in immutable 'str'");
+    }
     Node *base = lval;
     while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
         if (base->lhs->type && (base->lhs->type->kind == TY_PTR || base->lhs->type->kind == TY_SLICE)) return;
         base = base->lhs;
+    }
+    if (base && (base->kind == N_STRUCT_LIT || base->kind == N_CALL)) {
+        fatal(pos, "cannot mutate or take address of temporary '%s' value", base->type->name);
     }
     if (base && base->kind == N_IDENT && base->sym) {
         if (base->sym->kind == SYM_PARAM) {
@@ -763,8 +766,8 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     case N_INDEX: {
         check_expr(c, n->lhs, NULL);
         Type *bt = n->lhs->type;
-        if (bt->kind != TY_ARRAY && bt->kind != TY_SLICE && bt->kind != TY_PTR) {
-            fatal(n->pos, "cannot index value of type '%s' (expected array, slice, or pointer)", bt->name);
+        if (bt->kind != TY_ARRAY && bt->kind != TY_SLICE && bt->kind != TY_PTR && bt != &ty_str) {
+            fatal(n->pos, "cannot index value of type '%s' (expected array, slice, string, or pointer)", bt->name);
         }
         check_expr(c, n->rhs, NULL);
         if (!is_int(n->rhs->type)) {
@@ -774,15 +777,20 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         if (bt->kind != TY_PTR && n->rhs->is_const) {
             if (n->rhs->cval < 0) {
                 char buf[48];
-                fatal(n->rhs->pos, "array index %s cannot be negative", i128_str(n->rhs->cval, buf));
+                fatal(n->rhs->pos, "index %s cannot be negative", i128_str(n->rhs->cval, buf));
             }
             if (bt->kind == TY_ARRAY && n->rhs->cval >= bt->array_len) {
                 char buf[48];
                 fatal(n->rhs->pos, "array index %s out of bounds for '%s' (length %d)",
                       i128_str(n->rhs->cval, buf), bt->name, bt->array_len);
             }
+            if (bt == &ty_str && n->lhs->kind == N_STR && n->rhs->cval >= n->lhs->str_len) {
+                char buf[48];
+                fatal(n->rhs->pos, "string index %s out of bounds (length %d)",
+                      i128_str(n->rhs->cval, buf), n->lhs->str_len);
+            }
         }
-        n->type = bt->elem;
+        n->type = (bt == &ty_str) ? &ty_u8 : bt->elem;
         if (expected) coerce(n, expected);
         return;
     }
@@ -790,8 +798,8 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     case N_SLICE: {
         check_expr(c, n->lhs, NULL);
         Type *bt = n->lhs->type;
-        if (bt->kind != TY_ARRAY && bt->kind != TY_SLICE && bt->kind != TY_PTR) {
-            fatal(n->pos, "cannot slice value of type '%s' (expected array, slice, or pointer)", bt->name);
+        if (bt->kind != TY_ARRAY && bt->kind != TY_SLICE && bt->kind != TY_PTR && bt != &ty_str) {
+            fatal(n->pos, "cannot slice value of type '%s' (expected array, slice, string, or pointer)", bt->name);
         }
         if (bt->kind == TY_PTR && !n->hi) {
             fatal(n->pos, "slicing a raw pointer requires an explicit upper bound 'p[lo..hi]'");
@@ -807,6 +815,10 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 fatal(n->lo->pos, "slice lower bound %d exceeds array length %d",
                       (int)n->lo->cval, bt->array_len);
             }
+            if (bt == &ty_str && n->lhs->kind == N_STR && n->lo->is_const && n->lo->cval > n->lhs->str_len) {
+                fatal(n->lo->pos, "slice lower bound %d exceeds string length %d",
+                      (int)n->lo->cval, n->lhs->str_len);
+            }
         }
         if (n->hi) {
             check_expr(c, n->hi, NULL);
@@ -819,12 +831,16 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 fatal(n->hi->pos, "slice upper bound %d exceeds array length %d",
                       (int)n->hi->cval, bt->array_len);
             }
+            if (bt == &ty_str && n->lhs->kind == N_STR && n->hi->is_const && n->hi->cval > n->lhs->str_len) {
+                fatal(n->hi->pos, "slice upper bound %d exceeds string length %d",
+                      (int)n->hi->cval, n->lhs->str_len);
+            }
         }
         if (n->lo && n->hi && n->lo->is_const && n->hi->is_const && n->lo->cval > n->hi->cval) {
             fatal(n->pos, "slice lower bound (%d) > upper bound (%d)",
                   (int)n->lo->cval, (int)n->hi->cval);
         }
-        n->type = make_slice_type(bt->elem, n->pos);
+        n->type = (bt == &ty_str) ? &ty_str : make_slice_type(bt->elem, n->pos);
         if (expected) coerce(n, expected);
         return;
     }
@@ -1052,7 +1068,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         Type *ot = n->lhs->type;
         if (is_cmp) {
             if (op == T_EQ || op == T_NE) {
-                if (!is_int(ot) && ot != &ty_bool && ot->kind != TY_ENUM) {
+                if (!is_int(ot) && ot != &ty_bool && ot->kind != TY_ENUM && ot != &ty_str) {
                     fatal(n->pos, "operator %s is not defined for '%s'", tok_name(op), ot->name);
                 }
             } else {
@@ -1061,6 +1077,12 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 }
             }
             n->type = &ty_bool;
+            if (ot == &ty_str && n->lhs->kind == N_STR && n->rhs->kind == N_STR) {
+                bool eq = (n->lhs->str_len == n->rhs->str_len) &&
+                          (memcmp(n->lhs->str, n->rhs->str, (size_t)n->lhs->str_len) == 0);
+                n->is_const = true;
+                n->cval = (op == T_EQ) ? eq : !eq;
+            }
         } else {
             if (!is_int(ot)) {
                 fatal(n->pos, "operator %s requires integer operands, got '%s'", tok_name(op), ot->name);
@@ -1181,6 +1203,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             n->name = ms->name;
             n->sym  = ms;
             n->type = ms->type;
+            if (n->type->kind == TY_STRUCT && c->cur_fn) {
+                n->slot_start = alloc_slots_bytes(c, n->type->size);
+            }
             if (expected) {
                 if (n->type == &ty_void) {
                     fatal(n->pos, "method '%s.%s' returns no value", base_t->name, fn->name2);
@@ -1362,6 +1387,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         }
         n->sym = s;
         n->type = s->type;
+        if (n->type->kind == TY_STRUCT && c->cur_fn) {
+            n->slot_start = alloc_slots_bytes(c, n->type->size);
+        }
         if (expected) {
             if (n->type == &ty_void) {
                 fatal(n->pos, "function '%s' returns no value", n->name);
@@ -1649,6 +1677,32 @@ static bool check_stmt(Checker *c, Node *n) {
                 fatal(n->pos, "missing return value (expected '%s')", c->ret_type->name);
             }
             check_expr(c, n->lhs, c->ret_type);
+            if (c->ret_type->kind == TY_SLICE) {
+                Node *base = n->lhs;
+                while (base) {
+                    if (base->kind == N_SLICE || base->kind == N_FIELD || base->kind == N_INDEX) {
+                        if (base->lhs && base->lhs->type &&
+                            (base->lhs->type->kind == TY_PTR || base->lhs->type->kind == TY_SLICE)) {
+                            break;
+                        }
+                        base = base->lhs;
+                    } else if (base->kind == N_IDENT && base->sym &&
+                               base->sym->kind == SYM_VAR && !base->sym->is_global) {
+                        if (base->sym->type->kind == TY_ARRAY || base->sym->type->kind == TY_STRUCT) {
+                            fatal(n->lhs->pos,
+                                  "cannot return slice of local variable '%s' (stack frame is destroyed on return)",
+                                  base->sym->name);
+                        }
+                        if (base->sym->decl && base->sym->decl->rhs) {
+                            base = base->sym->decl->rhs;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
         }
         c->assigned = ALL_ASSIGNED;
         return true;
@@ -1881,10 +1935,10 @@ static bool check_stmt(Checker *c, Node *n) {
     case N_LOOP_ITER: {
         check_expr(c, n->lhs, NULL);
         Type *ct = n->lhs->type;
-        if (ct->kind != TY_ARRAY && ct->kind != TY_SLICE) {
-            fatal(n->lhs->pos, "cannot iterate over '%s' (expected array or slice)", ct->name);
+        if (ct->kind != TY_ARRAY && ct->kind != TY_SLICE && ct != &ty_str) {
+            fatal(n->lhs->pos, "cannot iterate over '%s' (expected array, slice, or string)", ct->name);
         }
-        Type *elem_t = ct->elem;
+        Type *elem_t = (ct == &ty_str) ? &ty_u8 : ct->elem;
         AssignSet before = c->assigned;
         push_scope(c, false);
         if (n->name2) {
@@ -2102,18 +2156,20 @@ Program check(NodeVec decls) {
         Node *d = decls.items[i];
         if (d->kind == N_FN) {
             Type *ret = d->type_name ? resolve_decl_type(&c, d) : &ty_void;
-            if (ret == &ty_str || ret->kind == TY_ARRAY || ret->kind == TY_SLICE || ret->kind == TY_STRUCT) {
-                fatal(d->type_pos, "returning '%s' by value is not supported yet (return '*%s' or pass a pointer)",
-                      ret->name, ret->name);
+            if (ret->kind == TY_ARRAY) {
+                fatal(d->type_pos, "returning fixed-size array '%s' by value is not allowed (return a slice '[]%s' or pass a pointer)",
+                      ret->name, ret->elem->name);
+            }
+            if (d->is_extern && (ret == &ty_str || ret->kind == TY_SLICE || ret->kind == TY_STRUCT)) {
+                fatal(d->type_pos, "extern function '%s' cannot return '%s' by value (return a pointer instead)",
+                      d->name, ret->name);
             }
             for (int j = 0; j < d->list.len; j++) {
                 Node *p = d->list.items[j];
                 p->type = resolve_decl_type(&c, p);
-                if (p->type == &ty_str) {
-                    fatal(p->type_pos, "'str' parameters are not supported yet (use '*u8' for C strings)");
-                }
-                if (d->is_extern && (p->type->kind == TY_SLICE || p->type->kind == TY_ARRAY || p->type->kind == TY_STRUCT)) {
-                    fatal(p->type_pos, "extern function parameter '%s' cannot have type '%s' by value; pass a pointer instead",
+                if (d->is_extern && (p->type == &ty_str || p->type->kind == TY_SLICE ||
+                                     p->type->kind == TY_ARRAY || p->type->kind == TY_STRUCT)) {
+                    fatal(p->type_pos, "extern function parameter '%s' cannot have type '%s' by value; pass a pointer (e.g. '*u8') instead",
                           p->name, p->type->name);
                 }
             }
@@ -2244,14 +2300,17 @@ Program check(NodeVec decls) {
         c.assigned = 0;
 
         push_scope(&c, true);
+        if (fn->type->kind == TY_STRUCT) {
+            fn->slot_start = alloc_slot(&c); // hidden return buffer pointer passed in R10
+        }
         for (int j = 0; j < fn->list.len; j++) {
             Node *p = fn->list.items[j];
             Symbol *ps = define(&c, SYM_PARAM, p->name, p->type, p->pos);
             ps->readonly = true;
-            if (p->type->kind == TY_SLICE) {
+            if (p->type->kind == TY_SLICE || p->type == &ty_str) {
                 ps->slot = alloc_slots_bytes(&c, 16); // {ptr, len}
             } else {
-                ps->slot = alloc_slot(&c); // scalar or pointer to fixed-size array
+                ps->slot = alloc_slot(&c); // scalar or pointer to fixed-size array/struct
             }
             p->sym = ps;
         }

@@ -19,9 +19,12 @@ typedef struct {
     int rt_print_f64;         // (rcx=f64 bits)
     int rt_print_bool;        // (rcx=0/1)
     int rt_print_str;         // (rcx=ptr, rdx=len)
+    int rt_str_eq;            // (rcx=ptr1, rdx=len1, r8=ptr2, r9=len2) -> rax=0/1
     int rt_trap;              // (rcx=msg_ptr, rdx=msg_len) -> stderr + ExitProcess(101)
 
     int cur_epilogue;
+    Type *cur_ret_type;       // return type of current function
+    int cur_ret_ptr_slot;     // slot holding hidden return buffer pointer (when cur_ret_type is TY_STRUCT)
     int temp_depth;           // expression temporary spill depth (1-based)
     int max_temp_depth;
     int base_slots;           // local variable slots in current function
@@ -499,7 +502,7 @@ static void gen_collection_ptr_len(CG *cg, Node *base) {
 // and returns the element address in RAX.
 static void gen_index_addr(CG *cg, Node *n) {
     Type *bt = n->lhs->type;
-    Type *elem_t = bt->elem;
+    Type *elem_t = (bt == &ty_str) ? &ty_u8 : bt->elem;
 
     if (bt->kind == TY_PTR) {
         gen_expr(cg, n->lhs); // RAX = ptr
@@ -543,8 +546,8 @@ static void gen_index_addr(CG *cg, Node *n) {
         return;
     }
 
-    // Fast path for slice variable `s[idx]` with simple index: zero stack spills.
-    if (n->lhs->kind == N_IDENT && bt->kind == TY_SLICE && is_simple_expr(n->rhs)) {
+    // Fast path for slice or string variable `s[idx]` with simple index: zero stack spills.
+    if (n->lhs->kind == N_IDENT && (bt->kind == TY_SLICE || bt == &ty_str) && is_simple_expr(n->rhs)) {
         Symbol *s = n->lhs->sym;
         gen_simple_into_reg(n->rhs, RAX);
         x_load(RDX, RBP, slot_disp(s->slot) + 8);
@@ -609,7 +612,7 @@ static void gen_lvalue_addr(CG *cg, Node *n) {
                 x_test_rr(1, RAX, RAX);
                 emit_trap_if(cg, CC_E, n->pos, "null pointer dereference");
             }
-        } else if (n->lhs->kind == N_STRUCT_LIT) {
+        } else if (n->lhs->kind == N_STRUCT_LIT || n->lhs->kind == N_CALL) {
             gen_expr(cg, n->lhs); // RAX = temp struct address
         } else {
             gen_lvalue_addr(cg, n->lhs);
@@ -666,6 +669,13 @@ static void gen_init_at_addr(CG *cg, int addr_slot, Node *rhs, Type *t) {
         x_rep_movsb();
         return;
     }
+    if (t == &ty_str || t->kind == TY_SLICE) {
+        gen_collection_ptr_len(cg, rhs); // RAX = ptr, RDX = len
+        x_load(RCX, RBP, slot_disp(addr_slot));
+        x_store(RCX, 0, RAX);
+        x_store(RCX, 8, RDX);
+        return;
+    }
     gen_expr(cg, rhs);
     x_load(RCX, RBP, slot_disp(addr_slot));
     x_store_sized(RCX, 0, RAX, t->size);
@@ -704,6 +714,11 @@ static void gen_expr(CG *cg, Node *n) {
             // Address of array/struct is already in RAX.
             return;
         }
+        if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
+            x_load(RDX, RAX, 8);
+            x_load(RAX, RAX, 0);
+            return;
+        }
         x_load_sized(RAX, RAX, 0, elem_t->size, elem_t->is_signed);
         return;
     }
@@ -720,6 +735,11 @@ static void gen_expr(CG *cg, Node *n) {
         Type *ft = n->type;
         gen_lvalue_addr(cg, n);
         if (ft->kind == TY_ARRAY || ft->kind == TY_STRUCT) {
+            return;
+        }
+        if (ft == &ty_str || ft->kind == TY_SLICE) {
+            x_load(RDX, RAX, 8);
+            x_load(RAX, RAX, 0);
             return;
         }
         x_load_sized(RAX, RAX, 0, ft->size, ft->is_signed);
@@ -746,13 +766,18 @@ static void gen_expr(CG *cg, Node *n) {
         if (elem_t->kind == TY_ARRAY || elem_t->kind == TY_STRUCT) {
             return;
         }
+        if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
+            x_load(RDX, RAX, 8);
+            x_load(RAX, RAX, 0);
+            return;
+        }
         x_load_sized(RAX, RAX, 0, elem_t->size, elem_t->is_signed);
         return;
     }
 
     case N_SLICE: {
         Type *bt = n->lhs->type;
-        Type *elem_t = n->type->elem;
+        Type *elem_t = (bt == &ty_str) ? &ty_u8 : n->type->elem;
         if (bt->kind == TY_PTR) {
             gen_expr(cg, n->lhs);
             if (!cg->release) {
@@ -927,6 +952,24 @@ static void gen_expr(CG *cg, Node *n) {
             return;
         }
 
+        // String equality (`s1 == s2`, `s1 != s2`).
+        if (n->lhs->type == &ty_str) {
+            gen_expr(cg, n->lhs); // RAX = ptr1, RDX = len1
+            int s_ptr1 = push_temp(cg);
+            x_mov_rr(1, RAX, RDX);
+            int s_len1 = push_temp(cg);
+            gen_expr(cg, n->rhs); // RAX = ptr2, RDX = len2
+            x_mov_rr(1, R8, RAX);
+            x_mov_rr(1, R9, RDX);
+            pop_temp(cg, s_len1, RDX);
+            pop_temp(cg, s_ptr1, RCX);
+            x_call(cg->rt_str_eq);
+            if (n->op == T_NE) {
+                x_alu_ri(ALU_XOR, 0, RAX, 1);
+            }
+            return;
+        }
+
         // Fast immediate specialization for shifts by a compile-time constant.
         if ((n->op == T_SHL || n->op == T_SHR) && n->rhs->is_const && n->lhs->type->kind == TY_INT) {
             int bits = n->lhs->type->size * 8;
@@ -1086,7 +1129,7 @@ static void gen_expr(CG *cg, Node *n) {
         for (int i = 0; i < nargs; i++) {
             Node *arg = n->list.items[i];
             Type *pt = n->sym->decl->list.items[i]->type;
-            if (pt->kind == TY_SLICE) {
+            if (pt->kind == TY_SLICE || pt == &ty_str) {
                 gen_collection_ptr_len(cg, arg); // RAX = ptr, RDX = len
                 int s_hi = push_temp(cg);        // stores RAX at [RBP - 8*s_hi]
                 x_mov_rr(1, RAX, RDX);
@@ -1114,7 +1157,7 @@ static void gen_expr(CG *cg, Node *n) {
                 pop_temp(cg, arg_slots[i], RAX);
                 x_store(RSP, 32 + (i - 4) * 8, RAX);
             }
-            if (pt->kind == TY_SLICE) {
+            if (pt->kind == TY_SLICE || pt == &ty_str) {
                 cg->temp_depth -= 2; // release the 16-byte temporary descriptor
             }
         }
@@ -1132,6 +1175,9 @@ static void gen_expr(CG *cg, Node *n) {
                 x_movzx8(RAX, RAX);
             }
         } else {
+            if (n->type->kind == TY_STRUCT) {
+                x_lea(R10, RBP, slot_disp(n->slot_start));
+            }
             x_call(n->sym->label);
         }
         return;
@@ -1188,7 +1234,7 @@ static void gen_assign(CG *cg, Node *n) {
             cg->temp_depth--;
             return;
         }
-        if (s->type->kind == TY_SLICE) {
+        if (s->type->kind == TY_SLICE || s->type == &ty_str) {
             gen_collection_ptr_len(cg, n->rhs);
             store_var(s, RAX);
             return;
@@ -1293,6 +1339,7 @@ static void gen_cond_jump(CG *cg, Node *cond, int target, bool jump_if_true) {
         return;
     }
     if (cond->kind == N_BINARY && cond->lhs->type->kind != TY_FLOAT &&
+        cond->lhs->type != &ty_str &&
         (cond->op == T_EQ || cond->op == T_NE || cond->op == T_LT ||
          cond->op == T_LE || cond->op == T_GT || cond->op == T_GE)) {
         int cc = CC_E;
@@ -1576,11 +1623,32 @@ static void gen_stmt(CG *cg, Node *n) {
 
     case N_RETURN:
         if (n->lhs) {
-            gen_expr(cg, n->lhs);
-            if (cg->defers.len > 0) {
-                int ret_slot = push_temp(cg);
-                emit_defers_from(cg, 0);
-                pop_temp(cg, ret_slot, RAX);
+            if (cg->cur_ret_type->kind == TY_STRUCT) {
+                x_load(RAX, RBP, slot_disp(cg->cur_ret_ptr_slot));
+                int addr_slot = push_temp(cg);
+                gen_init_at_addr(cg, addr_slot, n->lhs, cg->cur_ret_type);
+                cg->temp_depth--;
+                if (cg->defers.len > 0) {
+                    emit_defers_from(cg, 0);
+                }
+                x_load(RAX, RBP, slot_disp(cg->cur_ret_ptr_slot));
+            } else if (cg->cur_ret_type == &ty_str || cg->cur_ret_type->kind == TY_SLICE) {
+                gen_collection_ptr_len(cg, n->lhs);
+                if (cg->defers.len > 0) {
+                    int s_ptr = push_temp(cg);
+                    x_mov_rr(1, RAX, RDX);
+                    int s_len = push_temp(cg);
+                    emit_defers_from(cg, 0);
+                    pop_temp(cg, s_len, RDX);
+                    pop_temp(cg, s_ptr, RAX);
+                }
+            } else {
+                gen_expr(cg, n->lhs);
+                if (cg->defers.len > 0) {
+                    int ret_slot = push_temp(cg);
+                    emit_defers_from(cg, 0);
+                    pop_temp(cg, ret_slot, RAX);
+                }
             }
         } else if (cg->defers.len > 0) {
             emit_defers_from(cg, 0);
@@ -1875,6 +1943,8 @@ static void gen_fn(CG *cg, Node *fn) {
     uint32_t patch = x_sub_rsp_patchable();
 
     cg->cur_epilogue = x_label();
+    cg->cur_ret_type = fn->type;
+    cg->cur_ret_ptr_slot = fn->slot_start;
     cg->base_slots = fn->num_slots + num_saved;
     cg->temp_depth = 0;
     cg->max_temp_depth = 0;
@@ -1884,6 +1954,11 @@ static void gen_fn(CG *cg, Node *fn) {
     // Save allocated non-volatile registers (RBX, R12..R15).
     for (int k = 0; k < num_saved; k++) {
         x_store(RBP, slot_disp(fn->num_slots + 1 + k), saved_regs[k]);
+    }
+
+    // If this function returns a struct by value, save the caller's return buffer pointer (in R10).
+    if (fn->type->kind == TY_STRUCT) {
+        x_store(RBP, slot_disp(fn->slot_start), R10);
     }
 
     // Move incoming parameters into their allocated registers or stack slots
@@ -1897,7 +1972,7 @@ static void gen_fn(CG *cg, Node *fn) {
         } else {
             x_load(RAX, RBP, 48 + (i - 4) * 8);
         }
-        if (ps->type->kind == TY_SLICE) {
+        if (ps->type->kind == TY_SLICE || ps->type == &ty_str) {
             // Parameter register holds pointer to 16-byte `{ptr, len}` descriptor.
             x_load(R10, reg, 0);
             x_load(R11, reg, 8);
@@ -1937,6 +2012,7 @@ static void emit_runtime(CG *cg) {
     cg->rt_print_f64  = x_label();
     cg->rt_print_bool = x_label();
     cg->rt_print_str  = x_label();
+    cg->rt_str_eq     = x_label();
     cg->rt_trap       = x_label();
 
     // rt_write(rcx = buf, rdx = len): writes to cached stdout handle.
@@ -2150,6 +2226,31 @@ static void emit_runtime(CG *cg) {
     x_mov_ri(RDX, 1);
     x_call(cg->rt_write);
     x_leave();
+    x_ret();
+
+    // rt_str_eq(rcx = ptr1, rdx = len1, r8 = ptr2, r9 = len2) -> rax = 1 if equal, 0 otherwise.
+    x_bind(cg->rt_str_eq);
+    int seq_true = x_label(), seq_false = x_label(), seq_loop = x_label();
+    x_alu_rr(ALU_CMP, 1, RDX, R9);
+    x_jcc(CC_NE, seq_false);
+    x_alu_rr(ALU_CMP, 1, RCX, R8);
+    x_jcc(CC_E, seq_true);
+    x_bind(seq_loop);
+    x_test_rr(1, RDX, RDX);
+    x_jcc(CC_E, seq_true);
+    x_load_sized(RAX, RCX, 0, 1, false);
+    x_load_sized(R10, R8, 0, 1, false);
+    x_alu_rr(ALU_CMP, 0, RAX, R10);
+    x_jcc(CC_NE, seq_false);
+    x_alu_ri(ALU_ADD, 1, RCX, 1);
+    x_alu_ri(ALU_ADD, 1, R8, 1);
+    x_alu_ri(ALU_SUB, 1, RDX, 1);
+    x_jmp(seq_loop);
+    x_bind(seq_true);
+    x_mov_ri(RAX, 1);
+    x_ret();
+    x_bind(seq_false);
+    x_mov_ri(RAX, 0);
     x_ret();
 
     // rt_trap(rcx = msg_ptr, rdx = msg_len): writes message to stderr and exits with 101.
