@@ -155,8 +155,8 @@ static char *default_output_path(const char *input) {
 
 static void usage(void) {
     fprintf(stderr,
-        "Antimony compiler (sbc) — Windows x64 native backend\n"
-        "Usage: sbc <file.sb> [-o <out.exe>] [--release] [--run]\n");
+        "Antimony compiler (sbc) — Dual-Backend (Native x64 & Optimizing/LLVM)\n"
+        "Usage: sbc <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]\n");
     exit(1);
 }
 
@@ -164,14 +164,21 @@ int main(int argc, char **argv) {
     const char *input = NULL;
     const char *output = NULL;
     bool release = false;
+    bool use_llvm = false;
+    bool emit_ir = false;
     bool run_after = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-o") == 0) {
             if (++i >= argc) usage();
             output = argv[i];
-        } else if (strcmp(argv[i], "--release") == 0 || strcmp(argv[i], "-O") == 0) {
+        } else if (strcmp(argv[i], "--release") == 0 || strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O2") == 0) {
             release = true;
+        } else if (strcmp(argv[i], "--llvm") == 0 || strcmp(argv[i], "-O3") == 0 || strcmp(argv[i], "--opt") == 0) {
+            use_llvm = true;
+            release = true;
+        } else if (strcmp(argv[i], "--emit-llvm") == 0) {
+            emit_ir = true;
         } else if (strcmp(argv[i], "--run") == 0 || strcmp(argv[i], "-r") == 0) {
             run_after = true;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -197,14 +204,27 @@ int main(int argc, char **argv) {
     Pos root_pos = {1, 1, 0};
     load_module_recursive(input, "", false, root_pos, &decls);
     Program prog = check(decls);
-    Image img = codegen(&prog, release);
-    write_pe(output, &img);
+
+    if (emit_ir) {
+        if (!emit_llvm_ir(&prog, decls, output, release)) {
+            die("failed to write LLVM IR to '%s'", output);
+        }
+    } else if (use_llvm) {
+        if (!compile_opt_backend(&prog, decls, output, release)) {
+            die("optimizing backend failed for '%s'", output);
+        }
+    } else {
+        Image img = codegen(&prog, release);
+        write_pe(output, &img);
+    }
 
 #ifdef _WIN32
     QueryPerformanceCounter(&t1);
     double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-    fprintf(stderr, "compiled %s -> %s (%.2f ms, %s)\n",
-            input, output, ms, release ? "release" : "debug");
+    fprintf(stderr, "compiled %s -> %s (%.2f ms, %s%s)\n",
+            input, output, ms,
+            release ? "release" : "debug",
+            use_llvm ? ", llvm-O3" : (emit_ir ? ", llvm-ir" : ""));
 #endif
 
     if (run_after) {

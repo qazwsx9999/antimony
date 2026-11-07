@@ -315,6 +315,7 @@ void x_alu_rm(int alu, int w, int dst, int base, int32_t disp);   // dst = dst o
 void x_alu_mr_rip(int alu, int sec, uint32_t off, int src);       // [rip+x] op= src (64-bit)
 void x_test_rr(int w, int a, int b);
 void x_imul_rr(int w, int dst, int src);
+void x_imul_rri(int w, int dst, int src, int32_t imm);
 void x_f7(int ext, int w, int r);       // not=2 neg=3 mul=4 imul=5 div=6 idiv=7
 void x_cqo(void);
 void x_cdq(void);
@@ -366,5 +367,7 @@ typedef struct {
 
 Image codegen(Program *prog, bool release);
 void write_pe(const char *path, Image *img);
+bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release);
+bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release);
 
 #endif

@@ -229,6 +229,19 @@ void x_imul_rr(int w, int dst, int src) {
     modrm(3, dst, src);
 }
 
+void x_imul_rri(int w, int dst, int src, int32_t imm) {
+    emit_rex(w, dst, 0, src);
+    if (imm >= -128 && imm <= 127) {
+        emit8(0x6B);
+        modrm(3, dst, src);
+        emit8((uint8_t)(int8_t)imm);
+    } else {
+        emit8(0x69);
+        modrm(3, dst, src);
+        emit32((uint32_t)imm);
+    }
+}
+
 void x_f7(int ext, int w, int r) {
     emit_rex(w, 0, 0, r);
     emit8(0xF7);

@@ -27,6 +27,7 @@ typedef struct {
     int cur_ret_ptr_slot;     // slot holding hidden return buffer pointer (when cur_ret_type is TY_STRUCT)
     int temp_depth;           // expression temporary spill depth (1-based)
     int max_temp_depth;
+    int scratch_depth;        // volatile scratch register depth (0..4 -> R8..R11)
     int base_slots;           // local variable slots in current function
     int max_out_stack_args;   // max args > 4 across calls in current function
     VEC(Node *) defers;       // active `defer` statement bodies in current function
@@ -117,6 +118,13 @@ static void check_and_normalize_sub64(CG *cg, Type *dst, bool src_signed, Pos po
 }
 
 static void load_var(Symbol *s, int reg) {
+    if (s->type->kind == TY_SLICE || s->type == &ty_str) {
+        // Fat pointer {ptr, len} in (RAX, RDX).
+        if (s->hw_reg >= 0) x_mov_rr(1, RAX, s->hw_reg);
+        else                x_load(RAX, RBP, slot_disp(s->slot));
+        x_load(RDX, RBP, slot_disp(s->slot) + 8);
+        return;
+    }
     if (s->hw_reg >= 0) {
         x_mov_rr(1, reg, s->hw_reg);
         return;
@@ -133,24 +141,19 @@ static void load_var(Symbol *s, int reg) {
         }
         return;
     }
-    if (s->type->kind == TY_SLICE || s->type == &ty_str) {
-        // Fat pointer {ptr, len} in (RAX, RDX).
-        x_load(RAX, RBP, slot_disp(s->slot));
-        x_load(RDX, RBP, slot_disp(s->slot) + 8);
-        return;
-    }
     if (s->is_global) x_load_rip(reg, SEC_DATA, s->data_off);
     else              x_load(reg, RBP, slot_disp(s->slot));
 }
 
 static void store_var(Symbol *s, int reg) {
-    if (s->hw_reg >= 0) {
-        x_mov_rr(1, s->hw_reg, reg);
-        return;
-    }
     if (s->type->kind == TY_SLICE || s->type == &ty_str) {
+        if (s->hw_reg >= 0) x_mov_rr(1, s->hw_reg, RAX);
         x_store(RBP, slot_disp(s->slot), RAX);
         x_store(RBP, slot_disp(s->slot) + 8, RDX);
+        return;
+    }
+    if (s->hw_reg >= 0) {
+        x_mov_rr(1, s->hw_reg, reg);
         return;
     }
     if (s->is_global) x_store_rip(SEC_DATA, s->data_off, reg);
@@ -255,6 +258,36 @@ static void gen_simple_into_reg(Node *n, int reg) {
         return;
     default:
         die("internal error: non-simple expr in gen_simple_into_reg");
+    }
+}
+
+// Returns true if evaluating `n` in `release` mode is guaranteed not to issue
+// a function/runtime call (and therefore preserves volatile scratch registers R8..R11).
+static bool is_call_free_expr(Node *n, bool release) {
+    if (!n || !release) return false;
+    if (n->is_const) return true;
+    switch (n->kind) {
+    case N_INT:
+    case N_BOOL:
+    case N_NULL:
+    case N_FLOAT:
+        return true;
+    case N_IDENT: {
+        Type *t = n->sym->type;
+        return !n->implicit_slice &&
+               (t->kind == TY_INT || t->kind == TY_ENUM || t->kind == TY_BOOL ||
+                t->kind == TY_FLOAT || t->kind == TY_PTR);
+    }
+    case N_UNARY:
+        return is_call_free_expr(n->lhs, release);
+    case N_CONV:
+        return n->type != &ty_str && is_call_free_expr(n->lhs, release);
+    case N_BINARY:
+        if (n->lhs->type == &ty_str) return false;
+        if (n->op == T_SLASH || n->op == T_PERCENT) return false; // division traps even in release
+        return is_call_free_expr(n->lhs, release) && is_call_free_expr(n->rhs, release);
+    default:
+        return false;
     }
 }
 
@@ -550,12 +583,18 @@ static void gen_index_addr(CG *cg, Node *n) {
     if (n->lhs->kind == N_IDENT && (bt->kind == TY_SLICE || bt == &ty_str) && is_simple_expr(n->rhs)) {
         Symbol *s = n->lhs->sym;
         gen_simple_into_reg(n->rhs, RAX);
-        x_load(RDX, RBP, slot_disp(s->slot) + 8);
-        x_alu_rr(ALU_CMP, 1, RAX, RDX);
-        emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        if (!cg->release) {
+            x_load(RDX, RBP, slot_disp(s->slot) + 8);
+            x_alu_rr(ALU_CMP, 1, RAX, RDX);
+            emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        }
         scale_reg_by_size(RAX, elem_t->size, RDX);
-        x_load(RCX, RBP, slot_disp(s->slot));
-        x_alu_rr(ALU_ADD, 1, RAX, RCX);
+        if (s->hw_reg >= 0) {
+            x_alu_rr(ALU_ADD, 1, RAX, s->hw_reg);
+        } else {
+            x_load(RCX, RBP, slot_disp(s->slot));
+            x_alu_rr(ALU_ADD, 1, RAX, RCX);
+        }
         return;
     }
 
@@ -569,8 +608,10 @@ static void gen_index_addr(CG *cg, Node *n) {
     pop_temp(cg, s_ptr, RCX); // RCX = base_ptr
 
     // Bounds check: if idx is signed and < 0, or unsigned(idx) >= len -> trap.
-    x_alu_rr(ALU_CMP, 1, RAX, RDX);
-    emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+    if (!cg->release) {
+        x_alu_rr(ALU_CMP, 1, RAX, RDX);
+        emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+    }
 
     scale_reg_by_size(RAX, elem_t->size, RDX);
     x_alu_rr(ALU_ADD, 1, RAX, RCX); // RAX = base_ptr + idx * elem_size
@@ -1036,12 +1077,28 @@ static void gen_expr(CG *cg, Node *n) {
                     return;
                 }
             }
+            if (lt->kind == TY_INT && (n->op == T_STAR || n->op == T_STARW) &&
+                (n->op == T_STARW || cg->release)) {
+                gen_expr(cg, n->lhs);
+                x_imul_rri(1, RAX, RAX, imm32);
+                normalize_rax(lt);
+                return;
+            }
         }
 
-        // Evaluate left to right (spec §7.2); skip stack spill when RHS is a leaf operand.
+        // Evaluate left to right (spec §7.2); skip stack spill when RHS is a leaf operand
+        // or when RHS is call-free and a volatile scratch register (R8..R11) is free.
         if (is_simple_expr(n->rhs)) {
             gen_expr(cg, n->lhs);
             gen_simple_into_reg(n->rhs, RCX);
+        } else if (cg->scratch_depth < 4 && is_call_free_expr(n->rhs, cg->release)) {
+            gen_expr(cg, n->lhs);
+            int sreg = R8 + cg->scratch_depth++;
+            x_mov_rr(1, sreg, RAX);
+            gen_expr(cg, n->rhs);
+            x_mov_rr(1, RCX, RAX);
+            x_mov_rr(1, RAX, sreg);
+            cg->scratch_depth--;
         } else {
             gen_expr(cg, n->lhs);
             int slot = push_temp(cg);
@@ -1129,43 +1186,72 @@ static void gen_expr(CG *cg, Node *n) {
         if (nargs > 4 && (nargs - 4) > cg->max_out_stack_args) {
             cg->max_out_stack_args = nargs - 4;
         }
-        int *arg_slots = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
-        for (int i = 0; i < nargs; i++) {
-            Node *arg = n->list.items[i];
-            Type *pt = n->sym->decl->list.items[i]->type;
-            if (pt->kind == TY_SLICE || pt == &ty_str) {
-                gen_collection_ptr_len(cg, arg); // RAX = ptr, RDX = len
-                int s_hi = push_temp(cg);        // stores RAX at [RBP - 8*s_hi]
-                x_mov_rr(1, RAX, RDX);
-                int s_lo = push_temp(cg);        // stores RDX at [RBP - 8*s_lo] (8 bytes below s_hi)
-                // Store {ptr, len} at `[RBP - 8*s_lo]` (ptr) and `[RBP - 8*s_lo + 8]` (len).
-                x_load(RCX, RBP, slot_disp(s_hi));
-                x_store(RBP, slot_disp(s_lo) + 8, RAX); // len at +8
-                x_store(RBP, slot_disp(s_lo), RCX);     // ptr at +0
-                x_lea(RAX, RBP, slot_disp(s_lo));       // RAX = &{ptr, len}
-                arg_slots[i] = push_temp(cg);
-            } else {
-                gen_expr(cg, arg);
-                arg_slots[i] = push_temp(cg);
-            }
-        }
         static const int arg_regs[4] = {RCX, RDX, R8, R9};
-        for (int i = nargs - 1; i >= 0; i--) {
+        bool fast_args = (nargs <= 4);
+        for (int i = 0; i < nargs; i++) {
             Type *pt = n->sym->decl->list.items[i]->type;
-            if (i < 4) {
-                pop_temp(cg, arg_slots[i], arg_regs[i]);
-                if (n->sym->is_extern && pt->kind == TY_FLOAT) {
-                    x_movq_xmm_gpr(i, arg_regs[i]);
-                }
-            } else {
-                pop_temp(cg, arg_slots[i], RAX);
-                x_store(RSP, 32 + (i - 4) * 8, RAX);
-            }
             if (pt->kind == TY_SLICE || pt == &ty_str) {
-                cg->temp_depth -= 2; // release the 16-byte temporary descriptor
+                fast_args = false;
+                break;
+            }
+            if (i > 0 && !is_simple_expr(n->list.items[i])) {
+                fast_args = false;
+                break;
             }
         }
-        free(arg_slots);
+        if (fast_args) {
+            if (nargs > 0) {
+                gen_expr(cg, n->list.items[0]);
+                x_mov_rr(1, RCX, RAX);
+                if (n->sym->is_extern && n->sym->decl->list.items[0]->type->kind == TY_FLOAT) {
+                    x_movq_xmm_gpr(0, RCX);
+                }
+                for (int i = 1; i < nargs; i++) {
+                    Type *pt = n->sym->decl->list.items[i]->type;
+                    gen_simple_into_reg(n->list.items[i], arg_regs[i]);
+                    if (n->sym->is_extern && pt->kind == TY_FLOAT) {
+                        x_movq_xmm_gpr(i, arg_regs[i]);
+                    }
+                }
+            }
+        } else {
+            int *arg_slots = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
+            for (int i = 0; i < nargs; i++) {
+                Node *arg = n->list.items[i];
+                Type *pt = n->sym->decl->list.items[i]->type;
+                if (pt->kind == TY_SLICE || pt == &ty_str) {
+                    gen_collection_ptr_len(cg, arg); // RAX = ptr, RDX = len
+                    int s_hi = push_temp(cg);        // stores RAX at [RBP - 8*s_hi]
+                    x_mov_rr(1, RAX, RDX);
+                    int s_lo = push_temp(cg);        // stores RDX at [RBP - 8*s_lo] (8 bytes below s_hi)
+                    // Store {ptr, len} at `[RBP - 8*s_lo]` (ptr) and `[RBP - 8*s_lo + 8]` (len).
+                    x_load(RCX, RBP, slot_disp(s_hi));
+                    x_store(RBP, slot_disp(s_lo) + 8, RAX); // len at +8
+                    x_store(RBP, slot_disp(s_lo), RCX);     // ptr at +0
+                    x_lea(RAX, RBP, slot_disp(s_lo));       // RAX = &{ptr, len}
+                    arg_slots[i] = push_temp(cg);
+                } else {
+                    gen_expr(cg, arg);
+                    arg_slots[i] = push_temp(cg);
+                }
+            }
+            for (int i = nargs - 1; i >= 0; i--) {
+                Type *pt = n->sym->decl->list.items[i]->type;
+                if (i < 4) {
+                    pop_temp(cg, arg_slots[i], arg_regs[i]);
+                    if (n->sym->is_extern && pt->kind == TY_FLOAT) {
+                        x_movq_xmm_gpr(i, arg_regs[i]);
+                    }
+                } else {
+                    pop_temp(cg, arg_slots[i], RAX);
+                    x_store(RSP, 32 + (i - 4) * 8, RAX);
+                }
+                if (pt->kind == TY_SLICE || pt == &ty_str) {
+                    cg->temp_depth -= 2; // release the 16-byte temporary descriptor
+                }
+            }
+            free(arg_slots);
+        }
         if (n->sym->is_extern) {
             x_call_import(n->sym->iat_slot);
             if (n->type == &ty_f64) {
@@ -1202,6 +1288,20 @@ static void gen_block(CG *cg, Node *b);
 static void gen_assign(CG *cg, Node *n) {
     if (n->lhs && (n->lhs->kind == N_INDEX || n->lhs->kind == N_DEREF || n->lhs->kind == N_FIELD)) {
         Type *elem_t = n->lhs->type;
+        if (n->op == T_ASSIGN && elem_t->kind != TY_ARRAY && elem_t->kind != TY_STRUCT &&
+            elem_t->kind != TY_SLICE && elem_t != &ty_str) {
+            if (n->rhs->is_const && elem_t->size == 1 && (elem_t->kind == TY_INT || elem_t == &ty_bool)) {
+                gen_lvalue_addr(cg, n->lhs);
+                x_store8_imm(RAX, 0, (uint8_t)n->rhs->cval);
+                return;
+            }
+            if (is_simple_expr(n->rhs)) {
+                gen_lvalue_addr(cg, n->lhs);
+                gen_simple_into_reg(n->rhs, RCX);
+                x_store_sized(RAX, 0, RCX, elem_t->size);
+                return;
+            }
+        }
         gen_lvalue_addr(cg, n->lhs);
         int s_addr = push_temp(cg);
         if (n->op == T_ASSIGN) {
@@ -1439,6 +1539,9 @@ static void gen_range_loop(CG *cg, Node *n) {
             x_alu_ri(ALU_ADD, 1, r, 1);
             if (fits_imm32(n->hi, &end_imm)) {
                 x_alu_ri(ALU_CMP, 1, r, end_imm);
+            } else if (n->hi->kind == N_IDENT && !n->hi->implicit_slice &&
+                       n->hi->sym->hw_reg >= 0 && n->hi->sym->readonly) {
+                x_alu_rr(ALU_CMP, 1, r, n->hi->sym->hw_reg);
             } else {
                 x_alu_rm(ALU_CMP, 1, r, RBP, slot_disp(s_end));
             }
@@ -1897,7 +2000,7 @@ static void scan_node_vars(SymVec *locals, Node *n, int weight) {
         return;
     case N_LOOP_RANGE:
         scan_node_vars(locals, n->lo, weight);
-        scan_node_vars(locals, n->hi, weight);
+        scan_node_vars(locals, n->hi, loop_w);
         scan_node_vars(locals, n->by, weight);
         add_sym_score(locals, n->sym, 2 * loop_w);
         scan_node_vars(locals, n->body, loop_w);
@@ -1945,7 +2048,8 @@ static int alloc_fn_regs(Node *fn, int out_regs[5]) {
             if (s->hw_reg >= 0 || s->addr_taken || s->use_score < 2) continue;
             Type *t = s->type;
             if (!t || (t->kind != TY_INT && t->kind != TY_ENUM && t->kind != TY_BOOL &&
-                       t->kind != TY_FLOAT && t->kind != TY_PTR)) continue;
+                       t->kind != TY_FLOAT && t->kind != TY_PTR &&
+                       t->kind != TY_SLICE && t != &ty_str)) continue;
             if (!best || s->use_score > best->use_score) {
                 best = s;
             }
@@ -2001,6 +2105,7 @@ static void gen_fn(CG *cg, Node *fn) {
             // Parameter register holds pointer to 16-byte `{ptr, len}` descriptor.
             x_load(R10, reg, 0);
             x_load(R11, reg, 8);
+            if (ps->hw_reg >= 0) x_mov_rr(1, ps->hw_reg, R10);
             x_store(RBP, slot_disp(ps->slot), R10);
             x_store(RBP, slot_disp(ps->slot) + 8, R11);
         } else {

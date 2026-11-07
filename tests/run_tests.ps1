@@ -1056,4 +1056,57 @@ fn main() {
 }
 "@ "1`n1`n2`n2`n3`n0`n0`nHello`ntrue`nell`n3`nvalue=-1234567; okabcdefghijklmnopqrst`n38`ntrue`n09223372036854775807`ntrue`n3`n5`nprog.exe`nbuild`nC:\My Dir\a.sb`nout.exe`ntrue`ntrue`nraw-output`ntrue`n17`ntrue`ntrue`ntrue"
 
+# 19. Phase 11: Optimizing / LLVM backend (--llvm / -O3 and --emit-llvm)
+function Test-RunLlvm([string]$name, [string]$code, [string]$expected) {
+    $sb = Join-Path $tmp "$name.sb"
+    $exe = Join-Path $tmp "$name.exe"
+    $ll = Join-Path $tmp "$name.ll"
+    Set-Content -Path $sb -Value $code -Encoding UTF8
+    $null = & $sbc $sb -o $ll --emit-llvm 2>&1
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $ll)) { throw "FAIL [$name]: failed --emit-llvm" }
+    $null = & $sbc $sb -o $exe --llvm 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile with --llvm" }
+    $out = ((& $exe) -join "`n").Replace("`r`n", "`n").Trim()
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: exited with code $LASTEXITCODE" }
+    if ($out -ne $expected) {
+        throw "FAIL [$name]: expected '$expected', got '$out'"
+    }
+    Write-Host "PASS [llvm-O3]       $name"
+}
+
+Test-RunLlvm "phase11_llvm_opt_backend" @"
+import "std/str"
+
+struct Pair {
+    a: i64
+    b: i64
+}
+
+fn make_pair(a: i64, b: i64): Pair {
+    return Pair { a: a, b: b }
+}
+
+fn (self: Pair) sum(): i64 {
+    return self.a + self.b
+}
+
+fn fib(n: i32): i32 {
+    if n < 2 { return n }
+    return fib(n - 1) + fib(n - 2)
+}
+
+fn main() {
+    var p = make_pair(40, 2)
+    print(p.sum())
+    print(fib(15))
+
+    var sb: StringBuilder
+    sb.init(8)
+    defer sb.free()
+    sb.append("llvm=")
+    sb.append_i64(p.sum())
+    print(sb.as_str())
+}
+"@ "42`n610`nllvm=42"
+
 Write-Host "`nAll tests passed."
