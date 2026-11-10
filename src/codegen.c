@@ -2523,6 +2523,33 @@ static bool can_inline_fn(CG *cg, Node *callee) {
     return check_inline_body(callee->body, &count);
 }
 
+// Conservatively marks every symbol whose address is taken (`&x`, `&x.f`, `&x[i]`) inside `n`.
+// Needed before inlining: `addr_taken` is otherwise only computed when the callee itself is
+// compiled, which may happen after its callers.
+static void mark_addr_taken_syms(Node *n) {
+    if (!n) return;
+    if (n->kind == N_ADDR) {
+        Node *base = n->lhs;
+        while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
+            base = base->lhs;
+        }
+        if (base && base->kind == N_IDENT && base->sym) base->sym->addr_taken = true;
+    }
+    mark_addr_taken_syms(n->lhs);
+    mark_addr_taken_syms(n->rhs);
+    mark_addr_taken_syms(n->cond);
+    mark_addr_taken_syms(n->body);
+    mark_addr_taken_syms(n->els);
+    mark_addr_taken_syms(n->lo);
+    mark_addr_taken_syms(n->hi);
+    mark_addr_taken_syms(n->by);
+    mark_addr_taken_syms(n->init);
+    mark_addr_taken_syms(n->step);
+    for (int i = 0; i < n->list.len; i++) {
+        mark_addr_taken_syms(n->list.items[i]);
+    }
+}
+
 static bool is_reg_scalar_type(Type *t) {
     return t && (t->kind == TY_INT || (t->kind == TY_ENUM && !t->is_tagged) ||
                  t->kind == TY_BOOL || t->kind == TY_FLOAT || t->kind == TY_PTR || t->kind == TY_FN);
@@ -2692,6 +2719,7 @@ static void gen_inline_call(CG *cg, Node *n, Node *callee) {
             ps->is_const_alias  = false;
         }
     }
+    mark_addr_taken_syms(callee->body);
     shift_node_slots(cg, callee->body, delta);
 
     // 3. Emit `callee->body` inline.

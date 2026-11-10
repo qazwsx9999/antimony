@@ -1840,4 +1840,175 @@ $phase17_expected = "100`n2`n100`n7.75`n0`n150`n1200"
 Test-RunOk "phase17_xmm_and_loop_bce" $phase17_code $phase17_expected
 Test-RunLlvm "phase17_xmm_and_loop_bce_llvm" $phase17_code $phase17_expected
 
+# 26. Phase 18: SIB indexed loads, register compound ops, fused XMM branches, inline reg/const propagation
+$phase18_code = @"
+fn sum_i32(s: []i32): i64 {
+    var t: i64 = 0
+    var i: i64 = 0
+    loop i < len(s) {
+        t += i64(s[i])
+        i += 1
+    }
+    return t
+}
+
+fn sum_u8(s: []u8): i64 {
+    var t: i64 = 0
+    var i: i64 = 0
+    loop i < len(s) {
+        t += i64(s[i])
+        i += 1
+    }
+    return t
+}
+
+fn sum_ptr(p: *i32, n: i64): i64 {
+    var t: i64 = 0
+    var i: i64 = 0
+    loop i < n {
+        t += i64(p[i])
+        i += 1
+    }
+    return t
+}
+
+fn mix(n: i64): i64 {
+    var acc: i64 = 1
+    var k: i64 = 3
+    loop i in 0..n {
+        acc *= k
+        acc ^= i
+        acc -= i
+        acc &= 0xFFFFFF
+        acc |= k
+    }
+    return acc
+}
+
+fn cmp_code(a: f64, b: f64): i32 {
+    var code = 0
+    if a < b { code += 1 }
+    if a <= b { code += 2 }
+    if a > b { code += 4 }
+    if a >= b { code += 8 }
+    return code
+}
+
+fn scale_add(x: i64, m: i64, b: i64): i64 {
+    var t = x * m
+    return t + b
+}
+
+fn div_mix(a: i64, b: i64): i64 {
+    return (a / 4) + (b % 7) * (a / 3) - (b / 5)
+}
+
+fn main() {
+    // 1. SIB loads: sign-extended i32, zero-extended u8, raw pointer
+    var data: [8]i32 = [5, -3, 7, 100, -50, 2, 9, 1]
+    var bytes: [4]u8 = [200, 10, 255, 1]
+    print(sum_i32(data))
+    print(sum_u8(bytes))
+    print(sum_ptr(&data[0], 8))
+
+    // 2. In-register compound ops with non-constant right-hand sides
+    print(mix(5))
+
+    // 3. Fused float branches, including unordered (NaN) comparisons
+    var zero: f64 = 0.0
+    var nan = zero / zero
+    print(cmp_code(1.0, 2.0))
+    print(cmp_code(2.0, 1.0))
+    print(cmp_code(1.5, 1.5))
+    print(cmp_code(nan, 1.0))
+    var x: f64 = 0.0
+    var steps = 0
+    loop x < 10.0 {
+        x += 1.5
+        steps += 1
+    }
+    print(steps)
+
+    // 4. Inlining with constant and variable arguments; callee locals in registers
+    var v: i64 = 9
+    print(scale_add(7, 6, -2))
+    print(scale_add(v, 3, 1))
+    print(bump_via_ptr(10))
+
+    // 5. Constant-divisor division inside scratch-register expressions
+    var a: i64 = 100
+    var b: i64 = 23
+    print(div_mix(a, b))
+    print(div_mix(-a, -b))
+}
+
+// Defined after main on purpose: its '&local' must be seen before main inlines it.
+fn bump_via_ptr(x: i64): i64 {
+    var local: i64 = x
+    var p = &local
+    *p = *p + 5
+    return local
+}
+"@
+$phase18_expected = "71`n466`n71`n203`n3`n12`n10`n0`n7`n40`n28`n15`n87`n45"
+
+Test-RunOk "phase18_sib_regops_xmm_branches" $phase18_code $phase18_expected
+Test-RunOk "phase18_sib_regops_xmm_branches_release" $phase18_code $phase18_expected -Release
+Test-RunLlvm "phase18_sib_regops_xmm_branches_llvm" $phase18_code $phase18_expected
+
+# Release mode: register compound ops must wrap and re-normalize sub-64-bit types.
+$phase18_wrap_code = @"
+fn main() {
+    var w: i32 = 2147483647
+    var one: i32 = 1
+    w += one
+    print(w)
+    var b: u8 = 250
+    var six: u8 = 6
+    b += six
+    print(b)
+    var m: i32 = 65536
+    var m2: i32 = 65536
+    m *= m2
+    print(m)
+}
+"@
+Test-RunOk "phase18_reg_compound_wrap_release" $phase18_wrap_code "-2147483648`n0`n0" -Release
+
+# Debug mode: SIB fast path must keep the bounds check when the index is not range-proven.
+$phase18_oob_code = @"
+fn probe(s: []i64, n: i64): i64 {
+    var t: i64 = 0
+    var i: i64 = 0
+    loop i <= n {
+        t += s[i]
+        i += 1
+    }
+    return t
+}
+
+fn main() {
+    var a: [4]i64 = [1, 2, 3, 4]
+    print(probe(a, 4))
+}
+"@
+Test-RunTrap "phase18_sib_oob_trap" $phase18_oob_code "index out of bounds"
+
+# Regression: a callee compiled AFTER its caller that takes '&local' must not have that local
+# placed in a spare register when inlined (previously printed 10 instead of 15).
+$phase18_addr_code = @"
+fn main() {
+    print(bump_via_ptr(10))
+}
+
+fn bump_via_ptr(x: i64): i64 {
+    var local: i64 = x
+    var p = &local
+    *p = *p + 5
+    return local
+}
+"@
+Test-RunOk "phase18_inline_addr_taken_local" $phase18_addr_code "15"
+Test-RunOk "phase18_inline_addr_taken_local_release" $phase18_addr_code "15" -Release
+
 Write-Host "`nAll tests passed."
