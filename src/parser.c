@@ -229,6 +229,36 @@ static Node *parse_primary_base(Parser *p) {
         expect(p, T_RPAREN);
         return e;
     }
+    case T_DOT: {
+        // Inferred enum variant access: `.Variant` or `.Variant(payload)`
+        next(p); // '.'
+        Token *vid = expect(p, T_IDENT);
+        if (match(p, T_LPAREN)) {
+            bool saved_nsl = p->no_struct_lit;
+            p->no_struct_lit = false;
+            Node *n = new_node(N_CALL, t->pos);
+            n->op = T_DOT;
+            n->name = vid->name;
+            skip_terms(p);
+            if (cur(p)->kind != T_RPAREN) {
+                for (;;) {
+                    skip_terms(p);
+                    vec_push(n->list, parse_expr(p));
+                    skip_terms(p);
+                    if (!match(p, T_COMMA)) break;
+                    skip_terms(p);
+                    if (cur(p)->kind == T_RPAREN) break;
+                }
+            }
+            p->no_struct_lit = saved_nsl;
+            expect(p, T_RPAREN);
+            return n;
+        }
+        Node *n = new_node(N_FIELD, t->pos);
+        n->op = T_DOT;
+        n->name = vid->name;
+        return n;
+    }
     default:
         fatal(t->pos, "expected expression, got %s", tok_name(t->kind));
     }
@@ -306,6 +336,13 @@ static Node *parse_primary(Parser *p) {
                     base = n;
                 }
             }
+            continue;
+        }
+        if (cur(p)->kind == T_QUESTION) {
+            Token *q = next(p);
+            Node *n = new_node(N_TRY, q->pos);
+            n->lhs = base;
+            base = n;
             continue;
         }
         break;
@@ -777,7 +814,7 @@ static Node *parse_stmt(Parser *p) {
             expect_term(p);
             return n;
         }
-        if (lhs->kind == N_CALL) {
+        if (lhs->kind == N_CALL || lhs->kind == N_TRY) {
             if (cur(p)->kind != T_TERM && cur(p)->kind != T_RBRACE && cur(p)->kind != T_EOF) {
                 fatal(cur(p)->pos, "expression result is not used; only function calls and assignments may be statements");
             }
@@ -938,6 +975,10 @@ static Node *parse_enum(Parser *p) {
         Token *vid = expect(p, T_IDENT);
         Node *ev = new_node(N_ENUM_VAR, vid->pos);
         ev->name = vid->name;
+        if (match(p, T_LPAREN)) {
+            ev->type_name = parse_type_spec(p, &ev->type_pos, &ev->decl_kind, &ev->len_expr, &ev->ptr_depth);
+            expect(p, T_RPAREN);
+        }
         if (match(p, T_ASSIGN)) {
             ev->rhs = parse_expr(p);
         }

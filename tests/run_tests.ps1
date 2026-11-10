@@ -1064,8 +1064,8 @@ function Test-RunLlvm([string]$name, [string]$code, [string]$expected) {
     Set-Content -Path $sb -Value $code -Encoding UTF8
     $null = & $sbc $sb -o $ll --emit-llvm 2>&1
     if ($LASTEXITCODE -ne 0 -or !(Test-Path $ll)) { throw "FAIL [$name]: failed --emit-llvm" }
-    $null = & $sbc $sb -o $exe --llvm 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile with --llvm" }
+    $optOut = (& $sbc $sb -o $exe --llvm 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile with --llvm:`n$optOut" }
     $out = ((& $exe) -join "`n").Replace("`r`n", "`n").Trim()
     if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: exited with code $LASTEXITCODE" }
     if ($out -ne $expected) {
@@ -1108,5 +1108,189 @@ fn main() {
     print(sb.as_str())
 }
 "@ "42`n610`nllvm=42"
+
+# 20. Phase 12: Tagged Unions (Payload Enums), Pattern-Matching Destructuring, and `?` Operator
+Test-CompileError "tagged_enum_missing_payload" @"
+enum Opt { Some(i32), None }
+fn main() {
+    var x: Opt = Opt.Some
+}
+"@ "requires a payload of type"
+
+Test-CompileError "tagged_enum_unwanted_payload" @"
+enum Opt { Some(i32), None }
+fn main() {
+    var x: Opt = Opt.None(1)
+}
+"@ "does not take a payload"
+
+Test-CompileError "inferred_enum_no_expected" @"
+enum Opt { Some(i32), None }
+fn main() {
+    var x = .None
+}
+"@ "requires a known enum type context"
+
+Test-CompileError "match_multi_payload_binding" @"
+enum Msg { A(i32), B(i32), C }
+fn main() {
+    var m = Msg.A(1)
+    match m {
+        Msg.A(x), Msg.B(x) { print(x) }
+        Msg.C {}
+    }
+}
+"@ "cannot combine payload-binding pattern"
+
+Test-CompileError "try_outside_result_fn" @"
+enum Res { Ok(i32), Err(str) }
+fn fail(): Res { return .Err("bad") }
+fn main() {
+    var x = fail()?
+    print(x)
+}
+"@ "enclosing function must return a compatible 'Result' or 'Option' enum"
+
+Test-CompileError "try_err_type_mismatch" @"
+enum ResA { Ok(i32), Err(i32) }
+enum ResB { Ok(i32), Err(str) }
+fn a(): ResA { return .Err(404) }
+fn b(): ResB {
+    var v = a()?
+    return .Ok(v)
+}
+fn main() {}
+"@ "cannot propagate 'ResA.Err' via '?'"
+
+$phase12_code = @"
+struct Point {
+    x: i32
+    y: i32
+}
+
+enum Shape {
+    Circle(i32),
+    Rect(Point),
+    Label(str),
+    Empty
+}
+
+enum OptionI32 {
+    Some(i32),
+    None
+}
+
+enum ParseRes {
+    Ok(i32),
+    Err(str)
+}
+
+enum PointRes {
+    Ok(Point),
+    Err(str)
+}
+
+fn (self: Shape) describe(): i32 {
+    match self {
+        .Circle(r) { return r * r }
+        Shape.Rect(pt) { return pt.x + pt.y }
+        .Label(s) { return i32(len(s)) }
+        .Empty { return 0 }
+    }
+}
+
+fn find_pos(arr: []i32, target: i32): OptionI32 {
+    loop i, v in arr {
+        if v == target {
+            return .Some(i32(i))
+        }
+    }
+    return .None
+}
+
+fn sum_two_targets(arr: []i32, a: i32, b: i32): OptionI32 {
+    defer print("defer-opt")
+    var idx_a = find_pos(arr, a)?
+    var idx_b = find_pos(arr, b)?
+    return .Some(idx_a + idx_b)
+}
+
+fn parse_positive(s: str): ParseRes {
+    if len(s) == 0 {
+        return .Err("empty input")
+    }
+    if s[0] == 45 {
+        return .Err("negative number")
+    }
+    var acc: i32 = 0
+    loop b in s {
+        if b < 48 || b > 57 {
+            return .Err("invalid digit")
+        }
+        acc = acc * 10 + i32(b - 48)
+    }
+    return .Ok(acc)
+}
+
+fn parse_point(sx: str, sy: str): PointRes {
+    defer print("defer-parse-point")
+    var x = parse_positive(sx)?
+    var y = parse_positive(sy)?
+    return .Ok(Point { x: x, y: y })
+}
+
+fn main() {
+    // 1. Tagged union construction, inferred `.Variant`, methods, and destructuring match
+    var s1: Shape = .Circle(7)
+    var s2 = Shape.Rect(Point { x: 15, y: 27 })
+    var s3: Shape = .Label("Antimony")
+    var s4: Shape = .Empty
+    print(s1.describe())
+    print(s2.describe())
+    print(s3.describe())
+    print(s4.describe())
+
+    // 2. Array of tagged unions & iteration
+    var shapes[3]: Shape = [
+        Shape.Circle(3),
+        Shape.Rect(Point { x: 10, y: 20 }),
+        Shape.Empty
+    ]
+    var total: i32 = 0
+    loop sh in shapes {
+        total += sh.describe()
+    }
+    print(total)
+
+    // 3. Option `?` propagation (both Some and None paths + defer execution)
+    var nums[4]: i32 = [10, 20, 30, 40]
+    match sum_two_targets(nums, 20, 40) {
+        .Some(v) { print(v) }
+        .None { print(-1) }
+    }
+    match sum_two_targets(nums, 20, 99) {
+        .Some(v) { print(v) }
+        .None { print(-1) }
+    }
+
+    // 4. Result `?` propagation (Ok and Err paths with `str` payload + struct Ok payload + defer)
+    match parse_point("12", "34") {
+        .Ok(pt) { print(pt.x * 100 + pt.y) }
+        .Err(msg) { print(msg) }
+    }
+    match parse_point("12", "-5") {
+        .Ok(pt) { print(pt.x * 100 + pt.y) }
+        .Err(msg) { print(msg) }
+    }
+    match parse_point("12x", "34") {
+        .Ok(pt) { print(pt.x * 100 + pt.y) }
+        .Err(msg) { print(msg) }
+    }
+}
+"@
+$phase12_expected = "49`n42`n8`n0`n39`ndefer-opt`n4`ndefer-opt`n-1`ndefer-parse-point`n1234`ndefer-parse-point`nnegative number`ndefer-parse-point`ninvalid digit"
+
+Test-RunOk "phase12_tagged_unions_and_try" $phase12_code $phase12_expected
+Test-RunLlvm "phase12_tagged_unions_and_try_llvm" $phase12_code $phase12_expected
 
 Write-Host "`nAll tests passed."

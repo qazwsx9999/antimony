@@ -53,10 +53,10 @@ static void emit_mangled_ident(Buf *b, const char *prefix, const char *name) {
 
 static int get_slice_type_id(OptGen *g, Type *t) {
     for (int i = 0; i < g->slice_types.len; i++) {
-        if (g->slice_types.items[i]->elem == t->elem) return i;
+        if (g->slice_types.items[i] == t->elem) return i;
     }
     int id = g->slice_types.len;
-    vec_push(g->slice_types, t);
+    vec_push(g->slice_types, t->elem);
     return id;
 }
 
@@ -65,11 +65,17 @@ static void collect_slice_types_type(OptGen *g, Type *t) {
     if (t->kind == TY_SLICE) {
         collect_slice_types_type(g, t->elem);
         get_slice_type_id(g, t);
-    } else if (t->kind == TY_ARRAY || t->kind == TY_PTR) {
+    } else if (t->kind == TY_ARRAY) {
         collect_slice_types_type(g, t->elem);
-    } else if (t->kind == TY_STRUCT) {
+        Type slice_t = { .kind = TY_SLICE, .elem = t->elem };
+        get_slice_type_id(g, &slice_t);
+    } else if (t->kind == TY_PTR) {
+        collect_slice_types_type(g, t->elem);
+    } else if (t->kind == TY_STRUCT || (t->kind == TY_ENUM && t->is_tagged)) {
         for (int i = 0; i < t->fields.len; i++) {
-            collect_slice_types_type(g, t->fields.items[i].type);
+            if ((t->kind == TY_STRUCT || t->fields.items[i].has_payload) && t->fields.items[i].type) {
+                collect_slice_types_type(g, t->fields.items[i].type);
+            }
         }
     }
 }
@@ -77,8 +83,10 @@ static void collect_slice_types_type(OptGen *g, Type *t) {
 static void collect_slice_types_node(OptGen *g, Node *n) {
     if (!n) return;
     collect_slice_types_type(g, n->type);
-    if (n->sym) collect_slice_types_type(g, n->sym->type);
-    if (n->sym2) collect_slice_types_type(g, n->sym2->type);
+    if (n->kind == N_VAR || n->kind == N_PARAM || n->kind == N_LOOP_RANGE || n->kind == N_LOOP_ITER) {
+        if (n->sym) collect_slice_types_type(g, n->sym->type);
+        if (n->sym2) collect_slice_types_type(g, n->sym2->type);
+    }
     collect_slice_types_node(g, n->lhs);
     collect_slice_types_node(g, n->rhs);
     collect_slice_types_node(g, n->cond);
@@ -100,7 +108,14 @@ static void emit_c_type(OptGen *g, Buf *b, Type *t) {
     if (t == &ty_str)  { bprintf(b, "sb_str"); return; }
     if (t == &ty_f32)  { bprintf(b, "float"); return; }
     if (t == &ty_f64)  { bprintf(b, "double"); return; }
-    if (t->kind == TY_ENUM) { bprintf(b, "int32_t"); return; }
+    if (t->kind == TY_ENUM) {
+        if (t->is_tagged) {
+            emit_mangled_ident(b, "struct sb_en_", t->name);
+        } else {
+            bprintf(b, "int32_t");
+        }
+        return;
+    }
     if (t->kind == TY_INT) {
         const char *u = t->is_signed ? "" : "u";
         int bits = t->size * 8;
@@ -193,6 +208,7 @@ static void emit_loc_str(Buf *b, Pos pos, const char *reason) {
 static void opt_gen_expr(OptGen *g, Buf *b, Node *n);
 static void opt_gen_stmt(OptGen *g, Buf *b, Node *n);
 static void opt_gen_block(OptGen *g, Buf *b, Node *blk);
+static void opt_emit_defers_from(OptGen *g, Buf *b, int limit);
 
 static void opt_gen_collection_slice(OptGen *g, Buf *b, Node *base) {
     if (base->type->kind == TY_ARRAY && !base->implicit_slice) {
@@ -451,6 +467,56 @@ static void opt_gen_expr(OptGen *g, Buf *b, Node *n) {
             }
         }
         bprintf(b, "})");
+        return;
+    }
+
+    case N_ENUM_LIT: {
+        bprintf(b, "((");
+        emit_c_type(g, b, n->type);
+        bprintf(b, "){ .tag = %d", (int32_t)n->cval);
+        if (n->lhs) {
+            StructField *vf = (StructField *)n->sym2;
+            bprintf(b, ", .u = { .v_%s = ", vf->name);
+            if (vf->type->kind == TY_ARRAY && n->lhs->kind == N_ARRAY_LIT) {
+                bprintf(b, "{");
+                if (n->lhs->list.len == 0) bprintf(b, "0");
+                for (int j = 0; j < n->lhs->list.len; j++) {
+                    if (j > 0) bprintf(b, ", ");
+                    opt_gen_expr(g, b, n->lhs->list.items[j]);
+                }
+                bprintf(b, "}");
+            } else if (vf->type->kind == TY_SLICE && n->lhs->type->kind == TY_ARRAY) {
+                opt_gen_collection_slice(g, b, n->lhs);
+            } else {
+                opt_gen_expr(g, b, n->lhs);
+            }
+            bprintf(b, " }");
+        }
+        bprintf(b, " })");
+        return;
+    }
+
+    case N_TRY: {
+        int tid = ++g->tmp_id;
+        Type *et = n->lhs->type;
+        StructField *ok_v  = (StructField *)n->sym;
+        StructField *err_v = (StructField *)n->sym2;
+        bprintf(b, "({ ");
+        emit_c_type(g, b, et);
+        bprintf(b, " _try%d = ", tid);
+        opt_gen_expr(g, b, n->lhs);
+        bprintf(b, "; if (_try%d.tag == %d) {\n", tid, (int32_t)n->cval);
+        bprintf(b, "        ");
+        emit_c_type(g, b, g->cur_ret_type);
+        bprintf(b, " _eret%d = { .tag = %d", tid, n->field_offset);
+        if (err_v && err_v->has_payload) {
+            bprintf(b, ", .u = { .v_%s = _try%d.u.v_%s }", err_v->name, tid, err_v->name);
+        }
+        bprintf(b, " };\n");
+        if (g->defers.len > 0) {
+            opt_emit_defers_from(g, b, 0);
+        }
+        bprintf(b, "        return _eret%d;\n    }\n    _try%d.u.v_%s; })", tid, tid, ok_v->name);
         return;
     }
 
@@ -1020,6 +1086,7 @@ static void opt_gen_stmt(OptGen *g, Buf *b, Node *n) {
 
     case N_MATCH: {
         int tid = ++g->tmp_id;
+        bool is_tagged_enum = (n->cond->type->kind == TY_ENUM && n->cond->type->is_tagged);
         bprintf(b, "    {\n        ");
         emit_c_type(g, b, n->cond->type);
         bprintf(b, " _m%d = ", tid);
@@ -1035,6 +1102,8 @@ static void opt_gen_stmt(OptGen *g, Buf *b, Node *n) {
                     bprintf(b, "sb_str_eq(_m%d, ", tid);
                     opt_gen_expr(g, b, pat);
                     bprintf(b, ")");
+                } else if (is_tagged_enum) {
+                    bprintf(b, "(_m%d.tag == %d)", tid, (int32_t)pat->cval);
                 } else {
                     bprintf(b, "(_m%d == ", tid);
                     opt_gen_expr(g, b, pat);
@@ -1042,6 +1111,19 @@ static void opt_gen_stmt(OptGen *g, Buf *b, Node *n) {
                 }
             }
             bprintf(b, ") {\n");
+            if (is_tagged_enum && arm->sym) {
+                Symbol *bs = arm->sym;
+                StructField *vf = (StructField *)arm->list.items[0]->sym2;
+                bprintf(b, "            ");
+                emit_c_var_decl(g, b, bs->type, "", bs->name, bs->slot);
+                if (bs->type->kind == TY_ARRAY) {
+                    bprintf(b, ";\n            memcpy(&(");
+                    emit_var_ref(b, bs);
+                    bprintf(b, "), &(_m%d.u.v_%s), %d);\n", tid, vf->name, bs->type->size);
+                } else {
+                    bprintf(b, " = _m%d.u.v_%s;\n", tid, vf->name);
+                }
+            }
             opt_gen_block(g, b, arm->body);
             bprintf(b, "        }\n");
         }
@@ -1368,42 +1450,59 @@ static void generate_opt_c_unit(Program *prog, NodeVec all_decls, bool release, 
 
     emit_opt_runtime_preamble(&g.hdr);
 
-    // 2. Forward declare all structs.
+    // 2. Forward declare all structs and tagged union enums.
     for (int i = 0; i < all_decls.len; i++) {
         Node *d = all_decls.items[i];
         if (d->kind == N_STRUCT) {
             emit_mangled_ident(&g.hdr, "struct sb_st_", d->name);
+            bprintf(&g.hdr, ";\n");
+        } else if (d->kind == N_ENUM && d->type && d->type->is_tagged) {
+            emit_mangled_ident(&g.hdr, "struct sb_en_", d->name);
             bprintf(&g.hdr, ";\n");
         }
     }
 
     // 3. Emit slice typedefs that do not depend on by-value structs, then structs, then remaining slices.
     for (int i = 0; i < g.slice_types.len; i++) {
-        Type *st = g.slice_types.items[i];
+        Type *elem_t = g.slice_types.items[i];
         bprintf(&g.hdr, "typedef struct { ");
-        emit_c_type(&g, &g.hdr, st->elem);
+        emit_c_type(&g, &g.hdr, elem_t);
         bprintf(&g.hdr, " *ptr; int64_t len; } sb_slice_%d;\n", i);
     }
     bprintf(&g.hdr, "\n");
 
-    // 4. Emit struct definitions in declaration/layout order.
+    // 4. Emit struct and tagged union enum definitions in declaration/layout order.
     for (int i = 0; i < all_decls.len; i++) {
         Node *d = all_decls.items[i];
-        if (d->kind != N_STRUCT) continue;
-        Type *st = d->type;
-        emit_mangled_ident(&g.hdr, "struct sb_st_", st->name);
-        bprintf(&g.hdr, " {\n");
-        if (st->fields.len == 0) {
-            bprintf(&g.hdr, "    uint8_t _dummy;\n");
-        } else {
-            for (int j = 0; j < st->fields.len; j++) {
-                StructField *sf = &st->fields.items[j];
-                bprintf(&g.hdr, "    ");
-                emit_c_var_decl(&g, &g.hdr, sf->type, "f_", sf->name, -1);
-                bprintf(&g.hdr, ";\n");
+        if (d->kind == N_STRUCT) {
+            Type *st = d->type;
+            emit_mangled_ident(&g.hdr, "struct sb_st_", st->name);
+            bprintf(&g.hdr, " {\n");
+            if (st->fields.len == 0) {
+                bprintf(&g.hdr, "    uint8_t _dummy;\n");
+            } else {
+                for (int j = 0; j < st->fields.len; j++) {
+                    StructField *sf = &st->fields.items[j];
+                    bprintf(&g.hdr, "    ");
+                    emit_c_var_decl(&g, &g.hdr, sf->type, "f_", sf->name, -1);
+                    bprintf(&g.hdr, ";\n");
+                }
             }
+            bprintf(&g.hdr, "};\n\n");
+        } else if (d->kind == N_ENUM && d->type && d->type->is_tagged) {
+            Type *et = d->type;
+            emit_mangled_ident(&g.hdr, "struct sb_en_", et->name);
+            bprintf(&g.hdr, " {\n    int32_t tag;\n    union {\n");
+            for (int j = 0; j < et->fields.len; j++) {
+                StructField *vf = &et->fields.items[j];
+                if (vf->has_payload) {
+                    bprintf(&g.hdr, "        ");
+                    emit_c_var_decl(&g, &g.hdr, vf->type, "v_", vf->name, -1);
+                    bprintf(&g.hdr, ";\n");
+                }
+            }
+            bprintf(&g.hdr, "    } u;\n};\n\n");
         }
-        bprintf(&g.hdr, "};\n\n");
     }
 
     // 5. Emit extern DLL function pointer declarations.

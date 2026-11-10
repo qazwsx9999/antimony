@@ -25,7 +25,7 @@ static bool triggers_term(TokKind k) {
     case T_IDENT: case T_INT: case T_FLOAT: case T_STR:
     case T_TRUE: case T_FALSE: case T_NULL:
     case T_RETURN: case T_BREAK: case T_CONTINUE:
-    case T_RPAREN: case T_RBRACKET: case T_RBRACE:
+    case T_RPAREN: case T_RBRACKET: case T_RBRACE: case T_QUESTION:
         return true;
     default:
         return false;
@@ -266,6 +266,7 @@ Token *lex(const char *src, int *count) {
         case ',': single = T_COMMA; break;
         case ':': single = T_COLON; break;
         case '.': single = T_DOT; break;
+        case '?': single = T_QUESTION; break;
         case ';': single = T_SEMI; break;
         case '+': single = T_PLUS; break;
         case '-': single = T_MINUS; break;
@@ -359,6 +360,7 @@ const char *tok_name(TokKind k) {
     case T_COLON: return "':'";
     case T_DOT: return "'.'";
     case T_DOTDOT: return "'..'";
+    case T_QUESTION: return "'?'";
     case T_PLUS: return "'+'";
     case T_MINUS: return "'-'";
     case T_STAR: return "'*'";

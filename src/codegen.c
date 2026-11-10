@@ -129,8 +129,8 @@ static void load_var(Symbol *s, int reg) {
         x_mov_rr(1, reg, s->hw_reg);
         return;
     }
-    if (s->type->kind == TY_ARRAY || s->type->kind == TY_STRUCT) {
-        // Evaluating a fixed-size array or struct produces its base pointer in `reg`.
+    if (s->type->kind == TY_ARRAY || is_aggregate_type(s->type)) {
+        // Evaluating a fixed-size array or aggregate (struct / tagged enum) produces its base pointer in `reg`.
         if (s->is_global) {
             x_lea_rip(reg, SEC_DATA, s->data_off);
         } else if (s->kind == SYM_PARAM) {
@@ -618,6 +618,7 @@ static void gen_index_addr(CG *cg, Node *n) {
 }
 
 static void gen_lvalue_addr(CG *cg, Node *n);
+static void emit_defers_from(CG *cg, int limit);
 static void gen_init_at_addr(CG *cg, int addr_slot, Node *rhs, Type *t);
 
 static void gen_lvalue_addr(CG *cg, Node *n) {
@@ -625,7 +626,7 @@ static void gen_lvalue_addr(CG *cg, Node *n) {
         Symbol *s = n->sym;
         if (s->is_global) {
             x_lea_rip(RAX, SEC_DATA, s->data_off);
-        } else if (s->kind == SYM_PARAM && (s->type->kind == TY_ARRAY || s->type->kind == TY_STRUCT)) {
+        } else if (s->kind == SYM_PARAM && (s->type->kind == TY_ARRAY || is_aggregate_type(s->type))) {
             x_load(RAX, RBP, slot_disp(s->slot));
         } else {
             x_lea(RAX, RBP, slot_disp(s->slot));
@@ -653,7 +654,8 @@ static void gen_lvalue_addr(CG *cg, Node *n) {
                 x_test_rr(1, RAX, RAX);
                 emit_trap_if(cg, CC_E, n->pos, "null pointer dereference");
             }
-        } else if (n->lhs->kind == N_STRUCT_LIT || n->lhs->kind == N_CALL) {
+        } else if (n->lhs->kind == N_STRUCT_LIT || n->lhs->kind == N_ENUM_LIT ||
+                   n->lhs->kind == N_CALL || n->lhs->kind == N_TRY) {
             gen_expr(cg, n->lhs); // RAX = temp struct address
         } else {
             gen_lvalue_addr(cg, n->lhs);
@@ -702,7 +704,26 @@ static void gen_init_at_addr(CG *cg, int addr_slot, Node *rhs, Type *t) {
         }
         return;
     }
-    if (t->kind == TY_ARRAY || t->kind == TY_STRUCT) {
+    if (rhs->kind == N_ENUM_LIT) {
+        x_load(RDI, RBP, slot_disp(addr_slot));
+        x_mov_ri(RAX, 0);
+        x_mov_ri(RCX, (uint64_t)t->size);
+        x_rep_stosb();
+        x_load(RCX, RBP, slot_disp(addr_slot));
+        x_mov_ri(RAX, (uint64_t)(int64_t)rhs->cval);
+        x_store_sized(RCX, 0, RAX, 4);
+        if (rhs->lhs) {
+            x_load(RAX, RBP, slot_disp(addr_slot));
+            if (t->payload_offset != 0) {
+                x_alu_ri(ALU_ADD, 1, RAX, t->payload_offset);
+            }
+            int p_slot = push_temp(cg);
+            gen_init_at_addr(cg, p_slot, rhs->lhs, rhs->lhs->type);
+            cg->temp_depth--;
+        }
+        return;
+    }
+    if (t->kind == TY_ARRAY || is_aggregate_type(t)) {
         gen_expr(cg, rhs); // RAX = src address
         x_mov_rr(1, RSI, RAX);
         x_load(RDI, RBP, slot_disp(addr_slot));
@@ -751,8 +772,8 @@ static void gen_expr(CG *cg, Node *n) {
     case N_DEREF: {
         Type *elem_t = n->type;
         gen_lvalue_addr(cg, n);
-        if (elem_t->kind == TY_ARRAY || elem_t->kind == TY_STRUCT) {
-            // Address of array/struct is already in RAX.
+        if (elem_t->kind == TY_ARRAY || is_aggregate_type(elem_t)) {
+            // Address of array/struct/tagged-enum is already in RAX.
             return;
         }
         if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
@@ -764,7 +785,8 @@ static void gen_expr(CG *cg, Node *n) {
         return;
     }
 
-    case N_STRUCT_LIT: {
+    case N_STRUCT_LIT:
+    case N_ENUM_LIT: {
         x_lea(RAX, RBP, slot_disp(n->slot_start));
         int s_addr = push_temp(cg);
         gen_init_at_addr(cg, s_addr, n, n->type);
@@ -775,7 +797,7 @@ static void gen_expr(CG *cg, Node *n) {
     case N_FIELD: {
         Type *ft = n->type;
         gen_lvalue_addr(cg, n);
-        if (ft->kind == TY_ARRAY || ft->kind == TY_STRUCT) {
+        if (ft->kind == TY_ARRAY || is_aggregate_type(ft)) {
             return;
         }
         if (ft == &ty_str || ft->kind == TY_SLICE) {
@@ -804,7 +826,7 @@ static void gen_expr(CG *cg, Node *n) {
     case N_INDEX: {
         Type *elem_t = n->type;
         gen_index_addr(cg, n);
-        if (elem_t->kind == TY_ARRAY || elem_t->kind == TY_STRUCT) {
+        if (elem_t->kind == TY_ARRAY || is_aggregate_type(elem_t)) {
             return;
         }
         if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
@@ -1265,10 +1287,58 @@ static void gen_expr(CG *cg, Node *n) {
                 x_movzx8(RAX, RAX);
             }
         } else {
-            if (n->type->kind == TY_STRUCT) {
+            if (is_aggregate_type(n->type)) {
                 x_lea(R10, RBP, slot_disp(n->slot_start));
             }
             x_call(n->sym->label);
+        }
+        return;
+    }
+
+    case N_TRY: {
+        // `expr?`: evaluate `n->lhs` (tagged union `Result`/`Option`) -> RAX = base address.
+        Type *et = n->lhs->type;
+        gen_expr(cg, n->lhs);
+        x_store(RBP, slot_disp(n->slot_start), RAX);
+        x_load_sized(RCX, RAX, 0, 4, true); // RCX = 32-bit variant tag
+        int l_ok = x_label();
+        x_alu_ri(ALU_CMP, 1, RCX, (int32_t)n->cval); // compare with Err/None tag
+        x_jcc(CC_NE, l_ok);
+
+        // Failure path: construct `Err(e)` / `None` in caller's return buffer and return early.
+        x_load(R8, RBP, slot_disp(cg->cur_ret_ptr_slot)); // R8 = caller return buffer
+        x_mov_ri(RCX, (uint64_t)(uint32_t)n->field_offset); // caller's Err/None tag
+        x_store_sized(R8, 0, RCX, 4);
+        StructField *err_v = (StructField *)n->sym2;
+        if (err_v && err_v->has_payload) {
+            x_load(RSI, RBP, slot_disp(n->slot_start));
+            x_alu_ri(ALU_ADD, 1, RSI, et->payload_offset);
+            x_mov_rr(1, RDI, R8);
+            x_alu_ri(ALU_ADD, 1, RDI, cg->cur_ret_type->payload_offset);
+            x_mov_ri(RCX, (uint64_t)err_v->type->size);
+            x_rep_movsb();
+        }
+        if (cg->defers.len > 0) {
+            emit_defers_from(cg, 0);
+        }
+        x_load(RAX, RBP, slot_disp(cg->cur_ret_ptr_slot));
+        x_jmp(cg->cur_epilogue);
+
+        // Success path (`Ok(v)` / `Some(v)`): unwrap payload of type `n->type`.
+        x_bind(l_ok);
+        x_load(RAX, RBP, slot_disp(n->slot_start));
+        x_alu_ri(ALU_ADD, 1, RAX, et->payload_offset);
+        if (is_aggregate_type(n->type)) {
+            x_mov_rr(1, RSI, RAX);
+            x_lea(RDI, RBP, slot_disp(n->slot_end));
+            x_mov_ri(RCX, (uint64_t)n->type->size);
+            x_rep_movsb();
+            x_lea(RAX, RBP, slot_disp(n->slot_end));
+        } else if (n->type == &ty_str || n->type->kind == TY_SLICE) {
+            x_load(RDX, RAX, 8);
+            x_load(RAX, RAX, 0);
+        } else {
+            x_load_sized(RAX, RAX, 0, n->type->size, n->type->is_signed);
         }
         return;
     }
@@ -1288,7 +1358,7 @@ static void gen_block(CG *cg, Node *b);
 static void gen_assign(CG *cg, Node *n) {
     if (n->lhs && (n->lhs->kind == N_INDEX || n->lhs->kind == N_DEREF || n->lhs->kind == N_FIELD)) {
         Type *elem_t = n->lhs->type;
-        if (n->op == T_ASSIGN && elem_t->kind != TY_ARRAY && elem_t->kind != TY_STRUCT &&
+        if (n->op == T_ASSIGN && elem_t->kind != TY_ARRAY && !is_aggregate_type(elem_t) &&
             elem_t->kind != TY_SLICE && elem_t != &ty_str) {
             if (n->rhs->is_const && elem_t->size == 1 && (elem_t->kind == TY_INT || elem_t == &ty_bool)) {
                 gen_lvalue_addr(cg, n->lhs);
@@ -1330,7 +1400,7 @@ static void gen_assign(CG *cg, Node *n) {
 
     Symbol *s = n->sym;
     if (n->op == T_ASSIGN) {
-        if (s->type->kind == TY_ARRAY || s->type->kind == TY_STRUCT) {
+        if (s->type->kind == TY_ARRAY || is_aggregate_type(s->type)) {
             if (s->is_global) x_lea_rip(RAX, SEC_DATA, s->data_off);
             else              x_lea(RAX, RBP, slot_disp(s->slot));
             int s_addr = push_temp(cg);
@@ -1666,7 +1736,7 @@ static void gen_iter_loop(CG *cg, Node *n) {
     x_load(RCX, RBP, slot_disp(s_ptr));
     x_alu_rr(ALU_ADD, 1, RAX, RCX);
     Symbol *val_sym = n->sym2 ? n->sym2 : n->sym;
-    if (elem_t->kind == TY_STRUCT) {
+    if (is_aggregate_type(elem_t)) {
         x_mov_rr(1, RSI, RAX);
         x_lea(RDI, RBP, slot_disp(val_sym->slot));
         x_mov_ri(RCX, (uint64_t)elem_t->size);
@@ -1730,7 +1800,7 @@ static void gen_stmt(CG *cg, Node *n) {
 
     case N_RETURN:
         if (n->lhs) {
-            if (cg->cur_ret_type->kind == TY_STRUCT) {
+            if (is_aggregate_type(cg->cur_ret_type)) {
                 x_load(RAX, RBP, slot_disp(cg->cur_ret_ptr_slot));
                 int addr_slot = push_temp(cg);
                 gen_init_at_addr(cg, addr_slot, n->lhs, cg->cur_ret_type);
@@ -1794,6 +1864,7 @@ static void gen_stmt(CG *cg, Node *n) {
     case N_MATCH: {
         int l_end = x_label();
         int *l_arms = n->list.len ? xmalloc((size_t)n->list.len * sizeof(int)) : NULL;
+        bool is_tagged_enum = (n->cond->type->kind == TY_ENUM && n->cond->type->is_tagged);
         if (n->cond->type == &ty_str) {
             gen_expr(cg, n->cond); // RAX = ptr, RDX = len
             x_store(RBP, slot_disp(n->slot_start), RAX);
@@ -1811,6 +1882,19 @@ static void gen_stmt(CG *cg, Node *n) {
                     x_call(cg->rt_str_eq);
                     x_test_rr(0, RAX, RAX);
                     x_jcc(CC_NE, l_arms[i]);
+                }
+            }
+        } else if (is_tagged_enum) {
+            gen_expr(cg, n->cond); // RAX = base address of tagged union
+            x_store(RBP, slot_disp(n->slot_start), RAX);
+            x_load_sized(RAX, RAX, 0, 4, true); // RAX = 32-bit variant tag
+            for (int i = 0; i < n->list.len; i++) {
+                l_arms[i] = x_label();
+                Node *arm = n->list.items[i];
+                for (int j = 0; j < arm->list.len; j++) {
+                    Node *pat = arm->list.items[j];
+                    x_alu_ri(ALU_CMP, 1, RAX, (int32_t)pat->cval);
+                    x_jcc(CC_E, l_arms[i]);
                 }
             }
         } else {
@@ -1840,7 +1924,27 @@ static void gen_stmt(CG *cg, Node *n) {
         x_jmp(l_else);
         for (int i = 0; i < n->list.len; i++) {
             x_bind(l_arms[i]);
-            gen_block(cg, n->list.items[i]->body);
+            Node *arm = n->list.items[i];
+            if (is_tagged_enum && arm->sym) {
+                Symbol *bs = arm->sym;
+                Type *bt = bs->type;
+                x_load(RAX, RBP, slot_disp(n->slot_start));
+                x_alu_ri(ALU_ADD, 1, RAX, n->cond->type->payload_offset);
+                if (bt->kind == TY_ARRAY || is_aggregate_type(bt)) {
+                    x_mov_rr(1, RSI, RAX);
+                    x_lea(RDI, RBP, slot_disp(bs->slot));
+                    x_mov_ri(RCX, (uint64_t)bt->size);
+                    x_rep_movsb();
+                } else if (bt == &ty_str || bt->kind == TY_SLICE) {
+                    x_load(RDX, RAX, 8);
+                    x_load(RAX, RAX, 0);
+                    store_var(bs, RAX);
+                } else {
+                    x_load_sized(RAX, RAX, 0, bt->size, bt->is_signed);
+                    store_var(bs, RAX);
+                }
+            }
+            gen_block(cg, arm->body);
             x_jmp(l_end);
         }
         if (n->els) {
@@ -2047,8 +2151,8 @@ static int alloc_fn_regs(Node *fn, int out_regs[5]) {
             Symbol *s = locals.items[i];
             if (s->hw_reg >= 0 || s->addr_taken || s->use_score < 2) continue;
             Type *t = s->type;
-            if (!t || (t->kind != TY_INT && t->kind != TY_ENUM && t->kind != TY_BOOL &&
-                       t->kind != TY_FLOAT && t->kind != TY_PTR &&
+            if (!t || (t->kind != TY_INT && !(t->kind == TY_ENUM && !t->is_tagged) &&
+                       t->kind != TY_BOOL && t->kind != TY_FLOAT && t->kind != TY_PTR &&
                        t->kind != TY_SLICE && t != &ty_str)) continue;
             if (!best || s->use_score > best->use_score) {
                 best = s;
@@ -2085,8 +2189,8 @@ static void gen_fn(CG *cg, Node *fn) {
         x_store(RBP, slot_disp(fn->num_slots + 1 + k), saved_regs[k]);
     }
 
-    // If this function returns a struct by value, save the caller's return buffer pointer (in R10).
-    if (fn->type->kind == TY_STRUCT) {
+    // If this function returns a struct or tagged union by value, save the caller's return buffer pointer (in R10).
+    if (is_aggregate_type(fn->type)) {
         x_store(RBP, slot_disp(fn->slot_start), R10);
     }
 

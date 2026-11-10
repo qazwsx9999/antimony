@@ -78,7 +78,7 @@ typedef enum {
     T_BREAK, T_CONTINUE, T_TRUE, T_FALSE, T_NULL,
     // punctuation
     T_LPAREN, T_RPAREN, T_LBRACE, T_RBRACE, T_LBRACKET, T_RBRACKET,
-    T_COMMA, T_COLON, T_DOT, T_DOTDOT,
+    T_COMMA, T_COLON, T_DOT, T_DOTDOT, T_QUESTION,
     // operators
     T_PLUS, T_MINUS, T_STAR, T_SLASH, T_PERCENT, T_PLUSW, T_MINUSW, T_STARW,
     T_AMP, T_PIPE, T_CARET, T_TILDE, T_BANG, T_SHL, T_SHR,
@@ -120,6 +120,7 @@ typedef struct {
     const char *name;
     struct Type *type;
     int offset;
+    bool has_payload;
     Pos pos;
 } StructField;
 
@@ -129,12 +130,18 @@ typedef struct Type {
     int size;          // bytes
     int align;         // alignment in bytes (1, 2, 4, 8)
     bool is_signed;
+    bool is_tagged;    // TY_ENUM: true if any variant carries a payload
+    int payload_offset;// TY_ENUM: byte offset of union payload when is_tagged
     struct Type *elem; // TY_ARRAY / TY_SLICE / TY_PTR element type
     int array_len;     // TY_ARRAY element count
-    Node *decl;        // TY_STRUCT: AST declaration node
-    VEC(StructField) fields; // TY_STRUCT fields
-    int state;         // TY_STRUCT layout state: 0=unresolved, 1=in-progress, 2=done
+    Node *decl;        // TY_STRUCT / TY_ENUM: AST declaration node
+    VEC(StructField) fields; // TY_STRUCT fields or TY_ENUM variants
+    int state;         // TY_STRUCT / TY_ENUM layout state: 0=unresolved, 1=in-progress, 2=done
 } Type;
+
+static inline bool is_aggregate_type(Type *t) {
+    return t && (t->kind == TY_STRUCT || (t->kind == TY_ENUM && t->is_tagged));
+}
 
 extern Type ty_void, ty_bool, ty_str, ty_untyped_int, ty_untyped_float, ty_null;
 extern Type ty_i8, ty_i16, ty_i32, ty_i64, ty_u8, ty_u16, ty_u32, ty_u64;
@@ -175,7 +182,7 @@ typedef struct Symbol {
 typedef enum {
     // expressions
     N_INT, N_FLOAT, N_STR, N_BOOL, N_NULL, N_IDENT, N_CALL, N_CONV, N_UNARY, N_BINARY,
-    N_ADDR, N_DEREF, N_ARRAY_LIT, N_STRUCT_LIT, N_FIELD_INIT, N_INDEX, N_SLICE, N_FIELD,
+    N_ADDR, N_DEREF, N_ARRAY_LIT, N_STRUCT_LIT, N_ENUM_LIT, N_TRY, N_FIELD_INIT, N_INDEX, N_SLICE, N_FIELD,
     // statements
     N_VAR, N_CONST, N_ASSIGN, N_EXPR_STMT, N_IF, N_MATCH, N_MATCH_ARM, N_DEFER, N_BLOCK, N_RETURN,
     N_BREAK, N_CONTINUE, N_LOOP_INF, N_LOOP_COND, N_LOOP_RANGE, N_LOOP_ITER, N_LOOP_C,

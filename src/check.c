@@ -2,25 +2,25 @@
 // analysis, return-path checking, and stack-slot assignment.
 #include "sb.h"
 
-Type ty_void          = {TY_VOID,          "void",  0, 1, false, NULL, 0, NULL, {0}, 0};
-Type ty_bool          = {TY_BOOL,          "bool",  1, 1, false, NULL, 0, NULL, {0}, 0};
-Type ty_str           = {TY_STR,           "str",  16, 8, false, NULL, 0, NULL, {0}, 0};
-Type ty_untyped_int   = {TY_UNTYPED_INT,   "untyped int",   0, 1, true, NULL, 0, NULL, {0}, 0};
-Type ty_untyped_float = {TY_UNTYPED_FLOAT, "untyped float", 0, 1, true, NULL, 0, NULL, {0}, 0};
-Type ty_null          = {TY_NULL,          "null",  8, 8, false, NULL, 0, NULL, {0}, 0};
+Type ty_void          = { .kind = TY_VOID,          .name = "void",          .size = 0,  .align = 1, .is_signed = false };
+Type ty_bool          = { .kind = TY_BOOL,          .name = "bool",          .size = 1,  .align = 1, .is_signed = false };
+Type ty_str           = { .kind = TY_STR,           .name = "str",           .size = 16, .align = 8, .is_signed = false };
+Type ty_untyped_int   = { .kind = TY_UNTYPED_INT,   .name = "untyped int",   .size = 0,  .align = 1, .is_signed = true  };
+Type ty_untyped_float = { .kind = TY_UNTYPED_FLOAT, .name = "untyped float", .size = 0,  .align = 1, .is_signed = true  };
+Type ty_null          = { .kind = TY_NULL,          .name = "null",          .size = 8,  .align = 8, .is_signed = false };
 
-Type ty_i8    = {TY_INT,   "i8",    1, 1, true,  NULL, 0, NULL, {0}, 0};
-Type ty_i16   = {TY_INT,   "i16",   2, 2, true,  NULL, 0, NULL, {0}, 0};
-Type ty_i32   = {TY_INT,   "i32",   4, 4, true,  NULL, 0, NULL, {0}, 0};
-Type ty_i64   = {TY_INT,   "i64",   8, 8, true,  NULL, 0, NULL, {0}, 0};
-Type ty_isize = {TY_INT,   "isize", 8, 8, true,  NULL, 0, NULL, {0}, 0};
-Type ty_u8    = {TY_INT,   "u8",    1, 1, false, NULL, 0, NULL, {0}, 0};
-Type ty_u16   = {TY_INT,   "u16",   2, 2, false, NULL, 0, NULL, {0}, 0};
-Type ty_u32   = {TY_INT,   "u32",   4, 4, false, NULL, 0, NULL, {0}, 0};
-Type ty_u64   = {TY_INT,   "u64",   8, 8, false, NULL, 0, NULL, {0}, 0};
-Type ty_usize = {TY_INT,   "usize", 8, 8, false, NULL, 0, NULL, {0}, 0};
-Type ty_f32   = {TY_FLOAT, "f32",   4, 4, true,  NULL, 0, NULL, {0}, 0};
-Type ty_f64   = {TY_FLOAT, "f64",   8, 8, true,  NULL, 0, NULL, {0}, 0};
+Type ty_i8    = { .kind = TY_INT,   .name = "i8",    .size = 1, .align = 1, .is_signed = true  };
+Type ty_i16   = { .kind = TY_INT,   .name = "i16",   .size = 2, .align = 2, .is_signed = true  };
+Type ty_i32   = { .kind = TY_INT,   .name = "i32",   .size = 4, .align = 4, .is_signed = true  };
+Type ty_i64   = { .kind = TY_INT,   .name = "i64",   .size = 8, .align = 8, .is_signed = true  };
+Type ty_isize = { .kind = TY_INT,   .name = "isize", .size = 8, .align = 8, .is_signed = true  };
+Type ty_u8    = { .kind = TY_INT,   .name = "u8",    .size = 1, .align = 1, .is_signed = false };
+Type ty_u16   = { .kind = TY_INT,   .name = "u16",   .size = 2, .align = 2, .is_signed = false };
+Type ty_u32   = { .kind = TY_INT,   .name = "u32",   .size = 4, .align = 4, .is_signed = false };
+Type ty_u64   = { .kind = TY_INT,   .name = "u64",   .size = 8, .align = 8, .is_signed = false };
+Type ty_usize = { .kind = TY_INT,   .name = "usize", .size = 8, .align = 8, .is_signed = false };
+Type ty_f32   = { .kind = TY_FLOAT, .name = "f32",   .size = 4, .align = 4, .is_signed = true  };
+Type ty_f64   = { .kind = TY_FLOAT, .name = "f64",   .size = 8, .align = 8, .is_signed = true  };
 
 bool is_int(Type *t) {
     return t && (t->kind == TY_INT || t->kind == TY_UNTYPED_INT);
@@ -259,7 +259,7 @@ static Type *resolve_decl_type(Checker *c, Node *d) {
     Type *base = resolve_type(c, d->type_name, d->type_pos);
     if (d->ptr_depth == 0 && base->kind == TY_STRUCT && base->state != 2) {
         layout_struct(c, base);
-    } else if (base->kind == TY_ENUM && base->state != 2) {
+    } else if (d->ptr_depth == 0 && base->kind == TY_ENUM && base->state != 2) {
         layout_enum(c, base);
     }
     for (int i = 0; i < d->ptr_depth; i++) {
@@ -313,6 +313,10 @@ static void layout_enum(Checker *c, Type *et) {
         fatal(d->pos, "enum '%s' must have at least one variant", et->name);
     }
     i128 next_val = 0;
+    bool any_payload = false;
+    int max_payload_size = 0;
+    int max_payload_align = 4;
+
     for (int i = 0; i < d->list.len; i++) {
         Node *vd = d->list.items[i];
         for (int j = 0; j < et->fields.len; j++) {
@@ -340,13 +344,37 @@ static void layout_enum(Checker *c, Type *et) {
                       (int)val, et->name, vd->name, et->name, et->fields.items[j].name);
             }
         }
-        StructField sf = {vd->name, et, (int)val, vd->pos};
+        Type *pt = et;
+        bool has_payload = false;
+        if (vd->type_name) {
+            pt = resolve_decl_type(c, vd);
+            if (pt == &ty_void) {
+                fatal(vd->type_pos, "enum variant payload cannot have type 'void'");
+            }
+            has_payload = true;
+            any_payload = true;
+            int pa = pt->align ? pt->align : 8;
+            if (pa > max_payload_align) max_payload_align = pa;
+            if (pt->size > max_payload_size) max_payload_size = pt->size;
+        }
+        StructField sf = {vd->name, pt, (int)val, has_payload, vd->pos};
         vec_push(et->fields, sf);
         next_val = val + 1;
     }
-    et->size = 4;
-    et->align = 4;
-    et->is_signed = true;
+    if (any_payload) {
+        et->is_tagged = true;
+        et->payload_offset = (4 % max_payload_align == 0) ? 4 : max_payload_align;
+        int sz = et->payload_offset + max_payload_size;
+        if (sz % max_payload_align != 0) sz += max_payload_align - (sz % max_payload_align);
+        et->size = sz;
+        et->align = max_payload_align;
+        et->is_signed = false;
+    } else {
+        et->is_tagged = false;
+        et->size = 4;
+        et->align = 4;
+        et->is_signed = true;
+    }
     et->state = 2;
 }
 
@@ -375,7 +403,7 @@ static void layout_struct(Checker *c, Type *st) {
         if (a > max_align) max_align = a;
         if (offset % a != 0) offset += a - (offset % a);
 
-        StructField sf = {fd->name, ft, offset, fd->pos};
+        StructField sf = {fd->name, ft, offset, false, fd->pos};
         vec_push(st->fields, sf);
         offset += ft->size;
     }
@@ -403,7 +431,7 @@ static void check_lvalue_mutable(Node *lval, Pos pos) {
         if (base->lhs->type && (base->lhs->type->kind == TY_PTR || base->lhs->type->kind == TY_SLICE)) return;
         base = base->lhs;
     }
-    if (base && (base->kind == N_STRUCT_LIT || base->kind == N_CALL)) {
+    if (base && (base->kind == N_STRUCT_LIT || base->kind == N_ENUM_LIT || base->kind == N_CALL)) {
         fatal(pos, "cannot mutate or take address of temporary '%s' value", base->type->name);
     }
     if (base && base->kind == N_IDENT && base->sym) {
@@ -680,6 +708,34 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     }
 
     case N_FIELD: {
+        // Inferred enum variant access `.Variant`
+        if (n->op == T_DOT && !n->lhs) {
+            if (!expected || expected->kind != TY_ENUM) {
+                fatal(n->pos, "inferred enum variant '.%s' requires a known enum type context", n->name);
+            }
+            Type *et = expected;
+            if (et->state != 2) layout_enum(c, et);
+            StructField *sf = find_field(et, n->name);
+            if (!sf) {
+                fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
+            }
+            if (sf->has_payload) {
+                fatal(n->pos, "enum variant '%s.%s' requires a payload of type '%s'",
+                      et->name, n->name, sf->type->name);
+            }
+            if (et->is_tagged) {
+                n->kind = N_ENUM_LIT;
+                n->type = et;
+                n->cval = sf->offset;
+                n->lhs  = NULL;
+                if (c->cur_fn) n->slot_start = alloc_slots_bytes(c, et->size);
+            } else {
+                n->type = et;
+                n->is_const = true;
+                n->cval = sf->offset;
+            }
+            return;
+        }
         // Check for enum variant access `EnumName.Variant` before checking `n->lhs` as a value.
         if (n->lhs->kind == N_IDENT) {
             Symbol *s = lookup(c, n->lhs->name);
@@ -690,9 +746,21 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 if (!sf) {
                     fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
                 }
-                n->type = et;
-                n->is_const = true;
-                n->cval = sf->offset;
+                if (sf->has_payload) {
+                    fatal(n->pos, "enum variant '%s.%s' requires a payload of type '%s'",
+                          et->name, n->name, sf->type->name);
+                }
+                if (et->is_tagged) {
+                    n->kind = N_ENUM_LIT;
+                    n->type = et;
+                    n->cval = sf->offset;
+                    n->lhs  = NULL;
+                    if (c->cur_fn) n->slot_start = alloc_slots_bytes(c, et->size);
+                } else {
+                    n->type = et;
+                    n->is_const = true;
+                    n->cval = sf->offset;
+                }
                 if (expected) coerce(n, expected);
                 return;
             }
@@ -1068,6 +1136,10 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         Type *ot = n->lhs->type;
         if (is_cmp) {
             if (op == T_EQ || op == T_NE) {
+                if (ot->kind == TY_ENUM && ot->is_tagged) {
+                    fatal(n->pos, "cannot compare tagged union enum '%s' with %s (use 'match')",
+                          ot->name, tok_name(op));
+                }
                 if (!is_int(ot) && ot != &ty_bool && ot->kind != TY_ENUM && ot != &ty_str) {
                     fatal(n->pos, "operator %s is not defined for '%s'", tok_name(op), ot->name);
                 }
@@ -1123,10 +1195,62 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     }
 
     case N_CALL: {
-        // Method call: `recv.method(arg1, arg2, ...)`
+        // Inferred payload enum variant constructor: `.Variant(arg)`
+        if (n->op == T_DOT && !n->lhs) {
+            if (!expected || expected->kind != TY_ENUM) {
+                fatal(n->pos, "inferred enum variant '.%s(...)' requires a known enum type context", n->name);
+            }
+            Type *et = expected;
+            if (et->state != 2) layout_enum(c, et);
+            StructField *sf = find_field(et, n->name);
+            if (!sf) {
+                fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
+            }
+            if (!sf->has_payload) {
+                fatal(n->pos, "enum variant '%s.%s' does not take a payload", et->name, n->name);
+            }
+            if (n->list.len != 1) {
+                fatal(n->pos, "enum variant '%s.%s' expects 1 payload argument, got %d",
+                      et->name, n->name, n->list.len);
+            }
+            check_expr(c, n->list.items[0], sf->type);
+            n->kind = N_ENUM_LIT;
+            n->type = et;
+            n->cval = sf->offset;
+            n->sym2 = (Symbol *)sf;
+            n->lhs  = n->list.items[0];
+            if (c->cur_fn) n->slot_start = alloc_slots_bytes(c, et->size);
+            return;
+        }
+
+        // Method call `recv.method(...)` OR explicit payload enum variant `EnumName.Variant(arg)`
         if (n->lhs) {
             if (n->lhs->kind == N_IDENT) {
                 Symbol *vs = lookup(c, n->lhs->name);
+                if (vs && vs->kind == SYM_TYPE && vs->type->kind == TY_ENUM) {
+                    Type *et = vs->type;
+                    if (et->state != 2) layout_enum(c, et);
+                    StructField *sf = find_field(et, n->name);
+                    if (!sf) {
+                        fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
+                    }
+                    if (!sf->has_payload) {
+                        fatal(n->pos, "enum variant '%s.%s' does not take a payload", et->name, n->name);
+                    }
+                    if (n->list.len != 1) {
+                        fatal(n->pos, "enum variant '%s.%s' expects 1 payload argument, got %d",
+                              et->name, n->name, n->list.len);
+                    }
+                    check_expr(c, n->list.items[0], sf->type);
+                    n->kind = N_ENUM_LIT;
+                    n->type = et;
+                    n->cval = sf->offset;
+                    n->sym2 = (Symbol *)sf;
+                    n->lhs  = n->list.items[0];
+                    if (c->cur_fn) n->slot_start = alloc_slots_bytes(c, et->size);
+                    if (expected) coerce(n, expected);
+                    return;
+                }
                 if (vs && vs->kind == SYM_VAR && !vs->is_global && vs->var_index >= 0 &&
                     vs->type && (vs->type->kind == TY_STRUCT || vs->type->kind == TY_ENUM)) {
                     char mname[256];
@@ -1203,7 +1327,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             n->name = ms->name;
             n->sym  = ms;
             n->type = ms->type;
-            if (n->type->kind == TY_STRUCT && c->cur_fn) {
+            if (is_aggregate_type(n->type) && c->cur_fn) {
                 n->slot_start = alloc_slots_bytes(c, n->type->size);
             }
             if (expected) {
@@ -1225,6 +1349,11 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             }
             Node *arg = n->list.items[0];
             check_expr(c, arg, NULL);
+            if ((s->type->kind == TY_ENUM && s->type->is_tagged) ||
+                (arg->type->kind == TY_ENUM && arg->type->is_tagged)) {
+                fatal(n->pos, "cannot convert '%s' to '%s' (tagged union enums cannot be cast as integers)",
+                      arg->type->name, s->type->name);
+            }
             if (s->type == &ty_str) {
                 if (arg->type == &ty_str) {
                     n->kind = N_CONV;
@@ -1409,7 +1538,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         }
         n->sym = s;
         n->type = s->type;
-        if (n->type->kind == TY_STRUCT && c->cur_fn) {
+        if (is_aggregate_type(n->type) && c->cur_fn) {
             n->slot_start = alloc_slots_bytes(c, n->type->size);
         }
         if (expected) {
@@ -1418,6 +1547,50 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             }
             coerce(n, expected);
         }
+        return;
+    }
+
+    case N_TRY: {
+        if (c->in_defer > 0) {
+            fatal(n->pos, "'?' operator is not allowed inside a 'defer' statement");
+        }
+        check_expr(c, n->lhs, NULL);
+        Type *et = n->lhs->type;
+        if (et->kind != TY_ENUM || !et->is_tagged) {
+            fatal(n->pos, "'?' operator requires a tagged union enum ('Ok'/'Err' or 'Some'/'None'), got '%s'", et->name);
+        }
+        StructField *ok_v  = find_field(et, intern("Ok", 2));
+        StructField *err_v = find_field(et, intern("Err", 3));
+        if (!ok_v || !err_v) {
+            ok_v  = find_field(et, intern("Some", 4));
+            err_v = find_field(et, intern("None", 4));
+        }
+        if (!ok_v || !err_v || !ok_v->has_payload) {
+            fatal(n->pos, "'?' operator requires an enum with 'Ok(T)'/'Err(E)' or 'Some(T)'/'None' variants (got '%s')",
+                  et->name);
+        }
+        if (!c->ret_type || c->ret_type->kind != TY_ENUM || !c->ret_type->is_tagged) {
+            fatal(n->pos, "cannot use '?' in function '%s' returning '%s' (enclosing function must return a compatible 'Result' or 'Option' enum)",
+                  c->cur_fn ? c->cur_fn->name : "", c->ret_type ? c->ret_type->name : "void");
+        }
+        StructField *ret_err_v = find_field(c->ret_type, err_v->name);
+        if (!ret_err_v || ret_err_v->has_payload != err_v->has_payload ||
+            (err_v->has_payload && ret_err_v->type != err_v->type)) {
+            fatal(n->pos, "cannot propagate '%s.%s' via '?' in function returning '%s'",
+                  et->name, err_v->name, c->ret_type->name);
+        }
+        n->type = ok_v->type;
+        n->cval = err_v->offset;             // failure discriminant tag on `et`
+        n->field_offset = ret_err_v->offset; // failure discriminant tag on `c->ret_type`
+        n->sym  = (Symbol *)ok_v;            // pointer to `StructField` of `ok_v`
+        n->sym2 = (Symbol *)err_v;           // pointer to `StructField` of `err_v` (has_payload / type)
+        if (c->cur_fn) {
+            n->slot_start = alloc_slot(c);   // holds evaluated scrutinee pointer
+            if (is_aggregate_type(n->type)) {
+                n->slot_end = alloc_slots_bytes(c, n->type->size); // unwrapped struct/enum copy buffer
+            }
+        }
+        if (expected) coerce(n, expected);
         return;
     }
 
@@ -1630,6 +1803,15 @@ static bool check_stmt(Checker *c, Node *n) {
         if (decl_t->kind == TY_ARRAY || decl_t->kind == TY_STRUCT) {
             s->slot = alloc_slots_bytes(c, decl_t->size);
             s->var_index = -1; // array/struct storage is allocated on entry
+        } else if (decl_t->kind == TY_ENUM && decl_t->is_tagged) {
+            s->slot = alloc_slots_bytes(c, decl_t->size);
+            if (n->rhs) {
+                s->var_index = -1;
+            } else {
+                if (c->next_var_index >= 63) fatal(n->pos, "too many uninitialized variables");
+                s->var_index = c->next_var_index++;
+                c->assigned &= ~(1ULL << s->var_index);
+            }
         } else if (decl_t->kind == TY_SLICE || decl_t == &ty_str) {
             s->slot = alloc_slots_bytes(c, 16); // {ptr, len}
             if (n->rhs) {
@@ -1807,6 +1989,8 @@ static bool check_stmt(Checker *c, Node *n) {
         if (st == &ty_str) {
             n->slot_start = alloc_slot(c); // scrutinee ptr
             n->slot_end   = alloc_slot(c); // scrutinee len
+        } else if (st->kind == TY_ENUM && st->is_tagged) {
+            n->slot_start = alloc_slot(c); // scrutinee base address
         }
 
         VEC(i128)   seen_vals = {0};
@@ -1818,8 +2002,59 @@ static bool check_stmt(Checker *c, Node *n) {
 
         for (int i = 0; i < n->list.len; i++) {
             Node *arm = n->list.items[i];
+            arm->name = NULL;
+            arm->sym  = NULL;
             for (int j = 0; j < arm->list.len; j++) {
                 Node *pat = arm->list.items[j];
+                if (st->kind == TY_ENUM && st->is_tagged) {
+                    // Tagged union pattern: `.Variant(bind)`, `Enum.Variant(bind)`, `.Variant`, or `Enum.Variant`
+                    bool is_dot_pat = (pat->op == T_DOT && !pat->lhs);
+                    bool is_explicit_pat = (!is_dot_pat && pat->lhs && pat->lhs->kind == N_IDENT);
+                    if (!is_dot_pat && !is_explicit_pat) {
+                        fatal(pat->pos, "expected enum variant pattern for '%s'", st->name);
+                    }
+                    if (is_explicit_pat) {
+                        Symbol *ts = lookup(c, pat->lhs->name);
+                        if (!ts || ts->kind != SYM_TYPE || ts->type != st) {
+                            fatal(pat->pos, "expected variant of enum '%s'", st->name);
+                        }
+                    }
+                    StructField *sf = find_field(st, pat->name);
+                    if (!sf) {
+                        fatal(pat->pos, "enum '%s' has no variant named '%s'", st->name, pat->name);
+                    }
+                    if (pat->kind == N_CALL) {
+                        if (!sf->has_payload) {
+                            fatal(pat->pos, "enum variant '%s.%s' has no payload to destructure",
+                                  st->name, pat->name);
+                        }
+                        if (pat->list.len != 1 || pat->list.items[0]->kind != N_IDENT) {
+                            fatal(pat->pos, "expected a single identifier binding in pattern '%s.%s(name)'",
+                                  st->name, pat->name);
+                        }
+                        if (arm->list.len > 1) {
+                            fatal(pat->pos, "cannot combine payload-binding pattern '%s.%s(%s)' with multiple patterns in one arm",
+                                  st->name, pat->name, pat->list.items[0]->name);
+                        }
+                        arm->name = pat->list.items[0]->name;
+                        arm->type = sf->type;
+                    } else if (pat->kind != N_FIELD) {
+                        fatal(pat->pos, "invalid match pattern for enum '%s'", st->name);
+                    }
+                    pat->type = st;
+                    pat->sym2 = (Symbol *)sf;
+                    pat->is_const = true;
+                    pat->cval = sf->offset;
+                    for (int k = 0; k < seen_vals.len; k++) {
+                        if (seen_vals.items[k] == pat->cval) {
+                            fatal(pat->pos, "duplicate match pattern (already matched at line %d)",
+                                  seen_pos.items[k].line);
+                        }
+                    }
+                    vec_push(seen_vals, pat->cval);
+                    vec_push(seen_pos, pat->pos);
+                    continue;
+                }
                 check_expr(c, pat, st);
                 if (st == &ty_str) {
                     if (pat->kind != N_STR) {
@@ -1850,7 +2085,23 @@ static bool check_stmt(Checker *c, Node *n) {
                 }
             }
             c->assigned = before;
-            bool arm_ret = check_block(c, arm->body, true);
+            push_scope(c, false);
+            if (arm->name && strcmp(arm->name, "_") != 0) {
+                Type *pt = arm->type;
+                Symbol *bs = define(c, SYM_VAR, arm->name, pt, arm->pos);
+                bs->readonly = true;
+                bs->var_index = -1;
+                if (pt->kind == TY_ARRAY || is_aggregate_type(pt)) {
+                    bs->slot = alloc_slots_bytes(c, pt->size);
+                } else if (pt->kind == TY_SLICE || pt == &ty_str) {
+                    bs->slot = alloc_slots_bytes(c, 16);
+                } else {
+                    bs->slot = alloc_slot(c);
+                }
+                arm->sym = bs;
+            }
+            bool arm_ret = check_block(c, arm->body, false);
+            pop_scope(c);
             after_all &= c->assigned;
             if (!arm_ret) all_ret = false;
         }
@@ -2000,14 +2251,14 @@ static bool check_stmt(Checker *c, Node *n) {
             idx_sym->slot = alloc_slot(c);
             Symbol *val_sym = define(c, SYM_VAR, n->name2, elem_t, n->pos);
             val_sym->readonly = true;
-            val_sym->slot = (elem_t->kind == TY_STRUCT) ? alloc_slots_bytes(c, elem_t->size) : alloc_slot(c);
+            val_sym->slot = is_aggregate_type(elem_t) ? alloc_slots_bytes(c, elem_t->size) : alloc_slot(c);
             n->sym  = idx_sym;
             n->sym2 = val_sym;
         } else {
             // `loop x in arr`
             Symbol *val_sym = define(c, SYM_VAR, n->name, elem_t, n->pos);
             val_sym->readonly = true;
-            val_sym->slot = (elem_t->kind == TY_STRUCT) ? alloc_slots_bytes(c, elem_t->size) : alloc_slot(c);
+            val_sym->slot = is_aggregate_type(elem_t) ? alloc_slots_bytes(c, elem_t->size) : alloc_slot(c);
             n->sym  = val_sym;
             n->sym2 = NULL;
         }
@@ -2352,7 +2603,7 @@ Program check(NodeVec decls) {
         c.assigned = 0;
 
         push_scope(&c, true);
-        if (fn->type->kind == TY_STRUCT) {
+        if (is_aggregate_type(fn->type)) {
             fn->slot_start = alloc_slot(&c); // hidden return buffer pointer passed in R10
         }
         for (int j = 0; j < fn->list.len; j++) {
