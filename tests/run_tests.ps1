@@ -1622,4 +1622,88 @@ $phase14_expected = "true`ntrue`ntrue`n42`n42`nadder`n123`n15`n50`n15`n120`nfals
 Test-RunOk "phase14_fnptr_and_sort" $phase14_code $phase14_expected
 Test-RunLlvm "phase14_fnptr_and_sort_llvm" $phase14_code $phase14_expected
 
+# 23. Phase 15: OS Threads, Mutex/RwLock, and Hardware Atomics (std/thread.sb)
+Test-CompileError "atomic_bad_ptr_type" @"
+fn main() {
+    var x: i32 = 10
+    print(atomic_add(&x, 1))
+}
+"@ "'atomic_add' requires a '*i64' pointer first argument"
+
+Test-RunTrap "atomic_null_ptr_trap" @"
+fn main() {
+    var p: *i64 = null
+    print(atomic_add(p, 1))
+}
+"@ "null pointer in atomic_add"
+
+$phase15_code = @"
+import "std/thread.sb"
+
+struct SharedCtx {
+    mtx: Mutex
+    rw: RwLock
+    atomic_sum: AtomicI64
+    mutex_sum: i64
+    iters: i64
+}
+
+fn worker_fn(raw: *u8): u32 {
+    var ctx = ptr_cast(*SharedCtx, raw)
+    loop i in 0..ctx.iters {
+        ctx.atomic_sum.fetch_add(1)
+        ctx.mtx.lock()
+        ctx.mutex_sum += 1
+        ctx.mtx.unlock()
+    }
+    return 7
+}
+
+fn main() {
+    // 1. Hardware atomic intrinsics & AtomicI64 methods
+    var a: AtomicI64
+    a.init(100)
+    print(a.load())
+    print(a.fetch_add(25))
+    print(a.load())
+    print(a.fetch_sub(5))
+    print(a.load())
+    print(a.cas(120, 500))
+    print(a.cas(120, 999))
+    print(a.load())
+
+    // 2. Multi-threaded OS execution with 4 threads, Mutex, RwLock, and AtomicI64
+    var ctx = SharedCtx { iters: 10000 }
+    ctx.mtx.init()
+    ctx.rw.init()
+    ctx.atomic_sum.init(0)
+    ctx.mutex_sum = 0
+
+    ctx.rw.write_lock()
+    ctx.rw.write_unlock()
+    ctx.rw.read_lock()
+    ctx.rw.read_unlock()
+
+    var raw_ctx = ptr_cast(*u8, &ctx)
+    var t0 = spawn(worker_fn, raw_ctx)
+    var t1 = spawn(worker_fn, raw_ctx)
+    var t2 = spawn(worker_fn, raw_ctx)
+    var t3 = spawn(worker_fn, raw_ctx)
+
+    var c0 = t0.join()
+    var c1 = t1.join()
+    var c2 = t2.join()
+    var c3 = t3.join()
+
+    print(c0 + c1 + c2 + c3)
+    print(ctx.atomic_sum.load())
+    print(ctx.mutex_sum)
+    print(current_thread_id() > u32(0))
+}
+"@
+$phase15_expected = "100`n100`n125`n125`n120`ntrue`nfalse`n500`n28`n40000`n40000`ntrue"
+
+Test-RunOk "phase15_threads_and_atomics" $phase15_code $phase15_expected
+Test-RunLlvm "phase15_threads_and_atomics_llvm" $phase15_code $phase15_expected
+
 Write-Host "`nAll tests passed."

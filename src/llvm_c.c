@@ -899,6 +899,70 @@ static void opt_gen_expr(OptGen *g, Buf *b, Node *n) {
             bprintf(b, ").len)");
             return;
         }
+        if (n->builtin == B_ATOMIC_LOAD) {
+            bprintf(b, "__atomic_load_n((int64_t *)(");
+            if (!g->release) {
+                bprintf(b, "sb_chk_null((const void *)(");
+                opt_gen_expr(g, b, n->list.items[0]);
+                bprintf(b, "), ");
+                emit_loc_str(b, n->pos, "null pointer in atomic_load");
+                bprintf(b, ")");
+            } else {
+                opt_gen_expr(g, b, n->list.items[0]);
+            }
+            bprintf(b, "), __ATOMIC_SEQ_CST)");
+            return;
+        }
+        if (n->builtin == B_ATOMIC_STORE) {
+            bprintf(b, "__atomic_store_n((int64_t *)(");
+            if (!g->release) {
+                bprintf(b, "sb_chk_null((const void *)(");
+                opt_gen_expr(g, b, n->list.items[0]);
+                bprintf(b, "), ");
+                emit_loc_str(b, n->pos, "null pointer in atomic_store");
+                bprintf(b, ")");
+            } else {
+                opt_gen_expr(g, b, n->list.items[0]);
+            }
+            bprintf(b, "), (int64_t)(");
+            opt_gen_expr(g, b, n->list.items[1]);
+            bprintf(b, "), __ATOMIC_SEQ_CST)");
+            return;
+        }
+        if (n->builtin == B_ATOMIC_ADD) {
+            bprintf(b, "__sync_fetch_and_add((int64_t *)(");
+            if (!g->release) {
+                bprintf(b, "sb_chk_null((const void *)(");
+                opt_gen_expr(g, b, n->list.items[0]);
+                bprintf(b, "), ");
+                emit_loc_str(b, n->pos, "null pointer in atomic_add");
+                bprintf(b, ")");
+            } else {
+                opt_gen_expr(g, b, n->list.items[0]);
+            }
+            bprintf(b, "), (int64_t)(");
+            opt_gen_expr(g, b, n->list.items[1]);
+            bprintf(b, "))");
+            return;
+        }
+        if (n->builtin == B_ATOMIC_CAS) {
+            bprintf(b, "__sync_val_compare_and_swap((int64_t *)(");
+            if (!g->release) {
+                bprintf(b, "sb_chk_null((const void *)(");
+                opt_gen_expr(g, b, n->list.items[0]);
+                bprintf(b, "), ");
+                emit_loc_str(b, n->pos, "null pointer in atomic_cas");
+                bprintf(b, ")");
+            } else {
+                opt_gen_expr(g, b, n->list.items[0]);
+            }
+            bprintf(b, "), (int64_t)(");
+            opt_gen_expr(g, b, n->list.items[1]);
+            bprintf(b, "), (int64_t)(");
+            opt_gen_expr(g, b, n->list.items[2]);
+            bprintf(b, "))");
+            return;
+        }
         if (!n->sym && n->lhs) {
             if (!g->release) {
                 bprintf(b, "((");
@@ -1497,6 +1561,12 @@ static void generate_opt_c_unit(Program *prog, NodeVec all_decls, bool release, 
     }
     for (int i = 0; i < prog->fns.len; i++) {
         collect_slice_types_node(&g, prog->fns.items[i]);
+    }
+    for (int i = 0; i < all_decls.len; i++) {
+        Node *d = all_decls.items[i];
+        if (d->kind == N_FN && d->is_extern) {
+            collect_slice_types_node(&g, d);
+        }
     }
 
     emit_opt_runtime_preamble(&g.hdr);

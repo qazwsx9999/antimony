@@ -993,10 +993,49 @@ Antimony ships with native standard library modules in `std/` that you can impor
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `pop`, `get`, `set`, `as_slice`, `clear`, `free`).
 - `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `free`) and `Option[T]` (`.Some(T)` / `.None`).
 - `import "std/sort.sb"` — Generic sorting and slice algorithms (`sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, `reverse[T]`).
+- `import "std/thread.sb"` — Native Win32 OS threads (`Thread`, `spawn`, `join`, `detach`, `current_thread_id`), fast user-mode `SRWLOCK` locks (`Mutex`, `RwLock`, `CondVar`), and hardware atomic wrapper `AtomicI64` (`init`, `load`, `store`, `fetch_add`, `fetch_sub`, `cas`).
 - `import "std/io.sb"` — Native Win32 file I/O (`write_file_str`, `write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
 - `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification (`is_digit`, `is_alpha`, `is_space`), `str` helpers (`str_starts_with`, `str_ends_with`, `str_trim`, `str_find_byte`, `str_parse_i64`, `parse_i64`), and the growable `StringBuilder` (`init`, `append`, `append_byte`, `append_i64`, `as_str`, `cstr`, `clear`, `free`).
 - `import "std/os.sb"` — Console streams and process environment: `print_raw`, `eprint_raw`, `eprint`, `cmd_line`, `arg_count`, `arg_at`, `parse_arg_count`, `parse_arg_at`, `getenv_into`.
+
+### 15.4 Multi-Threading, `Mutex`, and Hardware Atomics (`std/thread.sb`)
+Import `"std/thread.sb"` to spawn native Win32 OS threads (`spawn(worker_fn, arg)`), synchronize shared state with 8-byte user-mode `SRWLOCK` mutexes (`Mutex`, `RwLock`, `CondVar`), or perform lock-free hardware atomic operations (`AtomicI64` / `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store` compiling directly to `LOCK XADD` and `LOCK CMPXCHG`):
+
+```
+import "std/thread.sb"
+
+struct WorkState {
+    mtx: Mutex
+    counter: AtomicI64
+    protected_sum: i64
+}
+
+fn worker(raw: *u8): u32 {
+    var st = ptr_cast(*WorkState, raw)
+    loop i in 0..10000 {
+        st.counter.fetch_add(1)
+        st.mtx.lock()
+        st.protected_sum += 1
+        st.mtx.unlock()
+    }
+    return 0
+}
+
+fn main() {
+    var st = WorkState {}
+    st.mtx.init()
+    st.counter.init(0)
+
+    var t1 = spawn(worker, ptr_cast(*u8, &st))
+    var t2 = spawn(worker, ptr_cast(*u8, &st))
+    t1.join()
+    t2.join()
+
+    print(st.counter.load())        // 20000
+    print(st.protected_sum)         // 20000
+}
+```
 
 ---
 
@@ -1009,6 +1048,10 @@ Antimony ships with native standard library modules in `std/` that you can impor
 | `sizeof(T_or_expr)` | Compile-time size in bytes of a type or expression |
 | `alignof(T_or_expr)` | Compile-time alignment in bytes of a type or expression |
 | `ptr_cast(*T, x)` | Zero-cost cast of a pointer or 64-bit integer address `x` to pointer type `*T` |
+| `atomic_load(p: *i64): i64` | Sequentially-consistent 64-bit atomic load from `p` |
+| `atomic_store(p: *i64, v: i64)` | Sequentially-consistent 64-bit atomic store (`XCHG`) to `p` |
+| `atomic_add(p: *i64, d: i64): i64` | Atomic 64-bit fetch-and-add (`LOCK XADD`), returning the previous value |
+| `atomic_cas(p: *i64, exp: i64, des: i64): i64` | Atomic 64-bit compare-and-swap (`LOCK CMPXCHG`), returning the previous value |
 | `exit(code: i32)` | Terminates the program immediately with exit status `code` |
 | `rev(a..b [by s])` | Reverses a range inside a `loop` header |
 | `T(x)` | Explicitly converts `x` to scalar integer, float, or enum type `T` (e.g. `i64(x)`, `f64(x)`, `usize(ptr)`) |

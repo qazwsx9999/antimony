@@ -150,6 +150,7 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
 - **Indirect Calls:** Any expression of type `fn(T1, ...): R` can be invoked directly (`fp(a, b)`, `s.cb(x)`, `ops[i](a, b)`). In `debug` mode, calling a `null` function pointer traps with `"null function pointer call"`.
 - **Stateless Anonymous Functions:** `fn(a: i32, b: i32): bool { return a < b }` defines an inline anonymous function and evaluates to its function pointer (`fn(i32, i32): bool`). Anonymous functions are stateless and cannot capture outer local variables (preserving zero hidden heap allocations).
 - **Standard Generic Sorting & Binary Search (`std/sort.sb`):** Provides `sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, and `reverse[T]`.
+- **Concurrency & Hardware Atomics (`std/thread.sb`):** Provides Win32 OS threads (`Thread`, `spawn`), `Mutex` / `RwLock` (`SRWLOCK`), `CondVar` (`CONDITION_VARIABLE`), `AtomicI64`, and hardware atomic built-ins (`atomic_load`, `atomic_store`, `atomic_add`, `atomic_cas`).
 
 ### 2.2 No implicit conversions
 Values of different types never mix implicitly. `i32 + i64` is a compile error. Conversions are explicit and use the target type name as a function:

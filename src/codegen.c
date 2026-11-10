@@ -1203,6 +1203,55 @@ static void gen_expr(CG *cg, Node *n) {
             x_mov_rr(1, RAX, RDX);
             return;
         }
+        if (n->builtin == B_ATOMIC_LOAD) {
+            gen_expr(cg, n->list.items[0]);
+            if (!cg->release) {
+                x_test_rr(1, RAX, RAX);
+                emit_trap_if(cg, CC_E, n->pos, "null pointer in atomic_load");
+            }
+            x_load(RAX, RAX, 0);
+            return;
+        }
+        if (n->builtin == B_ATOMIC_STORE) {
+            gen_expr(cg, n->list.items[0]);
+            if (!cg->release) {
+                x_test_rr(1, RAX, RAX);
+                emit_trap_if(cg, CC_E, n->pos, "null pointer in atomic_store");
+            }
+            int ptr_slot = push_temp(cg);
+            gen_expr(cg, n->list.items[1]);
+            pop_temp(cg, ptr_slot, RCX);
+            x_xchg_mr(RCX, RAX);
+            return;
+        }
+        if (n->builtin == B_ATOMIC_ADD) {
+            gen_expr(cg, n->list.items[0]);
+            if (!cg->release) {
+                x_test_rr(1, RAX, RAX);
+                emit_trap_if(cg, CC_E, n->pos, "null pointer in atomic_add");
+            }
+            int ptr_slot = push_temp(cg);
+            gen_expr(cg, n->list.items[1]);
+            pop_temp(cg, ptr_slot, RCX);
+            x_lock_xadd(RCX, RAX);
+            return;
+        }
+        if (n->builtin == B_ATOMIC_CAS) {
+            gen_expr(cg, n->list.items[0]);
+            if (!cg->release) {
+                x_test_rr(1, RAX, RAX);
+                emit_trap_if(cg, CC_E, n->pos, "null pointer in atomic_cas");
+            }
+            int ptr_slot = push_temp(cg);
+            gen_expr(cg, n->list.items[1]);
+            int exp_slot = push_temp(cg);
+            gen_expr(cg, n->list.items[2]);
+            x_mov_rr(1, RDX, RAX);
+            pop_temp(cg, exp_slot, RAX);
+            pop_temp(cg, ptr_slot, RCX);
+            x_lock_cmpxchg(RCX, RDX);
+            return;
+        }
 
         // Evaluate arguments left to right into temporary slots.
         // Note: a slice argument `{ptr, len}` occupies TWO 8-byte parameter slots

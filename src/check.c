@@ -2258,6 +2258,54 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 if (expected) coerce(n, expected);
                 return;
             }
+            if (s->builtin == B_ATOMIC_LOAD) {
+                if (n->list.len != 1) fatal(n->pos, "'atomic_load' takes 1 argument (ptr: *i64)");
+                Node *p = n->list.items[0];
+                check_expr(c, p, NULL);
+                if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
+                    fatal(p->pos, "'atomic_load' requires a '*i64' pointer argument (got '%s')", p->type->name);
+                }
+                n->type = &ty_i64;
+                if (expected) coerce(n, expected);
+                return;
+            }
+            if (s->builtin == B_ATOMIC_STORE) {
+                if (n->list.len != 2) fatal(n->pos, "'atomic_store' takes 2 arguments (ptr: *i64, val: i64)");
+                Node *p = n->list.items[0];
+                check_expr(c, p, NULL);
+                if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
+                    fatal(p->pos, "'atomic_store' requires a '*i64' pointer first argument (got '%s')", p->type->name);
+                }
+                check_expr(c, n->list.items[1], &ty_i64);
+                n->type = &ty_void;
+                if (expected) coerce(n, expected);
+                return;
+            }
+            if (s->builtin == B_ATOMIC_ADD) {
+                if (n->list.len != 2) fatal(n->pos, "'atomic_add' takes 2 arguments (ptr: *i64, delta: i64)");
+                Node *p = n->list.items[0];
+                check_expr(c, p, NULL);
+                if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
+                    fatal(p->pos, "'atomic_add' requires a '*i64' pointer first argument (got '%s')", p->type->name);
+                }
+                check_expr(c, n->list.items[1], &ty_i64);
+                n->type = &ty_i64;
+                if (expected) coerce(n, expected);
+                return;
+            }
+            if (s->builtin == B_ATOMIC_CAS) {
+                if (n->list.len != 3) fatal(n->pos, "'atomic_cas' takes 3 arguments (ptr: *i64, expected: i64, desired: i64)");
+                Node *p = n->list.items[0];
+                check_expr(c, p, NULL);
+                if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
+                    fatal(p->pos, "'atomic_cas' requires a '*i64' pointer first argument (got '%s')", p->type->name);
+                }
+                check_expr(c, n->list.items[1], &ty_i64);
+                check_expr(c, n->list.items[2], &ty_i64);
+                n->type = &ty_i64;
+                if (expected) coerce(n, expected);
+                return;
+            }
         }
 
         if (s->kind != SYM_FN) {
@@ -3143,7 +3191,9 @@ static void register_builtins(Checker *c) {
     }
     struct { const char *name; int id; } builtins[] = {
         {"print", B_PRINT}, {"exit", B_EXIT}, {"rev", B_REV}, {"len", B_LEN},
-        {"sizeof", B_SIZEOF}, {"alignof", B_ALIGNOF}, {"ptr_cast", B_PTR_CAST}
+        {"sizeof", B_SIZEOF}, {"alignof", B_ALIGNOF}, {"ptr_cast", B_PTR_CAST},
+        {"atomic_load", B_ATOMIC_LOAD}, {"atomic_store", B_ATOMIC_STORE},
+        {"atomic_add", B_ATOMIC_ADD}, {"atomic_cas", B_ATOMIC_CAS}
     };
     for (size_t i = 0; i < sizeof(builtins) / sizeof(builtins[0]); i++) {
         const char *nm = intern(builtins[i].name, (int)strlen(builtins[i].name));

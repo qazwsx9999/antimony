@@ -1,0 +1,199 @@
+// =============================================================================
+// Antimony Standard Library: std/thread.sb
+// Native Win32 OS threads, SRWLOCK mutexes & reader-writer locks, condition
+// variables, and hardware atomic operations (`AtomicI64`).
+// =============================================================================
+
+extern "kernel32.dll" {
+    fn CreateThread(
+        lpThreadAttributes: *u8,
+        dwStackSize: usize,
+        lpStartAddress: fn(*u8): u32,
+        lpParameter: *u8,
+        dwCreationFlags: u32,
+        lpThreadId: *u32
+    ): usize
+    fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32): u32
+    fn GetExitCodeThread(hThread: usize, lpExitCode: *u32): i32
+    fn CloseHandle(hObject: usize): i32
+    fn GetCurrentThreadId(): u32
+
+    fn AcquireSRWLockExclusive(SRWLock: *usize)
+    fn ReleaseSRWLockExclusive(SRWLock: *usize)
+    fn TryAcquireSRWLockExclusive(SRWLock: *usize): u8
+    fn AcquireSRWLockShared(SRWLock: *usize)
+    fn ReleaseSRWLockShared(SRWLock: *usize)
+    fn TryAcquireSRWLockShared(SRWLock: *usize): u8
+
+    fn WakeConditionVariable(ConditionVariable: *usize)
+    fn WakeAllConditionVariable(ConditionVariable: *usize)
+    fn SleepConditionVariableSRW(
+        ConditionVariable: *usize,
+        SRWLock: *usize,
+        dwMilliseconds: u32,
+        Flags: u32
+    ): i32
+}
+
+const WAIT_INFINITE: u32 = 0xFFFFFFFF
+
+// -----------------------------------------------------------------------------
+// OS Thread (`Thread`)
+// -----------------------------------------------------------------------------
+
+struct Thread {
+    handle: usize
+    id: u32
+}
+
+// Spawns a new OS thread executing `entry(arg)`.
+fn spawn(entry: fn(*u8): u32, arg: *u8): Thread {
+    var tid: u32 = 0
+    var h = CreateThread(null, 0, entry, arg, 0, &tid)
+    return Thread { handle: h, id: tid }
+}
+
+fn (t: *Thread) is_valid(): bool {
+    return t.handle != 0
+}
+
+// Waits for the thread to terminate, closes its OS handle, and returns its exit code.
+fn (t: *Thread) join(): u32 {
+    if t.handle == 0 {
+        return 0
+    }
+    WaitForSingleObject(t.handle, WAIT_INFINITE)
+    var code: u32 = 0
+    GetExitCodeThread(t.handle, &code)
+    CloseHandle(t.handle)
+    t.handle = 0
+    return code
+}
+
+// Detaches the thread by closing its OS handle without waiting for completion.
+fn (t: *Thread) detach() {
+    if t.handle != 0 {
+        CloseHandle(t.handle)
+        t.handle = 0
+    }
+}
+
+fn current_thread_id(): u32 {
+    return GetCurrentThreadId()
+}
+
+// -----------------------------------------------------------------------------
+// Fast User-Mode Mutex (`Mutex` backed by Win32 `SRWLOCK`)
+// -----------------------------------------------------------------------------
+
+struct Mutex {
+    srw: usize
+}
+
+fn (m: *Mutex) init() {
+    m.srw = 0
+}
+
+fn (m: *Mutex) lock() {
+    AcquireSRWLockExclusive(&m.srw)
+}
+
+fn (m: *Mutex) unlock() {
+    ReleaseSRWLockExclusive(&m.srw)
+}
+
+fn (m: *Mutex) try_lock(): bool {
+    return TryAcquireSRWLockExclusive(&m.srw) != 0
+}
+
+// -----------------------------------------------------------------------------
+// Reader-Writer Lock (`RwLock` backed by Win32 `SRWLOCK`)
+// -----------------------------------------------------------------------------
+
+struct RwLock {
+    srw: usize
+}
+
+fn (rw: *RwLock) init() {
+    rw.srw = 0
+}
+
+fn (rw: *RwLock) read_lock() {
+    AcquireSRWLockShared(&rw.srw)
+}
+
+fn (rw: *RwLock) read_unlock() {
+    ReleaseSRWLockShared(&rw.srw)
+}
+
+fn (rw: *RwLock) try_read_lock(): bool {
+    return TryAcquireSRWLockShared(&rw.srw) != 0
+}
+
+fn (rw: *RwLock) write_lock() {
+    AcquireSRWLockExclusive(&rw.srw)
+}
+
+fn (rw: *RwLock) write_unlock() {
+    ReleaseSRWLockExclusive(&rw.srw)
+}
+
+fn (rw: *RwLock) try_write_lock(): bool {
+    return TryAcquireSRWLockExclusive(&rw.srw) != 0
+}
+
+// -----------------------------------------------------------------------------
+// Condition Variable (`CondVar` backed by Win32 `CONDITION_VARIABLE`)
+// -----------------------------------------------------------------------------
+
+struct CondVar {
+    cv: usize
+}
+
+fn (c: *CondVar) init() {
+    c.cv = 0
+}
+
+fn (c: *CondVar) wait(m: *Mutex) {
+    SleepConditionVariableSRW(&c.cv, &m.srw, WAIT_INFINITE, 0)
+}
+
+fn (c: *CondVar) notify_one() {
+    WakeConditionVariable(&c.cv)
+}
+
+fn (c: *CondVar) notify_all() {
+    WakeAllConditionVariable(&c.cv)
+}
+
+// -----------------------------------------------------------------------------
+// 64-Bit Hardware Atomic Integer (`AtomicI64`)
+// -----------------------------------------------------------------------------
+
+struct AtomicI64 {
+    val: i64
+}
+
+fn (a: *AtomicI64) init(v: i64) {
+    atomic_store(&a.val, v)
+}
+
+fn (a: *AtomicI64) load(): i64 {
+    return atomic_load(&a.val)
+}
+
+fn (a: *AtomicI64) store(v: i64) {
+    atomic_store(&a.val, v)
+}
+
+fn (a: *AtomicI64) fetch_add(delta: i64): i64 {
+    return atomic_add(&a.val, delta)
+}
+
+fn (a: *AtomicI64) fetch_sub(delta: i64): i64 {
+    return atomic_add(&a.val, -delta)
+}
+
+fn (a: *AtomicI64) cas(expected: i64, desired: i64): bool {
+    return atomic_cas(&a.val, expected, desired) == expected
+}

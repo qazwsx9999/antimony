@@ -345,6 +345,28 @@ void x_call_reg(int reg) {
     modrm(3, 2, reg);
 }
 
+void x_xchg_mr(int base, int src) {
+    emit_rex(1, src, 0, base);
+    emit8(0x87); // xchg [base], src (implicitly LOCKed on x86-64)
+    mem_disp(src, base, 0);
+}
+
+void x_lock_xadd(int base, int src_dst) {
+    emit8(0xF0); // LOCK prefix
+    emit_rex(1, src_dst, 0, base);
+    emit8(0x0F);
+    emit8(0xC1); // lock xadd [base], src_dst
+    mem_disp(src_dst, base, 0);
+}
+
+void x_lock_cmpxchg(int base, int desired_reg) {
+    emit8(0xF0); // LOCK prefix
+    emit_rex(1, desired_reg, 0, base);
+    emit8(0x0F);
+    emit8(0xB1); // lock cmpxchg [base], desired_reg (compares RAX with [base])
+    mem_disp(desired_reg, base, 0);
+}
+
 void x_call_import(int imp) {
     emit8(0xFF);
     rip_rel(2, SEC_IAT, (uint32_t)imp * 8, 0);

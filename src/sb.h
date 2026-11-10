@@ -151,7 +151,10 @@ extern Type ty_isize, ty_usize, ty_f32, ty_f64;
 typedef struct Node Node;
 
 typedef enum { SYM_VAR, SYM_PARAM, SYM_CONST, SYM_FN, SYM_TYPE, SYM_BUILTIN } SymKind;
-typedef enum { B_PRINT = 1, B_EXIT, B_REV, B_LEN, B_SIZEOF, B_ALIGNOF, B_PTR_CAST } BuiltinId;
+typedef enum {
+    B_PRINT = 1, B_EXIT, B_REV, B_LEN, B_SIZEOF, B_ALIGNOF, B_PTR_CAST,
+    B_ATOMIC_LOAD, B_ATOMIC_STORE, B_ATOMIC_ADD, B_ATOMIC_CAS
+} BuiltinId;
 
 typedef struct Symbol {
     SymKind kind;
@@ -345,6 +348,9 @@ void x_jcc(int cc, int label);
 void x_call(int label);
 void x_call_reg(int reg);
 void x_call_import(int imp);
+void x_xchg_mr(int base, int src);
+void x_lock_xadd(int base, int src_dst);
+void x_lock_cmpxchg(int base, int desired_reg);
 void x_push(int r);
 void x_pop(int r);
 void x_ret(void);
