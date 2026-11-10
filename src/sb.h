@@ -173,6 +173,7 @@ typedef struct Symbol {
     int label;           // fn: code label
     double fval;         // SYM_CONST float value
     bool addr_taken;     // local var: address taken (&x) -> cannot live in register
+    bool is_const_alias; // inlined param: bound to a compile-time constant argument
     int use_score;       // loop-weighted reference count for register allocation
     int hw_reg;          // allocated callee-saved register (RBX, R12..R15), or -1 if stack
     bool is_extern;      // fn: imported from Windows DLL
@@ -315,6 +316,7 @@ void x_mov_rr(int w, int dst, int src);
 void x_mov_ri(int dst, uint64_t imm);
 void x_load(int dst, int base, int32_t disp);          // mov dst, [base+disp] (64-bit)
 void x_load_sized(int dst, int base, int32_t disp, int size, bool is_signed);
+void x_load_sib_sized(int dst, int base, int index, int scale, int size, bool is_signed);
 void x_store(int base, int32_t disp, int src);         // mov [base+disp], src (64-bit)
 void x_store_sized(int base, int32_t disp, int src, int size);
 void x_store8(int base, int32_t disp, int src);        // mov byte [base+disp], src8
@@ -324,6 +326,7 @@ void x_store_rip(int sec, uint32_t off, int src);
 void x_lea_rip(int dst, int sec, uint32_t off);
 void x_lea_label(int dst, int label);
 void x_lea(int dst, int base, int32_t disp);
+void x_lea_sib(int dst, int base, int index, int scale);
 void x_rep_stosb(void);
 void x_alu_rr(int alu, int w, int dst, int src);
 void x_alu_ri(int alu, int w, int dst, int32_t imm);

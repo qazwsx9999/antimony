@@ -52,6 +52,20 @@ static void mem_disp(int reg, int base, int32_t disp) {
     }
 }
 
+static void mem_sib(int reg, int base, int index, int scale) {
+    int ss = (scale == 8) ? 3 : (scale == 4) ? 2 : (scale == 2) ? 1 : 0;
+    int b = base & 7;
+    int x = index & 7;
+    if (b == RBP) {
+        modrm(1, reg, 4);
+        emit8((uint8_t)((ss << 6) | (x << 3) | b));
+        emit8(0);
+    } else {
+        modrm(0, reg, 4);
+        emit8((uint8_t)((ss << 6) | (x << 3) | b));
+    }
+}
+
 static void rip_rel(int reg, int sec, uint32_t off, int addend) {
     modrm(0, reg, 5); // [RIP + disp32]
     uint32_t pos = x_here();
@@ -124,6 +138,34 @@ void x_load_sized(int dst, int base, int32_t disp, int size, bool is_signed) {
     }
 }
 
+void x_load_sib_sized(int dst, int base, int index, int scale, int size, bool is_signed) {
+    if (size == 8) {
+        emit_rex(1, dst, index, base);
+        emit8(0x8B);
+        mem_sib(dst, base, index, scale);
+    } else if (size == 4) {
+        if (is_signed) {
+            emit_rex(1, dst, index, base);
+            emit8(0x63); // movsxd r64, [base+index*scale]
+            mem_sib(dst, base, index, scale);
+        } else {
+            emit_rex(0, dst, index, base);
+            emit8(0x8B); // mov r32, [base+index*scale]
+            mem_sib(dst, base, index, scale);
+        }
+    } else if (size == 2) {
+        emit_rex(1, dst, index, base);
+        emit8(0x0F);
+        emit8(is_signed ? 0xBF : 0xB7);
+        mem_sib(dst, base, index, scale);
+    } else {
+        emit_rex(1, dst, index, base);
+        emit8(0x0F);
+        emit8(is_signed ? 0xBE : 0xB6);
+        mem_sib(dst, base, index, scale);
+    }
+}
+
 void x_store(int base, int32_t disp, int src) {
     emit_rex(1, src, 0, base);
     emit8(0x89);
@@ -192,6 +234,12 @@ void x_lea(int dst, int base, int32_t disp) {
     emit_rex(1, dst, 0, base);
     emit8(0x8D);
     mem_disp(dst, base, disp);
+}
+
+void x_lea_sib(int dst, int base, int index, int scale) {
+    emit_rex(1, dst, index, base);
+    emit8(0x8D);
+    mem_sib(dst, base, index, scale);
 }
 
 // alu: ADD=0 OR=1 AND=4 SUB=5 XOR=6 CMP=7

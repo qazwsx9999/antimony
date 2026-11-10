@@ -37,6 +37,8 @@ typedef struct {
     Node *last_top_stmt;      // last top-level statement of current function/inline body
     Node *range_loops[8];     // active enclosing N_LOOP_RANGE statements for bounds-check elimination
     int num_range_loops;
+    int free_callee_regs[5];  // unused callee-saved registers available for inlined params/locals
+    int num_free_callee;
 } CG;
 
 static uint32_t add_string(CG *cg, const char *s, int len) {
@@ -123,7 +125,18 @@ static void check_and_normalize_sub64(CG *cg, Type *dst, bool src_signed, Pos po
     normalize_rax(dst);
 }
 
+static uint64_t fval_bits(double v, Type *t);
+
 static void load_var(Symbol *s, int reg) {
+    if (s->is_const_alias) {
+        if (s->type->kind == TY_FLOAT) {
+            x_mov_ri(reg, fval_bits(s->fval, s->type));
+        } else {
+            x_mov_ri(reg, (uint64_t)(int64_t)s->cval);
+            normalize_reg(reg, s->type);
+        }
+        return;
+    }
     if (s->kind == SYM_FN) {
         x_lea_label(reg, s->label);
         return;
@@ -203,8 +216,9 @@ static bool fits_imm32(Node *n, int32_t *out) {
         *out = 0;
         return true;
     }
-    if (n->is_const && (n->type->kind == TY_INT || n->type->kind == TY_ENUM || n->type == &ty_bool)) {
-        int64_t v = (int64_t)n->cval;
+    bool is_c = n->is_const || (n->kind == N_IDENT && n->sym && n->sym->is_const_alias);
+    if (is_c && (n->type->kind == TY_INT || n->type->kind == TY_ENUM || n->type == &ty_bool)) {
+        int64_t v = (int64_t)(n->is_const ? n->cval : n->sym->cval);
         if (n->type->is_signed) {
             if (v >= INT32_MIN && v <= INT32_MAX) {
                 *out = (int32_t)v;
@@ -294,10 +308,32 @@ static bool is_call_free_expr(Node *n, bool release) {
         return is_call_free_expr(n->lhs, release);
     case N_CONV:
         return n->type != &ty_str && is_call_free_expr(n->lhs, release);
-    case N_BINARY:
+    case N_DEREF:
+    case N_FIELD:
+        return !is_aggregate_type(n->type) && n->type->kind != TY_ARRAY &&
+               n->type->kind != TY_SLICE && n->type != &ty_str &&
+               is_call_free_expr(n->lhs, release);
+    case N_INDEX: {
+        if (is_aggregate_type(n->type) || n->type->kind == TY_ARRAY ||
+            n->type->kind == TY_SLICE || n->type == &ty_str) {
+            return false;
+        }
+        if (n->lhs->kind == N_IDENT &&
+            (n->lhs->type->kind == TY_SLICE || n->lhs->type == &ty_str ||
+             (n->lhs->type->kind == TY_ARRAY && !n->lhs->implicit_slice))) {
+            return is_simple_expr(n->rhs) || is_call_free_expr(n->rhs, release);
+        }
+        return n->lhs->type->kind == TY_PTR &&
+               is_call_free_expr(n->lhs, release) && is_call_free_expr(n->rhs, release);
+    }
+    case N_BINARY: {
         if (n->lhs->type == &ty_str) return false;
-        if (n->op == T_SLASH || n->op == T_PERCENT) return false; // division traps even in release
+        if (n->op == T_SLASH || n->op == T_PERCENT) {
+            int32_t imm = 0;
+            if (!(fits_imm32(n->rhs, &imm) && imm > 0)) return false;
+        }
         return is_call_free_expr(n->lhs, release) && is_call_free_expr(n->rhs, release);
+    }
     default:
         return false;
     }
@@ -715,6 +751,10 @@ static void gen_index_addr(CG *cg, Node *n) {
             else                x_load(RAX, RBP, slot_disp(s->slot));
             return;
         }
+        if (s->hw_reg >= 0 && (elem_t->size == 1 || elem_t->size == 2 || elem_t->size == 4 || elem_t->size == 8)) {
+            x_lea_sib(RAX, s->hw_reg, RAX, elem_t->size);
+            return;
+        }
         scale_reg_by_size(RAX, elem_t->size, RDX);
         if (s->hw_reg >= 0) {
             x_alu_rr(ALU_ADD, 1, RAX, s->hw_reg);
@@ -952,6 +992,26 @@ static void gen_expr(CG *cg, Node *n) {
 
     case N_INDEX: {
         Type *elem_t = n->type;
+        if (elem_t->kind != TY_ARRAY && !is_aggregate_type(elem_t) &&
+            elem_t != &ty_str && elem_t->kind != TY_SLICE &&
+            (elem_t->size == 1 || elem_t->size == 2 || elem_t->size == 4 || elem_t->size == 8) &&
+            n->lhs->kind == N_IDENT && !n->lhs->implicit_slice && n->lhs->sym->hw_reg >= 0 &&
+            n->rhs->kind == N_IDENT && !n->rhs->implicit_slice && n->rhs->sym->hw_reg >= 0) {
+            Type *bt = n->lhs->type;
+            if (bt->kind == TY_PTR && cg->release) {
+                x_load_sib_sized(RAX, n->lhs->sym->hw_reg, n->rhs->sym->hw_reg, elem_t->size, elem_t->size, elem_t->is_signed);
+                return;
+            }
+            if (bt->kind == TY_SLICE || bt == &ty_str) {
+                if (!cg->release && !is_range_loop_in_bounds(cg, n->lhs, n->rhs)) {
+                    x_load(RDX, RBP, slot_disp(n->lhs->sym->slot) + 8);
+                    x_alu_rr(ALU_CMP, 1, n->rhs->sym->hw_reg, RDX);
+                    emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+                }
+                x_load_sib_sized(RAX, n->lhs->sym->hw_reg, n->rhs->sym->hw_reg, elem_t->size, elem_t->size, elem_t->is_signed);
+                return;
+            }
+        }
         gen_index_addr(cg, n);
         if (elem_t->kind == TY_ARRAY || is_aggregate_type(elem_t)) {
             return;
@@ -1735,6 +1795,28 @@ static void gen_assign(CG *cg, Node *n) {
                 }
             }
         }
+        if ((cg->release || binop == T_PLUSW || binop == T_MINUSW || binop == T_STARW ||
+             binop == T_AMP || binop == T_PIPE || binop == T_CARET) &&
+            (binop == T_PLUS || binop == T_PLUSW || binop == T_MINUS || binop == T_MINUSW ||
+             binop == T_STAR || binop == T_STARW || binop == T_AMP || binop == T_PIPE || binop == T_CARET)) {
+            int rhs_reg = RAX;
+            if (n->rhs->kind == N_IDENT && !n->rhs->implicit_slice && n->rhs->sym && n->rhs->sym->hw_reg >= 0) {
+                rhs_reg = n->rhs->sym->hw_reg;
+            } else {
+                gen_expr(cg, n->rhs);
+            }
+            if (binop == T_STAR || binop == T_STARW) {
+                x_imul_rr(1, r, rhs_reg);
+            } else {
+                int alu = (binop == T_PLUS || binop == T_PLUSW)   ? ALU_ADD
+                        : (binop == T_MINUS || binop == T_MINUSW) ? ALU_SUB
+                        : (binop == T_AMP)                        ? ALU_AND
+                        : (binop == T_PIPE)                       ? ALU_OR : ALU_XOR;
+                x_alu_rr(alu, 1, r, rhs_reg);
+            }
+            normalize_reg(r, s->type);
+            return;
+        }
     }
 
     // Fast XMM compound assignment (`acc += f64_expr`, `acc *= f64_expr`).
@@ -1808,6 +1890,26 @@ static void gen_cond_jump(CG *cg, Node *cond, int target, bool jump_if_true) {
             gen_cond_jump(cg, cond->lhs, l_true, true);
             gen_cond_jump(cg, cond->rhs, target, false);
             x_bind(l_true);
+        }
+        return;
+    }
+    if (cond->kind == N_BINARY && cond->lhs->type->kind == TY_FLOAT &&
+        (cond->op == T_LT || cond->op == T_LE || cond->op == T_GT || cond->op == T_GE) &&
+        can_eval_xmm(cond->lhs, 0) && can_eval_xmm(cond->rhs, 1)) {
+        gen_float_xmm(cond->lhs, 0);
+        gen_float_xmm(cond->rhs, 1);
+        if (cond->op == T_GT) {
+            x_ucomisd(0, 1);
+            x_jcc(jump_if_true ? CC_A : CC_BE, target);
+        } else if (cond->op == T_GE) {
+            x_ucomisd(0, 1);
+            x_jcc(jump_if_true ? CC_AE : CC_B, target);
+        } else if (cond->op == T_LT) {
+            x_ucomisd(1, 0);
+            x_jcc(jump_if_true ? CC_A : CC_BE, target);
+        } else { // T_LE
+            x_ucomisd(1, 0);
+            x_jcc(jump_if_true ? CC_AE : CC_B, target);
         }
         return;
     }
@@ -2381,7 +2483,11 @@ static bool node_modifies_or_addrs_sym(Node *n, Symbol *s) {
 static bool check_inline_body(Node *n, int *count) {
     if (!n) return true;
     if (++(*count) > 40) return false;
-    if (n->kind == N_DEFER || n->kind == N_TRY) return false;
+    if (n->kind == N_DEFER || n->kind == N_TRY ||
+        n->kind == N_LOOP_INF || n->kind == N_LOOP_COND ||
+        n->kind == N_LOOP_RANGE || n->kind == N_LOOP_ITER || n->kind == N_LOOP_C) {
+        return false;
+    }
     if (!check_inline_body(n->lhs, count)) return false;
     if (!check_inline_body(n->rhs, count)) return false;
     if (!check_inline_body(n->cond, count)) return false;
@@ -2417,7 +2523,12 @@ static bool can_inline_fn(CG *cg, Node *callee) {
     return check_inline_body(callee->body, &count);
 }
 
-static void shift_node_slots(Node *n, int delta) {
+static bool is_reg_scalar_type(Type *t) {
+    return t && (t->kind == TY_INT || (t->kind == TY_ENUM && !t->is_tagged) ||
+                 t->kind == TY_BOOL || t->kind == TY_FLOAT || t->kind == TY_PTR || t->kind == TY_FN);
+}
+
+static void shift_node_slots(CG *cg, Node *n, int delta) {
     if (!n) return;
     if (n->slot_start > 0) n->slot_start += delta;
     if (n->slot_end > 0)   n->slot_end   += delta;
@@ -2425,39 +2536,53 @@ static void shift_node_slots(Node *n, int delta) {
 
     switch (n->kind) {
     case N_VAR:
+        if (n->sym) {
+            n->sym->slot += delta;
+            n->sym->is_const_alias = false;
+            if (delta > 0 && cg && !n->sym->addr_taken && is_reg_scalar_type(n->sym->type) &&
+                cg->num_free_callee > 0) {
+                n->sym->hw_reg = cg->free_callee_regs[--cg->num_free_callee];
+            } else {
+                n->sym->hw_reg = -1;
+            }
+        }
+        break;
     case N_LOOP_RANGE:
     case N_MATCH_ARM:
         if (n->sym) {
             n->sym->slot += delta;
             n->sym->hw_reg = -1;
+            n->sym->is_const_alias = false;
         }
         break;
     case N_LOOP_ITER:
         if (n->sym) {
             n->sym->slot += delta;
             n->sym->hw_reg = -1;
+            n->sym->is_const_alias = false;
         }
         if (n->sym2) {
             n->sym2->slot += delta;
             n->sym2->hw_reg = -1;
+            n->sym2->is_const_alias = false;
         }
         break;
     default:
         break;
     }
 
-    shift_node_slots(n->lhs, delta);
-    shift_node_slots(n->rhs, delta);
-    shift_node_slots(n->cond, delta);
-    shift_node_slots(n->body, delta);
-    shift_node_slots(n->els, delta);
-    shift_node_slots(n->lo, delta);
-    shift_node_slots(n->hi, delta);
-    shift_node_slots(n->by, delta);
-    shift_node_slots(n->init, delta);
-    shift_node_slots(n->step, delta);
+    shift_node_slots(cg, n->lhs, delta);
+    shift_node_slots(cg, n->rhs, delta);
+    shift_node_slots(cg, n->cond, delta);
+    shift_node_slots(cg, n->body, delta);
+    shift_node_slots(cg, n->els, delta);
+    shift_node_slots(cg, n->lo, delta);
+    shift_node_slots(cg, n->hi, delta);
+    shift_node_slots(cg, n->by, delta);
+    shift_node_slots(cg, n->init, delta);
+    shift_node_slots(cg, n->step, delta);
     for (int i = 0; i < n->list.len; i++) {
-        shift_node_slots(n->list.items[i], delta);
+        shift_node_slots(cg, n->list.items[i], delta);
     }
 }
 
@@ -2468,26 +2593,67 @@ static void gen_inline_call(CG *cg, Node *n, Node *callee) {
     if (cg->temp_depth > cg->max_temp_depth) {
         cg->max_temp_depth = cg->temp_depth;
     }
+    int saved_free_callee = cg->num_free_callee;
 
-    int *orig_slot = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
-    int *orig_hw   = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
-    bool *aliased  = nargs ? xcalloc((size_t)nargs, sizeof(bool)) : NULL;
+    int *orig_slot       = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
+    int *orig_hw         = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
+    bool *orig_const     = nargs ? xmalloc((size_t)nargs * sizeof(bool)) : NULL;
+    i128 *orig_cval      = nargs ? xmalloc((size_t)nargs * sizeof(i128)) : NULL;
+    double *orig_fval    = nargs ? xmalloc((size_t)nargs * sizeof(double)) : NULL;
+    bool *aliased        = nargs ? xcalloc((size_t)nargs, sizeof(bool)) : NULL;
+    bool *const_aliased  = nargs ? xcalloc((size_t)nargs, sizeof(bool)) : NULL;
+    int *param_reg       = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
 
-    // 1. Evaluate non-aliased arguments into their reserved target slots `[RBP - 8*(delta + ps->slot)]`
-    //    before shifting `callee` (so nested calls to `callee` in arguments can also inline cleanly).
+    // 1. Classify arguments (constant-aliased, caller-sym-aliased, or evaluated).
     for (int i = 0; i < nargs; i++) {
         Symbol *ps = callee->list.items[i]->sym;
         Node *arg  = n->list.items[i];
-        orig_slot[i] = ps->slot;
-        orig_hw[i]   = ps->hw_reg;
-        if (arg->kind == N_IDENT && !arg->implicit_slice && arg->sym) {
+        orig_slot[i]  = ps->slot;
+        orig_hw[i]    = ps->hw_reg;
+        orig_const[i] = ps->is_const_alias;
+        orig_cval[i]  = ps->cval;
+        orig_fval[i]  = ps->fval;
+        param_reg[i]  = -1;
+
+        bool unmodified = !node_modifies_or_addrs_sym(callee->body, ps);
+        if (unmodified && is_reg_scalar_type(ps->type) &&
+            (arg->is_const || (arg->kind == N_IDENT && !arg->implicit_slice && arg->sym && arg->sym->is_const_alias))) {
+            const_aliased[i] = true;
+            continue;
+        }
+        if (unmodified && arg->kind == N_IDENT && !arg->implicit_slice && arg->sym) {
             Symbol *as = arg->sym;
             if ((as->kind == SYM_VAR || as->kind == SYM_PARAM) && !as->is_global && !as->addr_taken &&
-                as->type == ps->type && ps->type->kind != TY_ARRAY && !is_aggregate_type(ps->type) &&
-                !node_modifies_or_addrs_sym(callee->body, ps)) {
+                as->type == ps->type && ps->type->kind != TY_ARRAY && !is_aggregate_type(ps->type)) {
                 aliased[i] = true;
                 continue;
             }
+        }
+    }
+
+    // Evaluate non-aliased arguments (into a free callee-saved register when safe, or target_slot).
+    for (int i = 0; i < nargs; i++) {
+        if (aliased[i] || const_aliased[i]) continue;
+        Symbol *ps = callee->list.items[i]->sym;
+        Node *arg  = n->list.items[i];
+        bool later_all_simple = true;
+        for (int j = i + 1; j < nargs; j++) {
+            if (!aliased[j] && !const_aliased[j] && !is_simple_expr(n->list.items[j])) {
+                later_all_simple = false;
+                break;
+            }
+        }
+        if (later_all_simple && is_reg_scalar_type(ps->type) && cg->num_free_callee > 0 &&
+            !node_modifies_or_addrs_sym(callee->body, ps)) {
+            int r = cg->free_callee_regs[--cg->num_free_callee];
+            param_reg[i] = r;
+            if (is_simple_expr(arg)) {
+                gen_simple_into_reg(arg, r);
+            } else {
+                gen_expr(cg, arg);
+                x_mov_rr(1, r, RAX);
+            }
+            continue;
         }
         int target_slot = delta + ps->slot;
         if (ps->type->kind == TY_SLICE || ps->type == &ty_str) {
@@ -2500,19 +2666,33 @@ static void gen_inline_call(CG *cg, Node *n, Node *callee) {
         }
     }
 
-    // 2. Shift `callee` parameter & local slots by `+delta` (or bind aliased parameters to caller's reg/slot).
+    // 2. Shift `callee` parameter & local slots by `+delta` (or bind aliased/constant/register parameters).
     for (int i = 0; i < nargs; i++) {
         Symbol *ps = callee->list.items[i]->sym;
-        if (aliased[i]) {
-            Symbol *as = n->list.items[i]->sym;
-            ps->slot   = as->slot;
-            ps->hw_reg = as->hw_reg;
-        } else {
-            ps->slot  += delta;
+        Node *arg  = n->list.items[i];
+        if (const_aliased[i]) {
+            ps->is_const_alias = true;
+            ps->cval   = arg->is_const ? arg->cval : arg->sym->cval;
+            ps->fval   = arg->is_const ? arg->fval : arg->sym->fval;
             ps->hw_reg = -1;
+        } else if (aliased[i]) {
+            Symbol *as = arg->sym;
+            ps->slot           = as->slot;
+            ps->hw_reg         = as->hw_reg;
+            ps->is_const_alias = as->is_const_alias;
+            ps->cval           = as->cval;
+            ps->fval           = as->fval;
+        } else if (param_reg[i] >= 0) {
+            ps->slot           += delta;
+            ps->hw_reg          = param_reg[i];
+            ps->is_const_alias  = false;
+        } else {
+            ps->slot           += delta;
+            ps->hw_reg          = -1;
+            ps->is_const_alias  = false;
         }
     }
-    shift_node_slots(callee->body, delta);
+    shift_node_slots(cg, callee->body, delta);
 
     // 3. Emit `callee->body` inline.
     cg->inline_stack[cg->inline_depth++] = callee;
@@ -2544,15 +2724,24 @@ static void gen_inline_call(CG *cg, Node *n, Node *callee) {
     cg->inline_depth--;
 
     // 4. Restore `callee` slots and release temporary frame space.
-    shift_node_slots(callee->body, -delta);
+    shift_node_slots(NULL, callee->body, -delta);
     for (int i = 0; i < nargs; i++) {
         Symbol *ps = callee->list.items[i]->sym;
-        ps->slot   = orig_slot[i];
-        ps->hw_reg = orig_hw[i];
+        ps->slot           = orig_slot[i];
+        ps->hw_reg         = orig_hw[i];
+        ps->is_const_alias = orig_const[i];
+        ps->cval           = orig_cval[i];
+        ps->fval           = orig_fval[i];
     }
     free(orig_slot);
     free(orig_hw);
+    free(orig_const);
+    free(orig_cval);
+    free(orig_fval);
     free(aliased);
+    free(const_aliased);
+    free(param_reg);
+    cg->num_free_callee = saved_free_callee;
     cg->temp_depth -= callee->num_slots;
 }
 
@@ -2697,17 +2886,49 @@ static int alloc_fn_regs(Node *fn, int out_regs[5]) {
     return n_alloc;
 }
 
+static bool node_has_inline_call(CG *cg, Node *n) {
+    if (!n) return false;
+    if (n->kind == N_CALL && n->sym && !n->sym->is_extern && can_inline_fn(cg, n->sym->decl)) {
+        return true;
+    }
+    if (node_has_inline_call(cg, n->lhs)) return true;
+    if (node_has_inline_call(cg, n->rhs)) return true;
+    if (node_has_inline_call(cg, n->cond)) return true;
+    if (node_has_inline_call(cg, n->body)) return true;
+    if (node_has_inline_call(cg, n->els)) return true;
+    if (node_has_inline_call(cg, n->lo)) return true;
+    if (node_has_inline_call(cg, n->hi)) return true;
+    if (node_has_inline_call(cg, n->by)) return true;
+    if (node_has_inline_call(cg, n->init)) return true;
+    if (node_has_inline_call(cg, n->step)) return true;
+    for (int i = 0; i < n->list.len; i++) {
+        if (node_has_inline_call(cg, n->list.items[i])) return true;
+    }
+    return false;
+}
+
 static void gen_fn(CG *cg, Node *fn) {
+    static const int callee_regs[5] = {RBX, R12, R13, R14, R15};
     int saved_regs[5];
     int num_saved = alloc_fn_regs(fn, saved_regs);
+
+    cg->cur_fn = fn;
+    cg->inline_depth = 0;
+    cg->scratch_depth = 0;
+    cg->num_free_callee = 0;
+    if (num_saved < 5 && node_has_inline_call(cg, fn->body)) {
+        for (int k = num_saved; k < 5; k++) {
+            saved_regs[k] = callee_regs[k];
+            cg->free_callee_regs[cg->num_free_callee++] = callee_regs[k];
+        }
+        num_saved = 5;
+    }
 
     x_bind(fn->sym->label);
     x_push(RBP);
     x_mov_rr(1, RBP, RSP);
     uint32_t patch = x_sub_rsp_patchable();
 
-    cg->cur_fn = fn;
-    cg->inline_depth = 0;
     cg->last_top_stmt = (fn->body && fn->body->list.len > 0)
         ? fn->body->list.items[fn->body->list.len - 1]
         : NULL;
@@ -2773,8 +2994,9 @@ static void gen_fn(CG *cg, Node *fn) {
     // Reset `hw_reg` on parameters and locals so subsequent inlining of `fn` starts clean.
     for (int i = 0; i < fn->list.len; i++) {
         fn->list.items[i]->sym->hw_reg = -1;
+        fn->list.items[i]->sym->is_const_alias = false;
     }
-    shift_node_slots(fn->body, 0);
+    shift_node_slots(NULL, fn->body, 0);
 }
 
 // ---------------------------------------------------------------------------
