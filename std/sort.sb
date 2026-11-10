@@ -1,0 +1,290 @@
+// =============================================================================
+// Antimony Standard Library: std/sort.sb
+// Generic in-place sorting, binary search, and slice algorithms powered by
+// compile-time generics ([T]) and first-class function pointers (fn(T, T): bool).
+// =============================================================================
+
+// Sorts `s` in-place according to comparator `less(a, b)`, which returns `true`
+// when `a` should be ordered before `b`.
+// Uses median-of-three quicksort with tail-call elimination and an insertion
+// sort cutoff for small partitions.
+fn sort_by[T](s: []T, less: fn(T, T): bool) {
+    var n = len(s)
+    if n <= 1 {
+        return
+    }
+
+    // Explicit stack of [lo, hi] inclusive index pairs (64 pairs covers > 2^64 elements).
+    var stack_lo: [64]i64 = []
+    var stack_hi: [64]i64 = []
+    var sp = 0
+    stack_lo[0] = 0
+    stack_hi[0] = n - 1
+    sp = 1
+
+    loop sp > 0 {
+        sp -= 1
+        var lo = stack_lo[sp]
+        var hi = stack_hi[sp]
+
+        loop hi - lo >= 16 {
+            // Median-of-three pivot selection on (lo, mid, hi).
+            var mid = lo + ((hi - lo) >> 1)
+            if less(s[mid], s[lo]) {
+                var tmp = s[lo]
+                s[lo] = s[mid]
+                s[mid] = tmp
+            }
+            if less(s[hi], s[lo]) {
+                var tmp = s[lo]
+                s[lo] = s[hi]
+                s[hi] = tmp
+            }
+            if less(s[hi], s[mid]) {
+                var tmp = s[mid]
+                s[mid] = s[hi]
+                s[hi] = tmp
+            }
+
+            var pivot = s[mid]
+            var i = lo
+            var j = hi
+
+            loop {
+                loop less(s[i], pivot) {
+                    i += 1
+                }
+                loop less(pivot, s[j]) {
+                    j -= 1
+                }
+                if i >= j {
+                    break
+                }
+                var tmp = s[i]
+                s[i] = s[j]
+                s[j] = tmp
+                i += 1
+                j -= 1
+            }
+
+            // Push the larger partition onto the stack and iterate on the smaller one
+            // to guarantee O(log N) stack depth.
+            if (j - lo) < (hi - i) {
+                if i < hi {
+                    stack_lo[sp] = i
+                    stack_hi[sp] = hi
+                    sp += 1
+                }
+                hi = j
+            } else {
+                if lo < j {
+                    stack_lo[sp] = lo
+                    stack_hi[sp] = j
+                    sp += 1
+                }
+                lo = i
+            }
+        }
+
+        // Insertion sort for small partition [lo..hi].
+        var i = lo + 1
+        loop i <= hi {
+            var key = s[i]
+            var j = i - 1
+            loop j >= lo && less(key, s[j]) {
+                s[j + 1] = s[j]
+                j -= 1
+            }
+            s[j + 1] = key
+            i += 1
+        }
+    }
+}
+
+// Sorts `s` in ascending order (`a < b`) for any ordered scalar type `T`.
+fn sort[T](s: []T) {
+    var n = len(s)
+    if n <= 1 {
+        return
+    }
+
+    var stack_lo: [64]i64 = []
+    var stack_hi: [64]i64 = []
+    var sp = 0
+    stack_lo[0] = 0
+    stack_hi[0] = n - 1
+    sp = 1
+
+    loop sp > 0 {
+        sp -= 1
+        var lo = stack_lo[sp]
+        var hi = stack_hi[sp]
+
+        loop hi - lo >= 16 {
+            var mid = lo + ((hi - lo) >> 1)
+            if s[mid] < s[lo] {
+                var tmp = s[lo]
+                s[lo] = s[mid]
+                s[mid] = tmp
+            }
+            if s[hi] < s[lo] {
+                var tmp = s[lo]
+                s[lo] = s[hi]
+                s[hi] = tmp
+            }
+            if s[hi] < s[mid] {
+                var tmp = s[mid]
+                s[mid] = s[hi]
+                s[hi] = tmp
+            }
+
+            var pivot = s[mid]
+            var i = lo
+            var j = hi
+
+            loop {
+                loop s[i] < pivot {
+                    i += 1
+                }
+                loop pivot < s[j] {
+                    j -= 1
+                }
+                if i >= j {
+                    break
+                }
+                var tmp = s[i]
+                s[i] = s[j]
+                s[j] = tmp
+                i += 1
+                j -= 1
+            }
+
+            if (j - lo) < (hi - i) {
+                if i < hi {
+                    stack_lo[sp] = i
+                    stack_hi[sp] = hi
+                    sp += 1
+                }
+                hi = j
+            } else {
+                if lo < j {
+                    stack_lo[sp] = lo
+                    stack_hi[sp] = j
+                    sp += 1
+                }
+                lo = i
+            }
+        }
+
+        var i = lo + 1
+        loop i <= hi {
+            var key = s[i]
+            var j = i - 1
+            loop j >= lo && key < s[j] {
+                s[j + 1] = s[j]
+                j -= 1
+            }
+            s[j + 1] = key
+            i += 1
+        }
+    }
+}
+
+// Sorts `s` in descending order (`a > b`) for any ordered scalar type `T`.
+fn sort_desc[T](s: []T) {
+    var n = len(s)
+    if n <= 1 {
+        return
+    }
+    var i: i64 = 1
+    loop i < n {
+        var key = s[i]
+        var j = i - 1
+        loop j >= 0 && s[j] < key {
+            s[j + 1] = s[j]
+            j -= 1
+        }
+        s[j + 1] = key
+        i += 1
+    }
+}
+
+// Returns `true` if `s` is sorted according to comparator `less(a, b)`.
+fn is_sorted_by[T](s: []T, less: fn(T, T): bool): bool {
+    var n = len(s)
+    if n <= 1 {
+        return true
+    }
+    loop i in 1..n {
+        if less(s[i], s[i - 1]) {
+            return false
+        }
+    }
+    return true
+}
+
+// Returns `true` if `s` is sorted in non-decreasing order (`s[i - 1] <= s[i]`).
+fn is_sorted[T](s: []T): bool {
+    var n = len(s)
+    if n <= 1 {
+        return true
+    }
+    loop i in 1..n {
+        if s[i] < s[i - 1] {
+            return false
+        }
+    }
+    return true
+}
+
+// Reverses a slice `s` in-place.
+fn reverse[T](s: []T) {
+    var i: i64 = 0
+    var j: i64 = len(s) - 1
+    loop i < j {
+        var tmp = s[i]
+        s[i] = s[j]
+        s[j] = tmp
+        i += 1
+        j -= 1
+    }
+}
+
+// Binary searches a sorted slice `s` for `target` using comparator `cmp(elem, target)`
+// which returns `< 0` when `elem < target`, `0` when equal, and `> 0` when `elem > target`.
+// Returns the matching index in `0..len(s)`, or `-1` if not found.
+fn binary_search_by[T](s: []T, target: T, cmp: fn(T, T): i32): i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(s)
+    loop lo < hi {
+        var mid = lo + ((hi - lo) >> 1)
+        var c = cmp(s[mid], target)
+        if c == 0 {
+            return mid
+        } else if c < 0 {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return -1
+}
+
+// Binary searches an ascending-sorted slice `s` for `target`.
+// Returns the matching index in `0..len(s)`, or `-1` if not found.
+fn binary_search[T](s: []T, target: T): i64 {
+    var lo: i64 = 0
+    var hi: i64 = len(s)
+    loop lo < hi {
+        var mid = lo + ((hi - lo) >> 1)
+        var v = s[mid]
+        if v == target {
+            return mid
+        } else if v < target {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return -1
+}

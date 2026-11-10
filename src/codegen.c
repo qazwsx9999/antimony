@@ -118,6 +118,10 @@ static void check_and_normalize_sub64(CG *cg, Type *dst, bool src_signed, Pos po
 }
 
 static void load_var(Symbol *s, int reg) {
+    if (s->kind == SYM_FN) {
+        x_lea_label(reg, s->label);
+        return;
+    }
     if (s->type->kind == TY_SLICE || s->type == &ty_str) {
         // Fat pointer {ptr, len} in (RAX, RDX).
         if (s->hw_reg >= 0) x_mov_rr(1, RAX, s->hw_reg);
@@ -224,10 +228,11 @@ static bool is_simple_expr(Node *n) {
     case N_FLOAT:
         return true;
     case N_IDENT: {
+        if (n->sym->kind == SYM_FN) return true;
         Type *t = n->sym->type;
         return !n->implicit_slice &&
                (t->kind == TY_INT || t->kind == TY_ENUM || t->kind == TY_BOOL ||
-                t->kind == TY_FLOAT || t->kind == TY_PTR);
+                t->kind == TY_FLOAT || t->kind == TY_PTR || t->kind == TY_FN);
     }
     default:
         return false;
@@ -273,10 +278,11 @@ static bool is_call_free_expr(Node *n, bool release) {
     case N_FLOAT:
         return true;
     case N_IDENT: {
+        if (n->sym->kind == SYM_FN) return true;
         Type *t = n->sym->type;
         return !n->implicit_slice &&
                (t->kind == TY_INT || t->kind == TY_ENUM || t->kind == TY_BOOL ||
-                t->kind == TY_FLOAT || t->kind == TY_PTR);
+                t->kind == TY_FLOAT || t->kind == TY_PTR || t->kind == TY_FN);
     }
     case N_UNARY:
         return is_call_free_expr(n->lhs, release);
@@ -1209,9 +1215,19 @@ static void gen_expr(CG *cg, Node *n) {
             cg->max_out_stack_args = nargs - 4;
         }
         static const int arg_regs[4] = {RCX, RDX, R8, R9};
-        bool fast_args = (nargs <= 4);
-        for (int i = 0; i < nargs; i++) {
-            Type *pt = n->sym->decl->list.items[i]->type;
+        bool is_indirect = (n->sym == NULL && n->lhs != NULL);
+        int fn_slot = 0;
+        if (is_indirect) {
+            gen_expr(cg, n->lhs);
+            if (!cg->release) {
+                x_test_rr(1, RAX, RAX);
+                emit_trap_if(cg, CC_E, n->pos, "null function pointer call");
+            }
+            fn_slot = push_temp(cg);
+        }
+        bool fast_args = (!is_indirect && nargs <= 4);
+        for (int i = 0; i < nargs && fast_args; i++) {
+            Type *pt = is_indirect ? n->lhs->type->params.items[i] : n->sym->decl->list.items[i]->type;
             if (pt->kind == TY_SLICE || pt == &ty_str) {
                 fast_args = false;
                 break;
@@ -1240,7 +1256,7 @@ static void gen_expr(CG *cg, Node *n) {
             int *arg_slots = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
             for (int i = 0; i < nargs; i++) {
                 Node *arg = n->list.items[i];
-                Type *pt = n->sym->decl->list.items[i]->type;
+                Type *pt = is_indirect ? n->lhs->type->params.items[i] : n->sym->decl->list.items[i]->type;
                 if (pt->kind == TY_SLICE || pt == &ty_str) {
                     gen_collection_ptr_len(cg, arg); // RAX = ptr, RDX = len
                     int s_hi = push_temp(cg);        // stores RAX at [RBP - 8*s_hi]
@@ -1258,10 +1274,10 @@ static void gen_expr(CG *cg, Node *n) {
                 }
             }
             for (int i = nargs - 1; i >= 0; i--) {
-                Type *pt = n->sym->decl->list.items[i]->type;
+                Type *pt = is_indirect ? n->lhs->type->params.items[i] : n->sym->decl->list.items[i]->type;
                 if (i < 4) {
                     pop_temp(cg, arg_slots[i], arg_regs[i]);
-                    if (n->sym->is_extern && pt->kind == TY_FLOAT) {
+                    if (!is_indirect && n->sym->is_extern && pt->kind == TY_FLOAT) {
                         x_movq_xmm_gpr(i, arg_regs[i]);
                     }
                 } else {
@@ -1274,7 +1290,13 @@ static void gen_expr(CG *cg, Node *n) {
             }
             free(arg_slots);
         }
-        if (n->sym->is_extern) {
+        if (is_indirect) {
+            pop_temp(cg, fn_slot, RAX);
+            if (is_aggregate_type(n->type)) {
+                x_lea(R10, RBP, slot_disp(n->slot_start));
+            }
+            x_call_reg(RAX);
+        } else if (n->sym->is_extern) {
             x_call_import(n->sym->iat_slot);
             if (n->type == &ty_f64) {
                 x_movq_gpr_xmm(RAX, 0);
@@ -2157,6 +2179,7 @@ static int alloc_fn_regs(Node *fn, int out_regs[5]) {
             Type *t = s->type;
             if (!t || (t->kind != TY_INT && !(t->kind == TY_ENUM && !t->is_tagged) &&
                        t->kind != TY_BOOL && t->kind != TY_FLOAT && t->kind != TY_PTR &&
+                       t->kind != TY_FN &&
                        t->kind != TY_SLICE && t != &ty_str)) continue;
             if (!best || s->use_score > best->use_score) {
                 best = s;

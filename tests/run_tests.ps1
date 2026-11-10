@@ -1487,4 +1487,139 @@ $phase13_expected = "42`nhello`nhello`n42`n250`n99`n90`n10`nbeta`nalpha`n20`n5`n
 Test-RunOk "phase13_generics_and_collections" $phase13_code $phase13_expected
 Test-RunLlvm "phase13_generics_and_collections_llvm" $phase13_code $phase13_expected
 
+# 22. Phase 14: First-Class Function Pointers, Anonymous Functions & std/sort.sb
+Test-CompileError "fnptr_call_non_fn" @"
+fn main() {
+    var x: i32 = 42
+    x(10)
+}
+"@ "'x' is not a function"
+
+Test-CompileError "fnptr_wrong_arg_count" @"
+fn add(a: i32, b: i32): i32 { return a + b }
+fn main() {
+    var f: fn(i32, i32): i32 = add
+    print(f(1))
+}
+"@ "expects 2 argument(s), got 1"
+
+Test-CompileError "fnptr_type_mismatch" @"
+fn add(a: i32, b: i32): i32 { return a + b }
+fn main() {
+    var f: fn(i64): i64 = add
+}
+"@ "type mismatch: expected 'fn(i64):i64', got 'fn(i32,i32):i32'"
+
+Test-CompileError "anon_fn_no_capture" @"
+fn main() {
+    var outer: i32 = 10
+    var f = fn(x: i32): i32 { return x + outer }
+    print(f(5))
+}
+"@ "undeclared identifier 'outer'"
+
+Test-RunTrap "fnptr_null_call_trap" @"
+fn main() {
+    var f: fn(i32): i32 = null
+    print(f(42))
+}
+"@ "null function pointer call"
+
+$phase14_code = @"
+import "std/sort.sb"
+
+fn add(a: i64, b: i64): i64 { return a + b }
+fn mul(a: i64, b: i64): i64 { return a * b }
+
+struct Handler {
+    name: str
+    op: fn(i64, i64): i64
+}
+
+fn choose_op(is_mul: bool): fn(i64, i64): i64 {
+    if is_mul {
+        return mul
+    }
+    return add
+}
+
+fn fold[T](s: []T, init: T, combine: fn(T, T): T): T {
+    var acc = init
+    loop v in s {
+        acc = combine(acc, v)
+    }
+    return acc
+}
+
+struct Player {
+    name: str
+    score: i32
+}
+
+fn main() {
+    // 1. Function pointer variables, equality with null, and returning function pointers
+    var fp: fn(i64, i64): i64 = null
+    print(fp == null)
+    fp = choose_op(false)
+    print(fp != null)
+    print(fp == add)
+    print(fp(15, 27))
+    print(choose_op(true)(6, 7))
+
+    // 2. Function pointers inside structs and fixed arrays
+    var h = Handler { name: "adder", op: add }
+    print(h.name)
+    print(h.op(100, 23))
+
+    var ops: [2]fn(i64, i64): i64 = [add, mul]
+    print(ops[0](10, 5))
+    print(ops[1](10, 5))
+
+    // 3. Stateless anonymous functions (`fn(...) { ... }`) & generic higher-order functions
+    var vals: [5]i64 = [1, 2, 3, 4, 5]
+    var sum = fold(vals, 0, fn(acc: i64, x: i64): i64 { return acc + x })
+    var prod = fold(vals, 1, fn(acc: i64, x: i64): i64 { return acc * x })
+    print(sum)
+    print(prod)
+
+    // 4. Standard generic sorting & binary search (`std/sort.sb`)
+    var nums: [10]i32 = [42, 7, 19, -5, 100, 3, 42, 0, 88, 12]
+    print(is_sorted(nums))
+    sort(nums)
+    print(is_sorted(nums))
+    print(nums[0])
+    print(nums[4])
+    print(nums[9])
+
+    print(binary_search(nums, 19))
+    print(binary_search(nums, 999))
+
+    // Custom comparator sort (descending order) using anonymous function
+    sort_by(nums, fn(a: i32, b: i32): bool { return a > b })
+    print(is_sorted_by(nums, fn(a: i32, b: i32): bool { return a > b }))
+    print(nums[0])
+    print(nums[9])
+
+    reverse(nums)
+    print(is_sorted(nums))
+
+    // Sorting structs by field using `sort_by` + anonymous function
+    var players: [4]Player = [
+        Player { name: "Bob", score: 120 },
+        Player { name: "Alice", score: 350 },
+        Player { name: "Dave", score: 90 },
+        Player { name: "Carol", score: 240 }
+    ]
+    sort_by(players, fn(a: Player, b: Player): bool { return a.score > b.score })
+    print(players[0].name)
+    print(players[1].name)
+    print(players[2].name)
+    print(players[3].name)
+}
+"@
+$phase14_expected = "true`ntrue`ntrue`n42`n42`nadder`n123`n15`n50`n15`n120`nfalse`ntrue`n-5`n12`n100`n5`n-1`ntrue`n100`n-5`ntrue`nAlice`nCarol`nBob`nDave"
+
+Test-RunOk "phase14_fnptr_and_sort" $phase14_code $phase14_expected
+Test-RunLlvm "phase14_fnptr_and_sort_llvm" $phase14_code $phase14_expected
+
 Write-Host "`nAll tests passed."

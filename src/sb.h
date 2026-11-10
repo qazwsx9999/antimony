@@ -113,7 +113,7 @@ typedef struct Node Node;
 
 typedef enum {
     TY_VOID, TY_BOOL, TY_INT, TY_FLOAT, TY_STR, TY_UNTYPED_INT, TY_UNTYPED_FLOAT,
-    TY_ARRAY, TY_SLICE, TY_PTR, TY_NULL, TY_STRUCT, TY_ENUM
+    TY_ARRAY, TY_SLICE, TY_PTR, TY_NULL, TY_STRUCT, TY_ENUM, TY_FN
 } TypeKind;
 
 typedef struct {
@@ -132,10 +132,11 @@ typedef struct Type {
     bool is_signed;
     bool is_tagged;    // TY_ENUM: true if any variant carries a payload
     int payload_offset;// TY_ENUM: byte offset of union payload when is_tagged
-    struct Type *elem; // TY_ARRAY / TY_SLICE / TY_PTR element type
+    struct Type *elem; // TY_ARRAY / TY_SLICE / TY_PTR element type, or TY_FN return type
     int array_len;     // TY_ARRAY element count
     Node *decl;        // TY_STRUCT / TY_ENUM: AST declaration node
     VEC(StructField) fields; // TY_STRUCT fields or TY_ENUM variants
+    VEC(struct Type *) params; // TY_FN parameter types
     int state;         // TY_STRUCT / TY_ENUM layout state: 0=unresolved, 1=in-progress, 2=done
 } Type;
 
@@ -318,6 +319,7 @@ void x_store8_imm(int base, int32_t disp, uint8_t imm);
 void x_load_rip(int dst, int sec, uint32_t off);
 void x_store_rip(int sec, uint32_t off, int src);
 void x_lea_rip(int dst, int sec, uint32_t off);
+void x_lea_label(int dst, int label);
 void x_lea(int dst, int base, int32_t disp);
 void x_rep_stosb(void);
 void x_alu_rr(int alu, int w, int dst, int src);
@@ -341,6 +343,7 @@ void x_setcc(int cc, int r);
 void x_jmp(int label);
 void x_jcc(int cc, int label);
 void x_call(int label);
+void x_call_reg(int reg);
 void x_call_import(int imp);
 void x_push(int r);
 void x_pop(int r);

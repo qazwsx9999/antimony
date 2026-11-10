@@ -178,6 +178,16 @@ void x_lea_rip(int dst, int sec, uint32_t off) {
     rip_rel(dst, sec, off, 0);
 }
 
+void x_lea_label(int dst, int label) {
+    emit_rex(1, dst, 0, 0);
+    emit8(0x8D);
+    modrm(0, dst, 5); // [RIP + disp32]
+    uint32_t pos = x_here();
+    emit32(0);
+    LabelFixup fx = {pos, label};
+    vec_push(A.fixups, fx);
+}
+
 void x_lea(int dst, int base, int32_t disp) {
     emit_rex(1, dst, 0, base);
     emit8(0x8D);
@@ -327,6 +337,12 @@ void x_jcc(int cc, int label) {
 void x_call(int label) {
     emit8(0xE8);
     emit_rel32_to(label);
+}
+
+void x_call_reg(int reg) {
+    if (reg >= 8) emit8(0x41);
+    emit8(0xFF);
+    modrm(3, 2, reg);
 }
 
 void x_call_import(int imp) {

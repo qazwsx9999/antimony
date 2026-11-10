@@ -808,9 +808,98 @@ fn main() {
 
 ---
 
-## 13. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
+## 13. First-Class Function Pointers, Anonymous Functions & Sorting (`std/sort.sb`)
 
-### 13.1 Splitting Code Across Files (`import`)
+### 13.1 First-Class Function Pointer Types (`fn(T1, T2): R`)
+Functions in Antimony are first-class values with zero-cost 8-byte code-pointer representation (`fn(ParamTypes...): ReturnType`, or `fn(ParamTypes...)` for `void` functions). You can store function pointers in variables, struct fields, arrays, or slices, compare them with `null` or other function pointers (`==`, `!=`), pass them to higher-order functions, and return them from functions. Calling a `null` function pointer traps in debug mode with `"null function pointer call"`:
+
+```
+fn add(a: i64, b: i64): i64 { return a + b }
+fn mul(a: i64, b: i64): i64 { return a * b }
+
+struct Command {
+    name: str
+    action: fn(i64, i64): i64
+}
+
+fn pick_op(multiply: bool): fn(i64, i64): i64 {
+    if multiply {
+        return mul
+    }
+    return add
+}
+
+fn main() {
+    var op: fn(i64, i64): i64 = pick_op(false)
+    print(op(10, 20))               // 30
+    print(pick_op(true)(6, 7))      // 42
+
+    var cmd = Command { name: "sum", action: add }
+    print(cmd.action(100, 50))      // 150
+}
+```
+
+### 13.2 Stateless Anonymous Functions (`fn(a: T, b: T): R { ... }`)
+Write inline anonymous function literals anywhere a function pointer is expected. To keep Antimony 100% zero-cost with no hidden heap allocations or closure environments, anonymous functions are **stateless** (they cannot capture local variables from enclosing functions; pass any state explicitly as parameters):
+
+```
+fn fold[T](s: []T, init: T, combine: fn(T, T): T): T {
+    var acc = init
+    loop v in s {
+        acc = combine(acc, v)
+    }
+    return acc
+}
+
+fn main() {
+    var nums: [5]i64 = [1, 2, 3, 4, 5]
+    var sum  = fold(nums, 0, fn(acc: i64, x: i64): i64 { return acc + x })
+    var prod = fold(nums, 1, fn(acc: i64, x: i64): i64 { return acc * x })
+    print(sum)      // 15
+    print(prod)     // 120
+}
+```
+
+### 13.3 Generic Sorting & Binary Search (`std/sort.sb`)
+Import `"std/sort.sb"` for in-place generic sorting (median-of-three quicksort + insertion sort hybrid), custom comparator sorting, slice reversal, and binary search:
+- `sort[T](s: []T)` / `sort_desc[T](s: []T)` — sort any ordered slice in ascending or descending order.
+- `sort_by[T](s: []T, less: fn(T, T): bool)` — sort any slice (including structs!) using a custom comparator `less(a, b)`.
+- `is_sorted[T](s: []T): bool` / `is_sorted_by[T](s: []T, less: fn(T, T): bool): bool` — check whether a slice is sorted.
+- `binary_search[T](s: []T, target: T): i64` / `binary_search_by[T](s: []T, target: T, cmp: fn(T, T): i32): i64` — return matching index in `0..len(s)` or `-1`.
+- `reverse[T](s: []T)` — reverse a slice in-place.
+
+```
+import "std/sort.sb"
+
+struct Player {
+    name: str
+    score: i32
+}
+
+fn main() {
+    var data: [6]i32 = [42, 7, 19, -5, 100, 3]
+    sort(data)
+    print(is_sorted(data))                      // true
+    print(binary_search(data, 19))              // 3
+
+    var players: [3]Player = [
+        Player { name: "Bob", score: 120 },
+        Player { name: "Alice", score: 350 },
+        Player { name: "Carol", score: 240 }
+    ]
+    // Sort players by descending score using an anonymous function
+    sort_by(players, fn(a: Player, b: Player): bool { return a.score > b.score })
+    print(players[0].name)                      // Alice
+    print(players[1].name)                      // Carol
+    print(players[2].name)                      // Bob
+}
+```
+
+---
+
+## 14. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
+
+### 14.1 Splitting Code Across Files (`import`)
 Use `import "path.sb"` at the top level to include another Antimony source file (resolved relative to the importing file's directory). Imports are automatically deduplicated, so diamond or circular imports are safe:
 
 ```
@@ -831,7 +920,7 @@ fn main() {
 }
 ```
 
-### 13.2 Calling Windows DLLs Directly (`extern`)
+### 14.2 Calling Windows DLLs Directly (`extern`)
 Antimony emits imported functions directly into the PE32+ Import Table—no C compiler, header files, or `.lib` import libraries needed. You can declare a single `extern` function or group multiple imports from the same DLL:
 
 ```
@@ -855,9 +944,9 @@ fn main() {
 
 ---
 
-## 14. `defer`, `sizeof` / `alignof`, `ptr_cast`, and the Standard Library (`std/`)
+## 15. `defer`, `sizeof` / `alignof`, `ptr_cast`, and the Standard Library (`std/`)
 
-### 14.1 Scope-Based Cleanup (`defer`)
+### 15.1 Scope-Based Cleanup (`defer`)
 `defer` schedules a statement or `{ ... }` block to run in **reverse (LIFO) order** when the enclosing scope exits—whether at the end of a block, or via `return`, `break`, or `continue`. When `return expr` runs, `expr` is evaluated before the deferred cleanup statements execute:
 
 ```
@@ -875,7 +964,7 @@ fn process_buffer(n: usize): i32 {
 }
 ```
 
-### 14.2 `sizeof`, `alignof`, and `ptr_cast`
+### 15.2 `sizeof`, `alignof`, and `ptr_cast`
 - `sizeof(T)` and `alignof(T)` evaluate at compile time to the size and alignment in bytes of any type or expression (`sizeof(Vec2)`, `sizeof(*u8)`, `sizeof(my_array)`).
 - `ptr_cast(*T, expr)` converts a raw pointer (such as `*u8` returned from `alloc`) or 64-bit integer address into `*T` with zero runtime overhead:
 
@@ -898,11 +987,12 @@ fn main() {
 }
 ```
 
-### 14.3 Standard Library Modules (`std/`)
+### 15.3 Standard Library Modules (`std/`)
 Antimony ships with native standard library modules in `std/` that you can import from any directory:
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `realloc_mem`, `free_mem`, `copy_mem`, `set_mem`, `cmp_mem`) and fast bump-pointer `Arena` (`arena_init`, `arena_alloc`, `arena_reset`, `arena_free`).
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `pop`, `get`, `set`, `as_slice`, `clear`, `free`).
 - `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `free`) and `Option[T]` (`.Some(T)` / `.None`).
+- `import "std/sort.sb"` — Generic sorting and slice algorithms (`sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, `reverse[T]`).
 - `import "std/io.sb"` — Native Win32 file I/O (`write_file_str`, `write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
 - `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification (`is_digit`, `is_alpha`, `is_space`), `str` helpers (`str_starts_with`, `str_ends_with`, `str_trim`, `str_find_byte`, `str_parse_i64`, `parse_i64`), and the growable `StringBuilder` (`init`, `append`, `append_byte`, `append_i64`, `as_str`, `cstr`, `clear`, `free`).
@@ -910,7 +1000,7 @@ Antimony ships with native standard library modules in `std/` that you can impor
 
 ---
 
-## 15. Built-in Functions
+## 16. Built-in Functions
 
 | Function | Description |
 |---|---|
@@ -925,7 +1015,7 @@ Antimony ships with native standard library modules in `std/` that you can impor
 
 ---
 
-## 16. Complete Example Program
+## 17. Complete Example Program
 
 See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony, or try this prime-counting benchmark:
 

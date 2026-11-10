@@ -384,7 +384,13 @@ static Type *resolve_type_str(Checker *c, const char *str, Pos pos) {
     return t;
 }
 
+static Type *make_fn_type(TypeVec *params, Type *ret, Pos pos);
+static Type *resolve_fn_type_str(Checker *c, const char *name, Pos pos);
+
 static Type *resolve_type(Checker *c, const char *name, Pos pos) {
+    if (strncmp(name, "fn(", 3) == 0) {
+        return resolve_fn_type_str(c, name, pos);
+    }
     Symbol *s = lookup_in(c->global, name);
     if (!s && strchr(name, '[')) {
         s = instantiate_generic_type(c, name, pos);
@@ -398,6 +404,87 @@ static Type *resolve_type(Checker *c, const char *name, Pos pos) {
 static VEC(Type *) array_types;
 static VEC(Type *) slice_types;
 static VEC(Type *) ptr_types;
+static VEC(Type *) fn_types;
+
+static Type *make_fn_type(TypeVec *params, Type *ret, Pos pos) {
+    (void)pos;
+    for (int i = 0; i < fn_types.len; i++) {
+        Type *t = fn_types.items[i];
+        if (t->elem != ret || t->params.len != params->len) continue;
+        bool match = true;
+        for (int j = 0; j < params->len; j++) {
+            if (t->params.items[j] != params->items[j]) { match = false; break; }
+        }
+        if (match) return t;
+    }
+    Buf b = {0};
+    buf_bytes(&b, "fn(", 3);
+    for (int j = 0; j < params->len; j++) {
+        if (j > 0) buf_u8(&b, ',');
+        buf_bytes(&b, params->items[j]->name, strlen(params->items[j]->name));
+    }
+    buf_u8(&b, ')');
+    if (ret && ret != &ty_void) {
+        buf_u8(&b, ':');
+        buf_bytes(&b, ret->name, strlen(ret->name));
+    }
+    const char *canon = intern((const char *)b.data, (int)b.len);
+    free(b.data);
+
+    Type *t = xcalloc(1, sizeof(Type));
+    t->kind = TY_FN;
+    t->name = canon;
+    t->elem = ret ? ret : &ty_void;
+    t->size = 8;
+    t->align = 8;
+    for (int j = 0; j < params->len; j++) {
+        vec_push(t->params, params->items[j]);
+    }
+    vec_push(fn_types, t);
+    return t;
+}
+
+static Type *resolve_fn_type_str(Checker *c, const char *name, Pos pos) {
+    const char *p = name + 3; // after "fn("
+    int depth = 1;
+    const char *rparen = NULL;
+    for (const char *cur = p; *cur; cur++) {
+        if (*cur == '(') depth++;
+        else if (*cur == ')') {
+            depth--;
+            if (depth == 0) { rparen = cur; break; }
+        }
+    }
+    if (!rparen) fatal(pos, "malformed function type '%s'", name);
+    TypeVec params = {0};
+    const char *seg = p;
+    int bdepth = 0;
+    for (const char *cur = p; cur <= rparen; cur++) {
+        if (cur == rparen || (*cur == ',' && bdepth == 0)) {
+            while (seg < cur && (*seg == ' ' || *seg == '\t')) seg++;
+            const char *end = cur;
+            while (end > seg && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            if (end > seg) {
+                const char *ps = intern(seg, (int)(end - seg));
+                vec_push(params, resolve_type_str(c, ps, pos));
+            }
+            seg = cur + 1;
+        } else if (*cur == '[' || *cur == '(') {
+            bdepth++;
+        } else if (*cur == ']' || *cur == ')') {
+            bdepth--;
+        }
+    }
+    Type *ret = &ty_void;
+    if (rparen[1] == ':') {
+        ret = resolve_type_str(c, rparen + 2, pos);
+    } else if (rparen[1] != '\0') {
+        fatal(pos, "malformed function type '%s'", name);
+    }
+    Type *ft = make_fn_type(&params, ret, pos);
+    free(params.items);
+    return ft;
+}
 
 static Type *make_ptr_type(Type *elem, Pos pos) {
     if (elem == &ty_void || elem->kind == TY_SLICE) {
@@ -610,6 +697,43 @@ static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk
             return;
         }
     }
+    if (strncmp(pat_str, "fn(", 3) == 0 && arg_t->kind == TY_FN) {
+        const char *p = pat_str + 3;
+        int depth = 1;
+        const char *rparen = NULL;
+        for (const char *cur = p; *cur; cur++) {
+            if (*cur == '(') depth++;
+            else if (*cur == ')') {
+                depth--;
+                if (depth == 0) { rparen = cur; break; }
+            }
+        }
+        if (rparen) {
+            StrVec p_args = {0};
+            const char *seg = p;
+            int bdepth = 0;
+            for (const char *cur = p; cur <= rparen; cur++) {
+                if (cur == rparen || (*cur == ',' && bdepth == 0)) {
+                    while (seg < cur && (*seg == ' ' || *seg == '\t')) seg++;
+                    const char *end = cur;
+                    while (end > seg && (end[-1] == ' ' || end[-1] == '\t')) end--;
+                    if (end > seg) vec_push(p_args, intern(seg, (int)(end - seg)));
+                    seg = cur + 1;
+                } else if (*cur == '[' || *cur == '(') bdepth++;
+                else if (*cur == ']' || *cur == ')') bdepth--;
+            }
+            if (p_args.len == arg_t->params.len) {
+                for (int k = 0; k < p_args.len; k++) {
+                    unify_type_pattern(p_args.items[k], 0, DECL_SCALAR, arg_t->params.items[k], tparams, inferred);
+                }
+            }
+            free(p_args.items);
+            if (rparen[1] == ':' && arg_t->elem) {
+                unify_type_pattern(rparen + 2, 0, DECL_SCALAR, arg_t->elem, tparams, inferred);
+            }
+        }
+        return;
+    }
     const char *pat_base = NULL, *arg_base = NULL;
     StrVec pat_args = {0}, arg_args = {0};
     if (split_generic_name(p_intern, &pat_base, &pat_args) &&
@@ -739,7 +863,7 @@ static Type *try_resolve_type_arg(Checker *c, Node *arg) {
         }
     }
     if (cur && cur->kind == N_IDENT) {
-        if (cur->name[0] == '*' || cur->name[0] == '[') {
+        if (cur->name[0] == '*' || cur->name[0] == '[' || strncmp(cur->name, "fn(", 3) == 0) {
             Type *t = resolve_type_str(c, cur->name, cur->pos);
             for (int i = 0; i < ptr_depth; i++) {
                 t = make_ptr_type(t, arg->pos);
@@ -935,8 +1059,8 @@ static void coerce(Node *n, Type *target) {
         n->implicit_slice = true;
         return;
     }
-    // `null` coerces to any pointer type `*T`.
-    if (target->kind == TY_PTR && n->type == &ty_null) {
+    // `null` coerces to any pointer type `*T` or function pointer type `fn(...): ...`.
+    if ((target->kind == TY_PTR || target->kind == TY_FN) && n->type == &ty_null) {
         n->type = target;
         return;
     }
@@ -1387,11 +1511,72 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         return;
     }
 
+    case N_FN: {
+        // Stateless anonymous function literal: `fn(a: i32, b: i32): bool { return a < b }`
+        static int anon_fn_counter = 0;
+        char aname[64];
+        int alen = snprintf(aname, sizeof(aname), "__anon_fn_%d", ++anon_fn_counter);
+        const char *canon = intern(aname, alen);
+        n->name = canon;
+
+        Type *ret = n->type_name ? resolve_decl_type(c, n) : &ty_void;
+        if (ret->kind == TY_ARRAY) {
+            fatal(n->type_pos, "returning fixed-size array '%s' by value is not allowed", ret->name);
+        }
+        TypeVec ptypes = {0};
+        for (int j = 0; j < n->list.len; j++) {
+            Node *p = n->list.items[j];
+            p->type = resolve_decl_type(c, p);
+            vec_push(ptypes, p->type);
+        }
+        Type *fn_t = make_fn_type(&ptypes, ret, n->pos);
+        free(ptypes.items);
+
+        Scope *saved_cur = c->cur;
+        c->cur = c->global;
+        Symbol *s = define(c, SYM_FN, canon, ret, n->pos);
+        s->decl = n;
+        n->sym  = s;
+        n->type = ret;
+        if (c->prog) vec_push(c->prog->fns, n);
+        c->cur = saved_cur;
+
+        Node *ref = xcalloc(1, sizeof(Node));
+        *ref = *n;
+        n->kind = N_IDENT;
+        n->name = canon;
+        n->sym  = s;
+        n->type = fn_t;
+        n->body = NULL;
+        n->list.items = NULL;
+        n->list.len = 0;
+        n->list.cap = 0;
+        s->decl = ref;
+        if (c->prog) c->prog->fns.items[c->prog->fns.len - 1] = ref;
+        if (expected) coerce(n, expected);
+        return;
+    }
+
     case N_IDENT: {
         Symbol *s = lookup(c, n->name);
         if (!s) fatal(n->pos, "undeclared identifier '%s'", n->name);
-        if (s->kind == SYM_TYPE || s->kind == SYM_FN || s->kind == SYM_BUILTIN) {
+        if (s->kind == SYM_TYPE || s->kind == SYM_BUILTIN) {
             fatal(n->pos, "'%s' is not a value", n->name);
+        }
+        if (s->kind == SYM_FN) {
+            if (s->is_extern) {
+                fatal(n->pos, "cannot take function pointer to extern DLL function '%s' directly (wrap it in an Antimony 'fn')", n->name);
+            }
+            Node *fn = s->decl;
+            TypeVec ptypes = {0};
+            for (int i = 0; i < fn->list.len; i++) {
+                vec_push(ptypes, fn->list.items[i]->type);
+            }
+            n->sym  = s;
+            n->type = make_fn_type(&ptypes, s->type, n->pos);
+            free(ptypes.items);
+            if (expected) coerce(n, expected);
+            return;
         }
         if (s->kind == SYM_CONST && s->is_global && s->state != 2) {
             resolve_global_const(c, s);
@@ -1533,11 +1718,12 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             return;
         }
 
-        // Pointer comparisons (`p == null`, `p != q`, `p < q`, ...).
-        if (is_cmp && (n->lhs->type->kind == TY_PTR || n->rhs->type->kind == TY_PTR)) {
-            if (n->lhs->type == &ty_null && n->rhs->type->kind == TY_PTR) {
+        // Pointer / function-pointer comparisons (`p == null`, `p != q`, `p < q`, ...).
+        if (is_cmp && (n->lhs->type->kind == TY_PTR || n->rhs->type->kind == TY_PTR ||
+                       n->lhs->type->kind == TY_FN  || n->rhs->type->kind == TY_FN)) {
+            if (n->lhs->type == &ty_null && (n->rhs->type->kind == TY_PTR || n->rhs->type->kind == TY_FN)) {
                 coerce(n->lhs, n->rhs->type);
-            } else if (n->rhs->type == &ty_null && n->lhs->type->kind == TY_PTR) {
+            } else if (n->rhs->type == &ty_null && (n->lhs->type->kind == TY_PTR || n->lhs->type->kind == TY_FN)) {
                 coerce(n->rhs, n->lhs->type);
             } else if (n->lhs->type != n->rhs->type) {
                 fatal(n->pos, "cannot compare different pointer types '%s' and '%s'",
@@ -1697,8 +1883,35 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             return;
         }
 
-        // Method call `recv.method(...)` OR explicit payload enum variant `EnumName.Variant(arg)`
+        // Method call `recv.method(...)`, explicit payload enum variant `EnumName.Variant(arg)`,
+        // OR indirect call through a struct field or expression `s.cb(arg)` / `(get_cb())(arg)`.
         if (n->lhs) {
+            if (!n->name) {
+                check_expr(c, n->lhs, NULL);
+                Type *ft = n->lhs->type;
+                if (ft->kind != TY_FN) {
+                    fatal(n->pos, "cannot call non-function type '%s'", ft->name);
+                }
+                if (n->list.len != ft->params.len) {
+                    fatal(n->pos, "function pointer '%s' expects %d argument(s), got %d",
+                          ft->name, ft->params.len, n->list.len);
+                }
+                for (int i = 0; i < n->list.len; i++) {
+                    check_expr(c, n->list.items[i], ft->params.items[i]);
+                }
+                n->sym  = NULL;
+                n->type = ft->elem;
+                if (is_aggregate_type(n->type) && c->cur_fn) {
+                    n->slot_start = alloc_slots_bytes(c, n->type->size);
+                }
+                if (expected) {
+                    if (n->type == &ty_void) {
+                        fatal(n->pos, "function pointer '%s' returns no value", ft->name);
+                    }
+                    coerce(n, expected);
+                }
+                return;
+            }
             if (n->lhs->kind == N_IDENT) {
                 Symbol *vs = lookup(c, n->lhs->name);
                 if (!vs && strchr(n->lhs->name, '[')) {
@@ -1762,6 +1975,42 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 ms = instantiate_generic_method(c, base_t, n->name, n->pos);
             }
             if (!ms || ms->kind != SYM_FN) {
+                // Check if `base_t` is a struct with a function-pointer field named `n->name`!
+                if (base_t->kind == TY_STRUCT) {
+                    if (base_t->state != 2) layout_struct(c, base_t);
+                    StructField *sf = find_field(base_t, n->name);
+                    if (sf && sf->type->kind == TY_FN) {
+                        Node *fa = xcalloc(1, sizeof(Node));
+                        fa->kind = N_FIELD;
+                        fa->pos  = n->pos;
+                        fa->lhs  = n->lhs;
+                        fa->name = n->name;
+                        fa->type = sf->type;
+                        fa->field_offset = sf->offset;
+                        Type *ft = sf->type;
+                        if (n->list.len != ft->params.len) {
+                            fatal(n->pos, "function pointer field '%s.%s' ('%s') expects %d argument(s), got %d",
+                                  base_t->name, n->name, ft->name, ft->params.len, n->list.len);
+                        }
+                        for (int i = 0; i < n->list.len; i++) {
+                            check_expr(c, n->list.items[i], ft->params.items[i]);
+                        }
+                        n->lhs  = fa;
+                        n->name = NULL;
+                        n->sym  = NULL;
+                        n->type = ft->elem;
+                        if (is_aggregate_type(n->type) && c->cur_fn) {
+                            n->slot_start = alloc_slots_bytes(c, n->type->size);
+                        }
+                        if (expected) {
+                            if (n->type == &ty_void) {
+                                fatal(n->pos, "function pointer '%s' returns no value", ft->name);
+                            }
+                            coerce(n, expected);
+                        }
+                        return;
+                    }
+                }
                 fatal(n->pos, "type '%s' has no method named '%s'", base_t->name, n->name);
             }
 
@@ -2012,6 +2261,41 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         }
 
         if (s->kind != SYM_FN) {
+            if ((s->kind == SYM_VAR || s->kind == SYM_PARAM) && s->type && s->type->kind == TY_FN) {
+                if (s->kind == SYM_VAR && !s->is_global && s->var_index >= 0) {
+                    if (!(c->assigned & (1ULL << s->var_index))) {
+                        fatal(n->pos, "variable '%s' may be read before it is assigned", n->name);
+                    }
+                }
+                Type *ft = s->type;
+                if (n->list.len != ft->params.len) {
+                    fatal(n->pos, "function pointer '%s' ('%s') expects %d argument(s), got %d",
+                          n->name, ft->name, ft->params.len, n->list.len);
+                }
+                for (int i = 0; i < n->list.len; i++) {
+                    check_expr(c, n->list.items[i], ft->params.items[i]);
+                }
+                Node *id_node = xcalloc(1, sizeof(Node));
+                id_node->kind = N_IDENT;
+                id_node->pos  = n->pos;
+                id_node->name = n->name;
+                id_node->sym  = s;
+                id_node->type = ft;
+                n->lhs  = id_node;
+                n->name = NULL;
+                n->sym  = NULL;
+                n->type = ft->elem;
+                if (is_aggregate_type(n->type) && c->cur_fn) {
+                    n->slot_start = alloc_slots_bytes(c, n->type->size);
+                }
+                if (expected) {
+                    if (n->type == &ty_void) {
+                        fatal(n->pos, "function pointer '%s' returns no value", n->name);
+                    }
+                    coerce(n, expected);
+                }
+                return;
+            }
             fatal(n->pos, "'%s' is not a function", n->name);
         }
         Node *fn = s->decl;

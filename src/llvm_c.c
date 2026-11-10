@@ -22,6 +22,7 @@ typedef struct {
     Type *cur_ret_type;
     VEC(Node *) defers;
     VEC(Type *) slice_types;
+    VEC(Type *) fn_types;
 } OptGen;
 
 static void bprintf(Buf *b, const char *fmt, ...) {
@@ -49,11 +50,23 @@ static void emit_mangled_ident(Buf *b, const char *prefix, const char *name) {
         if (*p == '.')      bprintf(b, "__");
         else if (*p == '[') bprintf(b, "_L_");
         else if (*p == ']') bprintf(b, "_R_");
+        else if (*p == '(') bprintf(b, "_LP_");
+        else if (*p == ')') bprintf(b, "_RP_");
+        else if (*p == ':') bprintf(b, "_RET_");
         else if (*p == ',') bprintf(b, "_C_");
         else if (*p == '*') bprintf(b, "_P_");
         else if (*p == ' ') continue;
         else                buf_u8(b, (uint8_t)*p);
     }
+}
+
+static int get_fn_type_id(OptGen *g, Type *t) {
+    for (int i = 0; i < g->fn_types.len; i++) {
+        if (g->fn_types.items[i] == t) return i;
+    }
+    int id = g->fn_types.len;
+    vec_push(g->fn_types, t);
+    return id;
 }
 
 static int get_slice_type_id(OptGen *g, Type *t) {
@@ -76,6 +89,12 @@ static void collect_slice_types_type(OptGen *g, Type *t) {
         get_slice_type_id(g, &slice_t);
     } else if (t->kind == TY_PTR) {
         collect_slice_types_type(g, t->elem);
+    } else if (t->kind == TY_FN) {
+        for (int i = 0; i < t->params.len; i++) {
+            collect_slice_types_type(g, t->params.items[i]);
+        }
+        collect_slice_types_type(g, t->elem);
+        get_fn_type_id(g, t);
     } else if (t->kind == TY_STRUCT || (t->kind == TY_ENUM && t->is_tagged)) {
         for (int i = 0; i < t->fields.len; i++) {
             if ((t->kind == TY_STRUCT || t->fields.items[i].has_payload) && t->fields.items[i].type) {
@@ -151,6 +170,11 @@ static void emit_c_type(OptGen *g, Buf *b, Type *t) {
         bprintf(b, "*");
         return;
     }
+    if (t->kind == TY_FN) {
+        int id = get_fn_type_id(g, t);
+        bprintf(b, "sb_fnptr_%d", id);
+        return;
+    }
     bprintf(b, "int64_t");
 }
 
@@ -178,7 +202,9 @@ static void emit_c_var_decl(OptGen *g, Buf *b, Type *t, const char *prefix, cons
 }
 
 static void emit_var_ref(Buf *b, Symbol *s) {
-    if (s->is_global) {
+    if (s->kind == SYM_FN) {
+        emit_mangled_ident(b, "sb_fn_", s->name);
+    } else if (s->is_global) {
         emit_mangled_ident(b, "sb_g_", s->name);
     } else {
         bprintf(b, "v%d_%s", s->slot, s->name);
@@ -873,7 +899,21 @@ static void opt_gen_expr(OptGen *g, Buf *b, Node *n) {
             bprintf(b, ").len)");
             return;
         }
-        if (n->sym->is_extern) {
+        if (!n->sym && n->lhs) {
+            if (!g->release) {
+                bprintf(b, "((");
+                emit_c_type(g, b, n->lhs->type);
+                bprintf(b, ")sb_chk_null((const void *)(");
+                opt_gen_expr(g, b, n->lhs);
+                bprintf(b, "), ");
+                emit_loc_str(b, n->pos, "null function pointer call");
+                bprintf(b, "))");
+            } else {
+                bprintf(b, "(");
+                opt_gen_expr(g, b, n->lhs);
+                bprintf(b, ")");
+            }
+        } else if (n->sym->is_extern) {
             emit_mangled_ident(b, "sb_ext_", n->sym->name);
         } else {
             emit_mangled_ident(b, "sb_fn_", n->sym->name);
@@ -882,7 +922,7 @@ static void opt_gen_expr(OptGen *g, Buf *b, Node *n) {
         for (int i = 0; i < n->list.len; i++) {
             if (i > 0) bprintf(b, ", ");
             Node *arg = n->list.items[i];
-            Type *pt = n->sym->decl->list.items[i]->type;
+            Type *pt = (!n->sym && n->lhs) ? n->lhs->type->params.items[i] : n->sym->decl->list.items[i]->type;
             if (pt->kind == TY_SLICE && arg->type->kind == TY_ARRAY) {
                 opt_gen_collection_slice(g, b, arg);
             } else if (pt->kind == TY_ARRAY) {
@@ -1473,12 +1513,27 @@ static void generate_opt_c_unit(Program *prog, NodeVec all_decls, bool release, 
         }
     }
 
-    // 3. Emit slice typedefs that do not depend on by-value structs, then structs, then remaining slices.
+    // 3. Forward-declare slice structs, emit function pointer typedefs, then define slice structs.
+    for (int i = 0; i < g.slice_types.len; i++) {
+        bprintf(&g.hdr, "typedef struct sb_slice_%d sb_slice_%d;\n", i, i);
+    }
+    for (int i = 0; i < g.fn_types.len; i++) {
+        Type *ft = g.fn_types.items[i];
+        bprintf(&g.hdr, "typedef ");
+        emit_c_type(&g, &g.hdr, ft->elem);
+        bprintf(&g.hdr, " (*sb_fnptr_%d)(", i);
+        if (ft->params.len == 0) bprintf(&g.hdr, "void");
+        for (int j = 0; j < ft->params.len; j++) {
+            if (j > 0) bprintf(&g.hdr, ", ");
+            emit_c_type(&g, &g.hdr, ft->params.items[j]);
+        }
+        bprintf(&g.hdr, ");\n");
+    }
     for (int i = 0; i < g.slice_types.len; i++) {
         Type *elem_t = g.slice_types.items[i];
-        bprintf(&g.hdr, "typedef struct { ");
+        bprintf(&g.hdr, "struct sb_slice_%d { ", i);
         emit_c_type(&g, &g.hdr, elem_t);
-        bprintf(&g.hdr, " *ptr; int64_t len; } sb_slice_%d;\n", i);
+        bprintf(&g.hdr, " *ptr; int64_t len; };\n");
     }
     bprintf(&g.hdr, "\n");
 
@@ -1636,6 +1691,7 @@ static void generate_opt_c_unit(Program *prog, NodeVec all_decls, bool release, 
     free(g.out.data);
     free(g.defers.items);
     free(g.slice_types.items);
+    free(g.fn_types.items);
     free(extern_fns.items);
 }
 

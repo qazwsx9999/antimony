@@ -145,6 +145,12 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
 - Generic function calls support both explicit type arguments (`max_val[i64](a, b)`) and type argument inference from value parameters (`max_val(a, b)`, `swap_val(&x, &y)`).
 - Standard generic collections are provided in `std/vec.sb` (`Vec[T]`) and `std/map.sb` (`HashMap[K, V]`, `Option[T]`).
 
+### 2.9 First-Class Function Pointers (`fn(T1, T2): R`) & Stateless Anonymous Functions
+- **Function Pointer Type:** `fn(T1, T2): R` (or `fn(T1, T2)` for `void` return) is an 8-byte code pointer (`TY_FN`). It may be stored in variables, struct fields, arrays, and slices, compared with `null` or another function pointer of identical signature (`==`, `!=`), passed as an argument, or returned from a function.
+- **Indirect Calls:** Any expression of type `fn(T1, ...): R` can be invoked directly (`fp(a, b)`, `s.cb(x)`, `ops[i](a, b)`). In `debug` mode, calling a `null` function pointer traps with `"null function pointer call"`.
+- **Stateless Anonymous Functions:** `fn(a: i32, b: i32): bool { return a < b }` defines an inline anonymous function and evaluates to its function pointer (`fn(i32, i32): bool`). Anonymous functions are stateless and cannot capture outer local variables (preserving zero hidden heap allocations).
+- **Standard Generic Sorting & Binary Search (`std/sort.sb`):** Provides `sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, and `reverse[T]`.
+
 ### 2.2 No implicit conversions
 Values of different types never mix implicitly. `i32 + i64` is a compile error. Conversions are explicit and use the target type name as a function:
 ```

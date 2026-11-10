@@ -73,7 +73,7 @@ static Node *parse_expr(Parser *p);
 static Node *parse_block(Parser *p);
 static Node *parse_stmt(Parser *p);
 
-// Parses a full type string inside `[...]` (e.g. `i32`, `*Point`, `[]u8`, `Result[i32,str]`).
+// Parses a full type string inside `[...]` or `fn(...)` (e.g. `i32`, `*Point`, `[]u8`, `Result[i32,str]`, `fn(i32,i32):bool`).
 static void parse_type_arg_buf(Parser *p, Buf *b) {
     skip_terms(p);
     while (cur(p)->kind == T_LBRACKET && peek(p, 1)->kind == T_RBRACKET) {
@@ -84,6 +84,33 @@ static void parse_type_arg_buf(Parser *p, Buf *b) {
     }
     while (match(p, T_STAR)) {
         buf_u8(b, '*');
+    }
+    if (match(p, T_FN)) {
+        buf_bytes(b, "fn(", 3);
+        expect(p, T_LPAREN);
+        skip_terms(p);
+        if (cur(p)->kind != T_RPAREN) {
+            for (int i = 0; ; i++) {
+                if (i > 0) buf_u8(b, ',');
+                skip_terms(p);
+                if (cur(p)->kind == T_IDENT && peek(p, 1)->kind == T_COLON) {
+                    next(p); // optional param name
+                    next(p); // ':'
+                }
+                parse_type_arg_buf(p, b);
+                skip_terms(p);
+                if (!match(p, T_COMMA)) break;
+                skip_terms(p);
+                if (cur(p)->kind == T_RPAREN) break;
+            }
+        }
+        expect(p, T_RPAREN);
+        buf_u8(b, ')');
+        if (match(p, T_COLON)) {
+            buf_u8(b, ':');
+            parse_type_arg_buf(p, b);
+        }
+        return;
     }
     Token *t = expect(p, T_IDENT);
     buf_bytes(b, t->name, strlen(t->name));
@@ -135,7 +162,8 @@ static bool looks_like_generic_type_args(Parser *p) {
             if (depth == 0) break;
         } else if (k == T_COMMA && depth == 1) {
             has_comma = true;
-        } else if (k != T_IDENT && k != T_STAR && k != T_COMMA && k != T_TERM) {
+        } else if (k != T_IDENT && k != T_STAR && k != T_COMMA && k != T_TERM &&
+                   k != T_FN && k != T_LPAREN && k != T_RPAREN && k != T_COLON) {
             return false;
         }
         idx++;
@@ -184,6 +212,14 @@ static const char *parse_type_spec(Parser *p, Pos *out_pos, DeclKind *dk, Node *
     }
     if (ptr_depth) *ptr_depth = stars;
     else if (stars > 0) fatal(cur(p)->pos, "pointer type is not allowed here");
+    if (cur(p)->kind == T_FN) {
+        if (out_pos) *out_pos = cur(p)->pos;
+        Buf b = {0};
+        parse_type_arg_buf(p, &b);
+        const char *res = intern((const char *)b.data, (int)b.len);
+        free(b.data);
+        return res;
+    }
     Token *t = expect(p, T_IDENT);
     if (out_pos) *out_pos = t->pos;
     if (cur(p)->kind == T_LBRACKET) {
@@ -360,6 +396,38 @@ static Node *parse_primary_base(Parser *p) {
         n->name = vid->name;
         return n;
     }
+    case T_FN: {
+        // Stateless anonymous function literal: `fn(a: i32, b: i32): bool { return a < b }`
+        next(p); // 'fn'
+        Node *fn = new_node(N_FN, t->pos);
+        expect(p, T_LPAREN);
+        skip_terms(p);
+        if (cur(p)->kind != T_RPAREN) {
+            for (;;) {
+                skip_terms(p);
+                Token *pid = expect(p, T_IDENT);
+                Node *param = new_node(N_PARAM, pid->pos);
+                param->name = pid->name;
+                parse_var_brackets(p, &param->decl_kind, &param->len_expr);
+                expect(p, T_COLON);
+                param->type_name = parse_type_spec(p, &param->type_pos, &param->decl_kind, &param->len_expr, &param->ptr_depth);
+                vec_push(fn->list, param);
+                skip_terms(p);
+                if (!match(p, T_COMMA)) break;
+                skip_terms(p);
+                if (cur(p)->kind == T_RPAREN) break;
+            }
+        }
+        expect(p, T_RPAREN);
+        if (match(p, T_COLON)) {
+            fn->type_name = parse_type_spec(p, &fn->type_pos, &fn->decl_kind, &fn->len_expr, &fn->ptr_depth);
+        }
+        bool saved_nsl = p->no_struct_lit;
+        p->no_struct_lit = false;
+        fn->body = parse_block(p);
+        p->no_struct_lit = saved_nsl;
+        return fn;
+    }
     default:
         fatal(t->pos, "expected expression, got %s", tok_name(t->kind));
     }
@@ -443,6 +511,29 @@ static Node *parse_primary(Parser *p) {
             Token *q = next(p);
             Node *n = new_node(N_TRY, q->pos);
             n->lhs = base;
+            base = n;
+            continue;
+        }
+        if (cur(p)->kind == T_LPAREN) {
+            Token *lp = next(p); // '('
+            Node *n = new_node(N_CALL, lp->pos);
+            n->lhs  = base;
+            n->name = NULL; // indirect call on expression `base`
+            bool saved_nsl = p->no_struct_lit;
+            p->no_struct_lit = false;
+            skip_terms(p);
+            if (cur(p)->kind != T_RPAREN) {
+                for (;;) {
+                    skip_terms(p);
+                    vec_push(n->list, parse_expr(p));
+                    skip_terms(p);
+                    if (!match(p, T_COMMA)) break;
+                    skip_terms(p);
+                    if (cur(p)->kind == T_RPAREN) break;
+                }
+            }
+            p->no_struct_lit = saved_nsl;
+            expect(p, T_RPAREN);
             base = n;
             continue;
         }
