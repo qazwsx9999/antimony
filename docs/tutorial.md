@@ -18,15 +18,26 @@ fn main() {
 Compile and run it with `sbc`:
 
 ```powershell
-# Compile and run immediately
+# Compile and run immediately (fast built-in native x64 backend, ~13ms compile time)
 .\sbc.exe hello.sb --run
 
-# Compile to hello.exe (debug mode: overflow checks enabled)
+# Compile to hello.exe (debug mode: overflow & null checks enabled)
 .\sbc.exe hello.sb -o hello.exe
 
 # Compile in release mode (wrapping arithmetic, smaller/faster binary)
 .\sbc.exe hello.sb --release -o hello.exe
+
+# Compile with the Optimizing / LLVM backend (-O3 vectorization & inlining)
+.\sbc.exe hello.sb --llvm -o hello.exe
+
+# Emit textual LLVM IR (.ll) for inspection
+.\sbc.exe hello.sb --emit-llvm -o hello.ll
 ```
+
+### Dual-Backend Architecture
+Antimony provides two backends out of the box:
+1. **Default Native x64 Backend (`sbc file.sb`):** Emits Windows `PE32+` `.exe` machine code directly in memory in **~13 milliseconds** with zero external dependencies—ideal for instant edit-compile-run iteration.
+2. **Optimizing / LLVM `-O3` Backend (`sbc file.sb --llvm` or `-O3`):** Applies full loop unrolling, function inlining, and auto-vectorization for maximum production runtime speed (matching or beating `gcc -O2`/`-O3` while preserving Antimony's exact debug overflow/bounds traps when `--release` is not passed).
 
 ### Core Syntax Rules
 - **No semicolons at the end of lines:** A newline ends a statement. Writing `;` at the end of a normal statement is a compile error.
@@ -623,11 +634,183 @@ fn classify_http(code: i32) {
 }
 ```
 
+### 11.3 Tagged Unions (Payload Enums) & Pattern Destructuring
+Enum variants can carry typed payloads—scalars, `str`, pointers, or structs—turning the `enum` into a type-safe **tagged union** (`4`-byte tag + naturally aligned union payload).
+- **Constructing variants:** Use `EnumName.Variant(val)` or, when the expected enum type is known (variable type annotation, `return`, function argument, or `match` arm), the inferred shorthand `.Variant(val)` / `.Variant`.
+- **Destructuring in `match`:** Bind a variant's payload to a read-only local variable with `.Variant(name) { ... }` or `EnumName.Variant(name) { ... }`.
+
+```
+struct Point {
+    x: i32
+    y: i32
+}
+
+enum Shape {
+    Circle(i32)
+    Rect(Point)
+    Label(str)
+    Empty
+}
+
+fn area_or_len(s: Shape): i32 {
+    match s {
+        .Circle(r)   { return r * r * 3 }
+        .Rect(pt)    { return pt.x * pt.y }
+        .Label(text) { return i32(len(text)) }
+        .Empty       { return 0 }
+    }
+}
+
+fn main() {
+    var c: Shape = .Circle(5)
+    var r = Shape.Rect(Point { x: 4, y: 10 })
+    print(area_or_len(c))       // 75
+    print(area_or_len(r))       // 40
+}
+```
+
+### 11.4 Error & Optional Propagation with `?` (`Result` and `Option`)
+Any tagged union with `.Ok(T)` + `.Err(E)` variants (or `.Some(T)` + `.None` variants) supports the postfix `?` operator (`expr?`):
+- If `expr` is `.Ok(v)` (or `.Some(v)`), `expr?` unwraps and evaluates to `v`.
+- If `expr` is `.Err(e)` (or `.None`), `expr?` executes any active `defer` blocks in LIFO order and immediately returns `.Err(e)` (or `.None`) from the enclosing function.
+
+```
+enum ParseRes {
+    Ok(i32)
+    Err(str)
+}
+
+fn parse_digit(b: u8): ParseRes {
+    if b < 48 || b > 57 {
+        return .Err("not a decimal digit")
+    }
+    return .Ok(i32(b - 48))
+}
+
+fn parse_two_digits(s: str): ParseRes {
+    if len(s) != 2 {
+        return .Err("expected 2 characters")
+    }
+    var hi = parse_digit(s[0])?     // returns .Err early if s[0] is invalid
+    var lo = parse_digit(s[1])?     // returns .Err early if s[1] is invalid
+    return .Ok(hi * 10 + lo)
+}
+```
+
 ---
 
-## 12. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
+## 12. Compile-Time Generics (`[T]`) & Standard Collections (`Vec[T]`, `HashMap[K, V]`)
 
-### 12.1 Splitting Code Across Files (`import`)
+### 12.1 Generic Structs, Enums, and Methods
+Declare type parameters inside square brackets `[T]` or `[K, V]` on any `struct`, `enum`, function, or method. Antimony **monomorphizes** generics at compile time into specialized machine code for each concrete type combination—zero boxing, zero vtables, and zero runtime overhead:
+
+```
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+
+fn (p: Pair[A, B]) swap(): Pair[B, A] {
+    return Pair[B, A] { first: p.second, second: p.first }
+}
+
+enum Result[T, E] {
+    Ok(T)
+    Err(E)
+}
+
+fn main() {
+    var p = Pair[i32, str] { first: 1, second: "one" }
+    var sw = p.swap()
+    print(sw.first)     // one
+    print(sw.second)    // 1
+}
+```
+
+### 12.2 Generic Functions & Type Argument Inference
+Generic functions can be called either with explicit type arguments (`max_val[i64](10, 20)`) or with **automatic type inference** from the value arguments (`max_val(10, 20)`, `swap_val(&x, &y)`):
+
+```
+fn max_val[T](a: T, b: T): T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn swap_val[T](a: *T, b: *T) {
+    var tmp = *a
+    *a = *b
+    *b = tmp
+}
+
+fn main() {
+    print(max_val(42, 99))          // T inferred as i32 -> 99
+    print(max_val[i64](100, 250))   // explicit T = i64  -> 250
+
+    var s1 = "first"
+    var s2 = "second"
+    swap_val(&s1, &s2)              // T inferred as str from *str
+    print(s1)                       // second
+}
+```
+
+### 12.3 Generic Dynamic Array (`Vec[T]` in `std/vec.sb`)
+Import `"std/vec.sb"` to use `Vec[T]`, a heap-backed growable array that works with any element type (`i64`, `str`, structs, pointers, or enums):
+
+```
+import "std/vec.sb"
+
+fn main() {
+    var words: Vec[str]
+    words.init(4)
+    defer words.free()
+
+    words.push("Antimony")
+    words.push("Systems")
+    words.push("Language")
+
+    print(words.len)                // 3
+    loop w in words.as_slice() {
+        print(w)
+    }
+    var last = words.pop()
+    print(last)                     // Language
+}
+```
+
+### 12.4 Generic Hash Table (`HashMap[K, V]` & `Option[T]` in `std/map.sb`)
+Import `"std/map.sb"` to use `HashMap[K, V]` (open-addressing hash table with FNV-1a hashing and linear probing) and `Option[T]` (`.Some(T)` / `.None`). `HashMap` supports `str` keys (hashed and compared by character content, even across string slices!) as well as integer, pointer, and enum keys:
+
+```
+import "std/map.sb"
+
+fn main() {
+    var scores: HashMap[str, i64]
+    scores.init(8)
+    defer scores.free()
+
+    scores.put("alice", 100)
+    scores.put("bob", 250)
+
+    print(scores.contains("alice"))         // true
+    print(scores.get_or("charlie", 0))      // 0
+
+    match scores.get("bob") {
+        .Some(v) { print(v) }               // 250
+        .None    { print(-1) }
+    }
+
+    scores.remove("alice")
+    print(scores.len)                       // 1
+}
+```
+
+---
+
+## 13. Multi-File Modules (`import`) & Windows DLL FFI (`extern`)
+
+### 13.1 Splitting Code Across Files (`import`)
 Use `import "path.sb"` at the top level to include another Antimony source file (resolved relative to the importing file's directory). Imports are automatically deduplicated, so diamond or circular imports are safe:
 
 ```
@@ -648,7 +831,7 @@ fn main() {
 }
 ```
 
-### 12.2 Calling Windows DLLs Directly (`extern`)
+### 13.2 Calling Windows DLLs Directly (`extern`)
 Antimony emits imported functions directly into the PE32+ Import Table—no C compiler, header files, or `.lib` import libraries needed. You can declare a single `extern` function or group multiple imports from the same DLL:
 
 ```
@@ -672,9 +855,9 @@ fn main() {
 
 ---
 
-## 13. `defer`, `sizeof` / `alignof`, `ptr_cast`, and the Standard Library (`std/`)
+## 14. `defer`, `sizeof` / `alignof`, `ptr_cast`, and the Standard Library (`std/`)
 
-### 13.1 Scope-Based Cleanup (`defer`)
+### 14.1 Scope-Based Cleanup (`defer`)
 `defer` schedules a statement or `{ ... }` block to run in **reverse (LIFO) order** when the enclosing scope exits—whether at the end of a block, or via `return`, `break`, or `continue`. When `return expr` runs, `expr` is evaluated before the deferred cleanup statements execute:
 
 ```
@@ -692,7 +875,7 @@ fn process_buffer(n: usize): i32 {
 }
 ```
 
-### 13.2 `sizeof`, `alignof`, and `ptr_cast`
+### 14.2 `sizeof`, `alignof`, and `ptr_cast`
 - `sizeof(T)` and `alignof(T)` evaluate at compile time to the size and alignment in bytes of any type or expression (`sizeof(Vec2)`, `sizeof(*u8)`, `sizeof(my_array)`).
 - `ptr_cast(*T, expr)` converts a raw pointer (such as `*u8` returned from `alloc`) or 64-bit integer address into `*T` with zero runtime overhead:
 
@@ -715,9 +898,11 @@ fn main() {
 }
 ```
 
-### 13.3 Standard Library Modules (`std/`)
+### 14.3 Standard Library Modules (`std/`)
 Antimony ships with native standard library modules in `std/` that you can import from any directory:
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `realloc_mem`, `free_mem`, `copy_mem`, `set_mem`, `cmp_mem`) and fast bump-pointer `Arena` (`arena_init`, `arena_alloc`, `arena_reset`, `arena_free`).
+- `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `pop`, `get`, `set`, `as_slice`, `clear`, `free`).
+- `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `free`) and `Option[T]` (`.Some(T)` / `.None`).
 - `import "std/io.sb"` — Native Win32 file I/O (`write_file_str`, `write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
 - `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification (`is_digit`, `is_alpha`, `is_space`), `str` helpers (`str_starts_with`, `str_ends_with`, `str_trim`, `str_find_byte`, `str_parse_i64`, `parse_i64`), and the growable `StringBuilder` (`init`, `append`, `append_byte`, `append_i64`, `as_str`, `cstr`, `clear`, `free`).
@@ -725,7 +910,7 @@ Antimony ships with native standard library modules in `std/` that you can impor
 
 ---
 
-## 14. Built-in Functions
+## 15. Built-in Functions
 
 | Function | Description |
 |---|---|
@@ -740,7 +925,7 @@ Antimony ships with native standard library modules in `std/` that you can impor
 
 ---
 
-## 15. Complete Example Program
+## 16. Complete Example Program
 
 See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony, or try this prime-counting benchmark:
 

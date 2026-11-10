@@ -85,6 +85,10 @@ typedef struct {
     int next_var_index;
     int in_defer;
     AssignSet assigned;     // current definite-assignment state
+    NodeVec generic_structs;
+    NodeVec generic_enums;
+    NodeVec generic_fns;    // generic free functions AND generic methods
+    Program *prog;
 } Checker;
 
 static Scope *push_scope(Checker *c, bool is_fn_root) {
@@ -154,9 +158,237 @@ static void check_expr(Checker *c, Node *n, Type *expected);
 static void resolve_global_const(Checker *c, Symbol *s);
 static void layout_struct(Checker *c, Type *st);
 static void layout_enum(Checker *c, Type *et);
+static Type *resolve_type_str(Checker *c, const char *str, Pos pos);
+static Type *make_ptr_type(Type *elem, Pos pos);
+static Type *make_array_type(Type *elem, int len, Pos pos);
+static Type *make_slice_type(Type *elem, Pos pos);
+static StructField *find_field(Type *st, const char *name);
+static void materialize(Node *n);
+
+// Splits `"Name[Arg1,Arg2]"` into `base_out = "Name"` and `args_out = ["Arg1", "Arg2"]`.
+// Returns false if `name` does not have top-level `[...]`.
+static bool split_generic_name(const char *name, const char **base_out, StrVec *args_out) {
+    if (!name) return false;
+    const char *lb = strchr(name, '[');
+    if (!lb || lb == name) return false;
+    int len = (int)strlen(name);
+    if (name[len - 1] != ']') return false;
+    *base_out = intern(name, (int)(lb - name));
+    const char *p = lb + 1;
+    const char *end = name + len - 1;
+    const char *seg_start = p;
+    int depth = 0;
+    while (p <= end) {
+        if (p == end || (*p == ',' && depth == 0)) {
+            while (seg_start < p && (*seg_start == ' ' || *seg_start == '\t')) seg_start++;
+            const char *seg_end = p;
+            while (seg_end > seg_start && (seg_end[-1] == ' ' || seg_end[-1] == '\t')) seg_end--;
+            vec_push(*args_out, intern(seg_start, (int)(seg_end - seg_start)));
+            seg_start = p + 1;
+        } else if (*p == '[') {
+            depth++;
+        } else if (*p == ']') {
+            depth--;
+        }
+        p++;
+    }
+    return args_out->len > 0;
+}
+
+static bool is_ident_char_subst(char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9') || ch == '_';
+}
+
+// Replaces standalone identifier tokens matching `tparams[i]` with `targs[i]->name` inside `str`.
+static const char *subst_type_str(const char *str, StrVec *tparams, TypeVec *targs) {
+    if (!str || tparams->len == 0) return str;
+    Buf b = {0};
+    const char *p = str;
+    while (*p) {
+        if (is_ident_char_subst(*p)) {
+            const char *start = p;
+            while (is_ident_char_subst(*p)) p++;
+            int tok_len = (int)(p - start);
+            const char *tok = intern(start, tok_len);
+            const char *rep = NULL;
+            for (int i = 0; i < tparams->len; i++) {
+                if (tparams->items[i] == tok) {
+                    rep = targs->items[i]->name;
+                    break;
+                }
+            }
+            if (rep) buf_bytes(&b, rep, strlen(rep));
+            else     buf_bytes(&b, start, (size_t)tok_len);
+        } else {
+            buf_u8(&b, (uint8_t)*p++);
+        }
+    }
+    const char *res = intern((const char *)b.data, (int)b.len);
+    free(b.data);
+    return res;
+}
+
+// Deep-clones an AST node, substituting `tparams` -> `targs` in all `type_name` and `name` fields.
+static Node *clone_ast_subst(Node *src, StrVec *tparams, TypeVec *targs) {
+    if (!src) return NULL;
+    Node *dst = xcalloc(1, sizeof(Node));
+    *dst = *src;
+    dst->type = NULL;
+    dst->sym  = NULL;
+    dst->sym2 = NULL;
+    dst->target = NULL;
+    dst->tparams.items = NULL;
+    dst->tparams.len = 0;
+    dst->tparams.cap = 0;
+
+    if (dst->type_name) {
+        const char *sub = subst_type_str(dst->type_name, tparams, targs);
+        while (sub[0] == '[' && sub[1] == ']') {
+            dst->decl_kind = DECL_SLICE;
+            sub = intern(sub + 2, (int)strlen(sub + 2));
+        }
+        while (sub[0] == '*') {
+            dst->ptr_depth++;
+            sub = intern(sub + 1, (int)strlen(sub + 1));
+        }
+        dst->type_name = sub;
+    }
+    if (dst->name && (dst->kind == N_IDENT || dst->kind == N_CALL ||
+                      dst->kind == N_STRUCT_LIT || dst->kind == N_FN)) {
+        dst->name = subst_type_str(dst->name, tparams, targs);
+    }
+
+    dst->len_expr = clone_ast_subst(src->len_expr, tparams, targs);
+    dst->lhs      = clone_ast_subst(src->lhs, tparams, targs);
+    dst->rhs      = clone_ast_subst(src->rhs, tparams, targs);
+    dst->init     = clone_ast_subst(src->init, tparams, targs);
+    dst->cond     = clone_ast_subst(src->cond, tparams, targs);
+    dst->step     = clone_ast_subst(src->step, tparams, targs);
+    dst->body     = clone_ast_subst(src->body, tparams, targs);
+    dst->els      = clone_ast_subst(src->els, tparams, targs);
+    dst->lo       = clone_ast_subst(src->lo, tparams, targs);
+    dst->hi       = clone_ast_subst(src->hi, tparams, targs);
+    dst->by       = clone_ast_subst(src->by, tparams, targs);
+
+    dst->list.items = NULL;
+    dst->list.len = 0;
+    dst->list.cap = 0;
+    for (int i = 0; i < src->list.len; i++) {
+        vec_push(dst->list, clone_ast_subst(src->list.items[i], tparams, targs));
+    }
+    return dst;
+}
+
+static Symbol *instantiate_generic_type(Checker *c, const char *name, Pos pos) {
+    const char *base_name = NULL;
+    StrVec arg_strs = {0};
+    if (!split_generic_name(name, &base_name, &arg_strs)) return NULL;
+
+    Node *tmpl = NULL;
+    for (int i = 0; i < c->generic_structs.len; i++) {
+        if (c->generic_structs.items[i]->name == base_name) {
+            tmpl = c->generic_structs.items[i];
+            break;
+        }
+    }
+    if (!tmpl) {
+        for (int i = 0; i < c->generic_enums.len; i++) {
+            if (c->generic_enums.items[i]->name == base_name) {
+                tmpl = c->generic_enums.items[i];
+                break;
+            }
+        }
+    }
+    if (!tmpl) {
+        free(arg_strs.items);
+        return NULL;
+    }
+    if (arg_strs.len != tmpl->tparams.len) {
+        fatal(pos, "generic type '%s' expects %d type argument(s), got %d",
+              base_name, tmpl->tparams.len, arg_strs.len);
+    }
+
+    TypeVec targs = {0};
+    Buf canon_buf = {0};
+    buf_bytes(&canon_buf, base_name, strlen(base_name));
+    buf_u8(&canon_buf, '[');
+    for (int i = 0; i < arg_strs.len; i++) {
+        if (i > 0) buf_u8(&canon_buf, ',');
+        Type *at = resolve_type_str(c, arg_strs.items[i], pos);
+        vec_push(targs, at);
+        buf_bytes(&canon_buf, at->name, strlen(at->name));
+    }
+    buf_u8(&canon_buf, ']');
+    const char *canon_name = intern((const char *)canon_buf.data, (int)canon_buf.len);
+    free(canon_buf.data);
+    free(arg_strs.items);
+
+    Symbol *existing = lookup_in(c->global, canon_name);
+    if (existing && existing->kind == SYM_TYPE) {
+        free(targs.items);
+        return existing;
+    }
+
+    Node *cloned = clone_ast_subst(tmpl, &tmpl->tparams, &targs);
+    free(targs.items);
+    cloned->name = canon_name;
+
+    Scope *saved_cur = c->cur;
+    c->cur = c->global;
+    Type *t = xcalloc(1, sizeof(Type));
+    t->kind = (tmpl->kind == N_STRUCT) ? TY_STRUCT : TY_ENUM;
+    t->name = canon_name;
+    t->decl = cloned;
+    if (t->kind == TY_ENUM) {
+        t->size = 4;
+        t->align = 4;
+        t->is_signed = true;
+    }
+    Symbol *s = define(c, SYM_TYPE, canon_name, t, pos);
+    cloned->sym  = s;
+    cloned->type = t;
+    if (t->kind == TY_STRUCT) layout_struct(c, t);
+    else                      layout_enum(c, t);
+    c->cur = saved_cur;
+    return s;
+}
+
+static Type *resolve_type(Checker *c, const char *name, Pos pos);
+
+// Resolves a full type string (`"i32"`, `"*Point"`, `"[]u8"`, `"Vec[i32]"`) into a `Type *`.
+static Type *resolve_type_str(Checker *c, const char *str, Pos pos) {
+    int slice_depth = 0;
+    while (str[0] == '[' && str[1] == ']') {
+        slice_depth++;
+        str += 2;
+    }
+    int ptr_depth = 0;
+    while (*str == '*') {
+        ptr_depth++;
+        str++;
+    }
+    const char *base_name = intern(str, (int)strlen(str));
+    Type *t = resolve_type(c, base_name, pos);
+    if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) {
+        layout_struct(c, t);
+    } else if (ptr_depth == 0 && t->kind == TY_ENUM && t->state != 2) {
+        layout_enum(c, t);
+    }
+    for (int i = 0; i < ptr_depth; i++) {
+        t = make_ptr_type(t, pos);
+    }
+    for (int i = 0; i < slice_depth; i++) {
+        t = make_slice_type(t, pos);
+    }
+    return t;
+}
 
 static Type *resolve_type(Checker *c, const char *name, Pos pos) {
     Symbol *s = lookup_in(c->global, name);
+    if (!s && strchr(name, '[')) {
+        s = instantiate_generic_type(c, name, pos);
+    }
     if (!s || s->kind != SYM_TYPE) {
         fatal(pos, "unknown type '%s'", name);
     }
@@ -168,14 +400,14 @@ static VEC(Type *) slice_types;
 static VEC(Type *) ptr_types;
 
 static Type *make_ptr_type(Type *elem, Pos pos) {
-    if (elem == &ty_void || elem == &ty_str || elem->kind == TY_SLICE) {
+    if (elem == &ty_void || elem->kind == TY_SLICE) {
         fatal(pos, "pointer to '%s' is not supported yet", elem->name);
     }
     for (int i = 0; i < ptr_types.len; i++) {
         Type *t = ptr_types.items[i];
         if (t->elem == elem) return t;
     }
-    char buf[64];
+    char buf[128];
     int n = snprintf(buf, sizeof(buf), "*%s", elem->name);
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = TY_PTR;
@@ -189,14 +421,14 @@ static Type *make_ptr_type(Type *elem, Pos pos) {
 
 static Type *make_array_type(Type *elem, int len, Pos pos) {
     if (len <= 0) fatal(pos, "array length must be > 0 (got %d)", len);
-    if (elem == &ty_str || elem->kind == TY_ARRAY || elem->kind == TY_SLICE) {
+    if (elem->kind == TY_ARRAY || elem->kind == TY_SLICE) {
         fatal(pos, "arrays of '%s' are not supported yet", elem->name);
     }
     for (int i = 0; i < array_types.len; i++) {
         Type *t = array_types.items[i];
         if (t->elem == elem && t->array_len == len) return t;
     }
-    char buf[64];
+    char buf[128];
     int n = snprintf(buf, sizeof(buf), "[%d]%s", len, elem->name);
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = TY_ARRAY;
@@ -210,14 +442,14 @@ static Type *make_array_type(Type *elem, int len, Pos pos) {
 }
 
 static Type *make_slice_type(Type *elem, Pos pos) {
-    if (elem == &ty_str || elem->kind == TY_ARRAY || elem->kind == TY_SLICE) {
+    if (elem->kind == TY_ARRAY || elem->kind == TY_SLICE) {
         fatal(pos, "slices of '%s' are not supported yet", elem->name);
     }
     for (int i = 0; i < slice_types.len; i++) {
         Type *t = slice_types.items[i];
         if (t->elem == elem) return t;
     }
-    char buf[64];
+    char buf[128];
     int n = snprintf(buf, sizeof(buf), "[]%s", elem->name);
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = TY_SLICE;
@@ -254,6 +486,213 @@ static int eval_array_len(Checker *c, Node *len_expr) {
     return (int)len_expr->cval;
 }
 
+static Type *resolve_decl_type(Checker *c, Node *d);
+
+// Instantiates a generic function or method `tmpl` with `tparams` -> `targs`,
+// registers its concrete `SYM_FN` under `canon_name`, and appends `cloned` to `c->prog->fns`.
+static Symbol *instantiate_fn_from_targs(Checker *c, Node *tmpl, const char *canon_name,
+                                         StrVec *tparams, TypeVec *targs, Pos pos) {
+    Symbol *existing = lookup_in(c->global, canon_name);
+    if (existing && existing->kind == SYM_FN) {
+        return existing;
+    }
+
+    Node *cloned = clone_ast_subst(tmpl, tparams, targs);
+    cloned->name = canon_name;
+
+    Scope *saved_cur = c->cur;
+    c->cur = c->global;
+
+    Type *ret = cloned->type_name ? resolve_decl_type(c, cloned) : &ty_void;
+    if (ret->kind == TY_ARRAY) {
+        fatal(cloned->type_pos, "returning fixed-size array '%s' by value is not allowed (return a slice '[]%s' or pass a pointer)",
+              ret->name, ret->elem->name);
+    }
+    for (int j = 0; j < cloned->list.len; j++) {
+        Node *p = cloned->list.items[j];
+        p->type = resolve_decl_type(c, p);
+    }
+    if (cloned->name2) {
+        Type *rt = cloned->list.items[0]->type;
+        Type *base_t = (rt->kind == TY_PTR) ? rt->elem : rt;
+        if (base_t->kind != TY_STRUCT && base_t->kind != TY_ENUM) {
+            fatal(cloned->list.items[0]->type_pos,
+                  "methods can only be defined on struct or enum types (got '%s')", rt->name);
+        }
+        if (find_field(base_t, cloned->name2)) {
+            fatal(cloned->pos, "method '%s' conflicts with %s '%s.%s'",
+                  cloned->name2, base_t->kind == TY_STRUCT ? "field" : "variant",
+                  base_t->name, cloned->name2);
+        }
+    }
+
+    Symbol *s = define(c, SYM_FN, canon_name, ret, pos);
+    s->decl = cloned;
+    cloned->sym  = s;
+    cloned->type = ret;
+    if (c->prog) vec_push(c->prog->fns, cloned);
+
+    c->cur = saved_cur;
+    return s;
+}
+
+static Symbol *instantiate_generic_method(Checker *c, Type *base_t, const char *method_name, Pos pos) {
+    const char *recv_base = NULL;
+    StrVec arg_strs = {0};
+    if (!split_generic_name(base_t->name, &recv_base, &arg_strs)) return NULL;
+
+    for (int i = 0; i < c->generic_fns.len; i++) {
+        Node *m = c->generic_fns.items[i];
+        if (!m->name2 || m->name2 != method_name) continue;
+        Node *rparam = m->list.items[0];
+        const char *m_base = NULL;
+        StrVec m_tparams = {0};
+        if (!split_generic_name(rparam->type_name, &m_base, &m_tparams)) continue;
+        if (m_base != recv_base || m_tparams.len != arg_strs.len) {
+            free(m_tparams.items);
+            continue;
+        }
+        TypeVec targs = {0};
+        for (int k = 0; k < arg_strs.len; k++) {
+            vec_push(targs, resolve_type_str(c, arg_strs.items[k], pos));
+        }
+        char full_mname[256];
+        int flen = snprintf(full_mname, sizeof(full_mname), "%s.%s", base_t->name, method_name);
+        const char *canon = intern(full_mname, flen);
+        Symbol *s = instantiate_fn_from_targs(c, m, canon, &m_tparams, &targs, pos);
+        free(targs.items);
+        free(m_tparams.items);
+        free(arg_strs.items);
+        return s;
+    }
+    free(arg_strs.items);
+    return NULL;
+}
+
+// Matches a formal type specification `pat_str` (with `ptr_depth` / `dk`) against a concrete `arg_t`
+// to infer any unbound type parameters in `tparams` -> `inferred`.
+static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk,
+                               Type *arg_t, StrVec *tparams, Type **inferred) {
+    if (!pat_str || !arg_t || arg_t == &ty_untyped_int || arg_t == &ty_untyped_float || arg_t == &ty_null) {
+        return;
+    }
+    if (pat_dk == DECL_SLICE) {
+        if (arg_t->kind == TY_SLICE || arg_t->kind == TY_ARRAY) {
+            unify_type_pattern(pat_str, pat_ptr, DECL_SCALAR, arg_t->elem, tparams, inferred);
+        }
+        return;
+    }
+    if (pat_dk == DECL_ARRAY) {
+        if (arg_t->kind == TY_ARRAY) {
+            unify_type_pattern(pat_str, pat_ptr, DECL_SCALAR, arg_t->elem, tparams, inferred);
+        }
+        return;
+    }
+    while (pat_ptr > 0) {
+        if (arg_t->kind != TY_PTR) return;
+        arg_t = arg_t->elem;
+        pat_ptr--;
+    }
+    while (pat_str[0] == '[' && pat_str[1] == ']') {
+        if (arg_t->kind != TY_SLICE && arg_t->kind != TY_ARRAY) return;
+        arg_t = arg_t->elem;
+        pat_str += 2;
+    }
+    while (*pat_str == '*') {
+        if (arg_t->kind != TY_PTR) return;
+        arg_t = arg_t->elem;
+        pat_str++;
+    }
+    const char *p_intern = intern(pat_str, (int)strlen(pat_str));
+    for (int i = 0; i < tparams->len; i++) {
+        if (tparams->items[i] == p_intern) {
+            if (!inferred[i]) inferred[i] = arg_t;
+            return;
+        }
+    }
+    const char *pat_base = NULL, *arg_base = NULL;
+    StrVec pat_args = {0}, arg_args = {0};
+    if (split_generic_name(p_intern, &pat_base, &pat_args) &&
+        split_generic_name(arg_t->name, &arg_base, &arg_args)) {
+        if (pat_base == arg_base && pat_args.len == arg_args.len) {
+            // Note: recursive type arg matching if needed
+        }
+    }
+    free(pat_args.items);
+    free(arg_args.items);
+}
+
+static Symbol *instantiate_generic_fn_call(Checker *c, Node *call_node) {
+    const char *base_name = call_node->name;
+    StrVec explicit_args = {0};
+    bool has_explicit = split_generic_name(call_node->name, &base_name, &explicit_args);
+
+    Node *tmpl = NULL;
+    for (int i = 0; i < c->generic_fns.len; i++) {
+        Node *f = c->generic_fns.items[i];
+        if (!f->name2 && f->name == base_name) {
+            tmpl = f;
+            break;
+        }
+    }
+    if (!tmpl) {
+        free(explicit_args.items);
+        return NULL;
+    }
+
+    TypeVec targs = {0};
+    if (has_explicit) {
+        if (explicit_args.len != tmpl->tparams.len) {
+            fatal(call_node->pos, "generic function '%s' expects %d type argument(s), got %d",
+                  base_name, tmpl->tparams.len, explicit_args.len);
+        }
+        for (int i = 0; i < explicit_args.len; i++) {
+            vec_push(targs, resolve_type_str(c, explicit_args.items[i], call_node->pos));
+        }
+        free(explicit_args.items);
+    } else {
+        if (call_node->list.len != tmpl->list.len) {
+            fatal(call_node->pos, "function '%s' expects %d argument(s), got %d",
+                  base_name, tmpl->list.len, call_node->list.len);
+        }
+        Type **inferred = xcalloc((size_t)tmpl->tparams.len, sizeof(Type *));
+        for (int i = 0; i < call_node->list.len; i++) {
+            Node *arg = call_node->list.items[i];
+            check_expr(c, arg, NULL);
+            if (arg->type == &ty_untyped_int || arg->type == &ty_untyped_float) {
+                materialize(arg);
+            }
+            Node *param = tmpl->list.items[i];
+            unify_type_pattern(param->type_name, param->ptr_depth, param->decl_kind,
+                               arg->type, &tmpl->tparams, inferred);
+        }
+        for (int i = 0; i < tmpl->tparams.len; i++) {
+            if (!inferred[i]) {
+                fatal(call_node->pos, "cannot infer type parameter '%s' for call to '%s' (specify '%s[...](...)')",
+                      tmpl->tparams.items[i], base_name, base_name);
+            }
+            vec_push(targs, inferred[i]);
+        }
+        free(inferred);
+    }
+
+    Buf canon_buf = {0};
+    buf_bytes(&canon_buf, base_name, strlen(base_name));
+    buf_u8(&canon_buf, '[');
+    for (int i = 0; i < targs.len; i++) {
+        if (i > 0) buf_u8(&canon_buf, ',');
+        buf_bytes(&canon_buf, targs.items[i]->name, strlen(targs.items[i]->name));
+    }
+    buf_u8(&canon_buf, ']');
+    const char *canon_name = intern((const char *)canon_buf.data, (int)canon_buf.len);
+    free(canon_buf.data);
+
+    Symbol *s = instantiate_fn_from_targs(c, tmpl, canon_name, &tmpl->tparams, &targs, call_node->pos);
+    free(targs.items);
+    call_node->name = canon_name;
+    return s;
+}
+
 static Type *resolve_decl_type(Checker *c, Node *d) {
     if (!d->type_name) return NULL;
     Type *base = resolve_type(c, d->type_name, d->type_pos);
@@ -275,7 +714,7 @@ static Type *resolve_decl_type(Checker *c, Node *d) {
     return base;
 }
 
-// If `arg` is a type expression (`T`, `*T`, `**T`, etc.) passed to `sizeof`, `alignof`,
+// If `arg` is a type expression (`T`, `*T`, `**T`, `Vec[i32]`, etc.) passed to `sizeof`, `alignof`,
 // or `ptr_cast`, resolves and returns that `Type *`; otherwise returns NULL.
 static Type *try_resolve_type_arg(Checker *c, Node *arg) {
     int ptr_depth = 0;
@@ -284,8 +723,33 @@ static Type *try_resolve_type_arg(Checker *c, Node *arg) {
         ptr_depth++;
         cur = cur->lhs;
     }
+    if (cur && cur->kind == N_INDEX && cur->lhs && cur->lhs->kind == N_IDENT &&
+        cur->rhs && cur->rhs->kind == N_IDENT) {
+        char gname[256];
+        int glen = snprintf(gname, sizeof(gname), "%s[%s]", cur->lhs->name, cur->rhs->name);
+        const char *canon = intern(gname, glen);
+        Symbol *s = lookup_in(c->global, canon);
+        if (!s) s = instantiate_generic_type(c, canon, cur->pos);
+        if (s && s->kind == SYM_TYPE) {
+            Type *t = s->type;
+            if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) layout_struct(c, t);
+            else if (t->kind == TY_ENUM && t->state != 2) layout_enum(c, t);
+            for (int i = 0; i < ptr_depth; i++) t = make_ptr_type(t, arg->pos);
+            return t;
+        }
+    }
     if (cur && cur->kind == N_IDENT) {
+        if (cur->name[0] == '*' || cur->name[0] == '[') {
+            Type *t = resolve_type_str(c, cur->name, cur->pos);
+            for (int i = 0; i < ptr_depth; i++) {
+                t = make_ptr_type(t, arg->pos);
+            }
+            return t;
+        }
         Symbol *s = lookup(c, cur->name);
+        if (!s && strchr(cur->name, '[')) {
+            s = instantiate_generic_type(c, cur->name, cur->pos);
+        }
         if (s && s->kind == SYM_TYPE) {
             Type *t = s->type;
             if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) {
@@ -376,6 +840,7 @@ static void layout_enum(Checker *c, Type *et) {
         et->is_signed = true;
     }
     et->state = 2;
+    if (c->prog) vec_push(c->prog->type_decls, d);
 }
 
 static void layout_struct(Checker *c, Type *st) {
@@ -411,6 +876,7 @@ static void layout_struct(Checker *c, Type *st) {
     st->size = offset;
     st->align = max_align;
     st->state = 2;
+    if (c->prog) vec_push(c->prog->type_decls, d);
 }
 
 static StructField *find_field(Type *st, const char *name) {
@@ -677,6 +1143,10 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
 
     case N_STRUCT_LIT: {
         Symbol *s = lookup_in(c->global, n->name);
+        if (!s && strchr(n->name, '[')) {
+            s = instantiate_generic_type(c, n->name, n->pos);
+            if (s) n->name = s->name;
+        }
         if (!s || s->kind != SYM_TYPE || s->type->kind != TY_STRUCT) {
             fatal(n->pos, "'%s' is not a struct type", n->name);
         }
@@ -739,6 +1209,10 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         // Check for enum variant access `EnumName.Variant` before checking `n->lhs` as a value.
         if (n->lhs->kind == N_IDENT) {
             Symbol *s = lookup(c, n->lhs->name);
+            if (!s && strchr(n->lhs->name, '[')) {
+                s = instantiate_generic_type(c, n->lhs->name, n->lhs->pos);
+                if (s) n->lhs->name = s->name;
+            }
             if (s && s->kind == SYM_TYPE && s->type->kind == TY_ENUM) {
                 Type *et = s->type;
                 if (et->state != 2) layout_enum(c, et);
@@ -1227,6 +1701,10 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         if (n->lhs) {
             if (n->lhs->kind == N_IDENT) {
                 Symbol *vs = lookup(c, n->lhs->name);
+                if (!vs && strchr(n->lhs->name, '[')) {
+                    vs = instantiate_generic_type(c, n->lhs->name, n->lhs->pos);
+                    if (vs) n->lhs->name = vs->name;
+                }
                 if (vs && vs->kind == SYM_TYPE && vs->type->kind == TY_ENUM) {
                     Type *et = vs->type;
                     if (et->state != 2) layout_enum(c, et);
@@ -1256,6 +1734,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     char mname[256];
                     int mlen = snprintf(mname, sizeof(mname), "%s.%s", vs->type->name, n->name);
                     Symbol *ms = lookup_in(c->global, intern(mname, mlen));
+                    if (!ms && strchr(vs->type->name, '[')) {
+                        ms = instantiate_generic_method(c, vs->type, n->name, n->pos);
+                    }
                     if (ms && ms->kind == SYM_FN && ms->decl->list.items[0]->type->kind == TY_PTR) {
                         c->assigned |= (1ULL << vs->var_index);
                     }
@@ -1277,6 +1758,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             char mname[256];
             int mlen = snprintf(mname, sizeof(mname), "%s.%s", base_t->name, n->name);
             Symbol *ms = lookup_in(c->global, intern(mname, mlen));
+            if (!ms && strchr(base_t->name, '[')) {
+                ms = instantiate_generic_method(c, base_t, n->name, n->pos);
+            }
             if (!ms || ms->kind != SYM_FN) {
                 fatal(n->pos, "type '%s' has no method named '%s'", base_t->name, n->name);
             }
@@ -1340,6 +1824,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         }
 
         Symbol *s = lookup(c, n->name);
+        if (!s) {
+            s = instantiate_generic_fn_call(c, n);
+        }
         if (!s) fatal(n->pos, "undeclared function or type '%s'", n->name);
 
         // Type conversion: `i64(x)`, `f64(x)`, `f32(x)` (spec §2.2, §2.3)
@@ -2015,6 +2502,10 @@ static bool check_stmt(Checker *c, Node *n) {
                     }
                     if (is_explicit_pat) {
                         Symbol *ts = lookup(c, pat->lhs->name);
+                        if (!ts && strchr(pat->lhs->name, '[')) {
+                            ts = instantiate_generic_type(c, pat->lhs->name, pat->lhs->pos);
+                            if (ts) pat->lhs->name = ts->name;
+                        }
                         if (!ts || ts->kind != SYM_TYPE || ts->type != st) {
                             fatal(pat->pos, "expected variant of enum '%s'", st->name);
                         }
@@ -2251,14 +2742,26 @@ static bool check_stmt(Checker *c, Node *n) {
             idx_sym->slot = alloc_slot(c);
             Symbol *val_sym = define(c, SYM_VAR, n->name2, elem_t, n->pos);
             val_sym->readonly = true;
-            val_sym->slot = is_aggregate_type(elem_t) ? alloc_slots_bytes(c, elem_t->size) : alloc_slot(c);
+            if (is_aggregate_type(elem_t)) {
+                val_sym->slot = alloc_slots_bytes(c, elem_t->size);
+            } else if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
+                val_sym->slot = alloc_slots_bytes(c, 16);
+            } else {
+                val_sym->slot = alloc_slot(c);
+            }
             n->sym  = idx_sym;
             n->sym2 = val_sym;
         } else {
             // `loop x in arr`
             Symbol *val_sym = define(c, SYM_VAR, n->name, elem_t, n->pos);
             val_sym->readonly = true;
-            val_sym->slot = is_aggregate_type(elem_t) ? alloc_slots_bytes(c, elem_t->size) : alloc_slot(c);
+            if (is_aggregate_type(elem_t)) {
+                val_sym->slot = alloc_slots_bytes(c, elem_t->size);
+            } else if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
+                val_sym->slot = alloc_slots_bytes(c, 16);
+            } else {
+                val_sym->slot = alloc_slot(c);
+            }
             n->sym  = val_sym;
             n->sym2 = NULL;
         }
@@ -2407,6 +2910,7 @@ Program check(NodeVec decls) {
 
     // Seed built-in KERNEL32.dll imports at IAT slots 0, 1, 2.
     Program prog = {0};
+    c.prog = &prog;
     const char *k32 = intern("KERNEL32.dll", 12);
     register_dll_import(&prog, k32, intern("GetStdHandle", 12));
     register_dll_import(&prog, k32, intern("WriteFile", 9));
@@ -2417,6 +2921,10 @@ Program check(NodeVec decls) {
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
         if (d->kind == N_STRUCT) {
+            if (d->tparams.len > 0) {
+                vec_push(c.generic_structs, d);
+                continue;
+            }
             Type *st = xcalloc(1, sizeof(Type));
             st->kind = TY_STRUCT;
             st->name = d->name;
@@ -2425,6 +2933,10 @@ Program check(NodeVec decls) {
             d->sym = s;
             d->type = st;
         } else if (d->kind == N_ENUM) {
+            if (d->tparams.len > 0) {
+                vec_push(c.generic_enums, d);
+                continue;
+            }
             Type *et = xcalloc(1, sizeof(Type));
             et->kind = TY_ENUM;
             et->name = d->name;
@@ -2443,7 +2955,7 @@ Program check(NodeVec decls) {
     }
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
-        if (d->kind == N_ENUM) layout_enum(&c, d->type);
+        if (d->kind == N_ENUM && d->tparams.len == 0) layout_enum(&c, d->type);
     }
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
@@ -2451,13 +2963,34 @@ Program check(NodeVec decls) {
     }
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
-        if (d->kind == N_STRUCT) layout_struct(&c, d->type);
+        if (d->kind == N_STRUCT && d->tparams.len == 0) layout_struct(&c, d->type);
     }
 
     VEC(Symbol *) extern_syms = {0};
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
         if (d->kind == N_FN) {
+            bool is_generic_fn = (d->tparams.len > 0);
+            if (!is_generic_fn && d->name2) {
+                Node *rparam = d->list.items[0];
+                const char *rbase = NULL;
+                StrVec rargs = {0};
+                if (split_generic_name(rparam->type_name, &rbase, &rargs)) {
+                    for (int k = 0; k < c.generic_structs.len; k++) {
+                        if (c.generic_structs.items[k]->name == rbase) { is_generic_fn = true; break; }
+                    }
+                    if (!is_generic_fn) {
+                        for (int k = 0; k < c.generic_enums.len; k++) {
+                            if (c.generic_enums.items[k]->name == rbase) { is_generic_fn = true; break; }
+                        }
+                    }
+                }
+                free(rargs.items);
+            }
+            if (is_generic_fn) {
+                vec_push(c.generic_fns, d);
+                continue;
+            }
             Type *ret = d->type_name ? resolve_decl_type(&c, d) : &ty_void;
             if (ret->kind == TY_ARRAY) {
                 fatal(d->type_pos, "returning fixed-size array '%s' by value is not allowed (return a slice '[]%s' or pass a pointer)",

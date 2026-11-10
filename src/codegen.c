@@ -1741,6 +1741,10 @@ static void gen_iter_loop(CG *cg, Node *n) {
         x_lea(RDI, RBP, slot_disp(val_sym->slot));
         x_mov_ri(RCX, (uint64_t)elem_t->size);
         x_rep_movsb();
+    } else if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
+        x_load(RDX, RAX, 8);
+        x_load(RAX, RAX, 0);
+        store_var(val_sym, RAX);
     } else {
         x_load_sized(RAX, RAX, 0, elem_t->size, elem_t->is_signed);
         store_var(val_sym, RAX);

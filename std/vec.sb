@@ -1,0 +1,77 @@
+// std/vec.sb - Generic heap-backed dynamic array Vec[T].
+
+import "std/mem.sb"
+
+struct Vec[T] {
+    data: *T
+    len: i64
+    cap: i64
+}
+
+fn (v: *Vec[T]) init(initial_cap: i64) {
+    v.len = 0
+    if initial_cap <= 0 {
+        v.data = null
+        v.cap = 0
+        return
+    }
+    v.cap = initial_cap
+    v.data = ptr_cast(*T, alloc(usize(initial_cap) * usize(sizeof(T))))
+}
+
+fn (v: *Vec[T]) reserve(min_cap: i64) {
+    if min_cap <= v.cap {
+        return
+    }
+    var new_cap = v.cap * 2
+    if new_cap < 8 {
+        new_cap = 8
+    }
+    loop new_cap < min_cap {
+        new_cap *= 2
+    }
+    v.data = ptr_cast(*T, realloc_mem(ptr_cast(*u8, v.data), usize(new_cap) * usize(sizeof(T))))
+    v.cap = new_cap
+}
+
+fn (v: *Vec[T]) push(val: T) {
+    if v.len >= v.cap {
+        v.reserve(v.len + 1)
+    }
+    v.data[v.len] = val
+    v.len += 1
+}
+
+fn (v: *Vec[T]) pop(): T {
+    v.len -= 1
+    return v.data[v.len]
+}
+
+fn (v: Vec[T]) get(idx: i64): T {
+    return v.data[idx]
+}
+
+fn (v: *Vec[T]) set(idx: i64, val: T) {
+    v.data[idx] = val
+}
+
+fn (v: Vec[T]) as_slice(): []T {
+    if v.data == null || v.len == 0 {
+        var empty: *T = v.data
+        return empty[0..0]
+    }
+    return v.data[0..v.len]
+}
+
+fn (v: *Vec[T]) clear() {
+    v.len = 0
+}
+
+fn (v: *Vec[T]) free() {
+    if v.data != null {
+        free_mem(ptr_cast(*u8, v.data))
+    }
+    v.data = null
+    v.len = 0
+    v.cap = 0
+}

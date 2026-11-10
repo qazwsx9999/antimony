@@ -1293,4 +1293,198 @@ $phase12_expected = "49`n42`n8`n0`n39`ndefer-opt`n4`ndefer-opt`n-1`ndefer-parse-
 Test-RunOk "phase12_tagged_unions_and_try" $phase12_code $phase12_expected
 Test-RunLlvm "phase12_tagged_unions_and_try_llvm" $phase12_code $phase12_expected
 
+# 21. Phase 13: Compile-Time Generics ([T]) & Standard Collections (Vec[T], HashMap[K, V])
+Test-CompileError "generic_type_arity_mismatch" @"
+struct Box[T] { val: T }
+fn main() {
+    var b: Box[i32, i64]
+}
+"@ "expects 1 type argument(s), got 2"
+
+Test-CompileError "generic_fn_infer_fail" @"
+fn id[T](x: i32): T {
+    return 0
+}
+fn main() {
+    var y = id(5)
+}
+"@ "cannot infer type parameter 'T' for call to 'id'"
+
+Test-CompileError "generic_fn_arity_mismatch" @"
+fn pair_sum[T](a: T, b: T): T {
+    return a + b
+}
+fn main() {
+    print(pair_sum[i32, i64](1, 2))
+}
+"@ "expects 1 type argument(s), got 2"
+
+$phase13_code = @"
+import "std/vec.sb"
+import "std/map.sb"
+
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+
+fn (p: Pair[A, B]) swap(): Pair[B, A] {
+    return Pair[B, A] { first: p.second, second: p.first }
+}
+
+enum Result[T, E] {
+    Ok(T)
+    Err(E)
+}
+
+fn max_val[T](a: T, b: T): T {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn swap_val[T](a: *T, b: *T) {
+    var tmp = *a
+    *a = *b
+    *b = tmp
+}
+
+fn checked_div(a: i64, b: i64): Result[i64, str] {
+    if b == 0 {
+        return .Err("div by zero")
+    }
+    return .Ok(a / b)
+}
+
+fn compute_ratio(x: i64, y: i64, z: i64): Result[Pair[i64, i64], str] {
+    var q1 = checked_div(x, y)?
+    var q2 = checked_div(q1, z)?
+    return .Ok(Pair[i64, i64] { first: q1, second: q2 })
+}
+
+struct Point {
+    x: i32
+    y: i32
+}
+
+fn main() {
+    // 1. Generic struct, generic method, and nested generic struct
+    var p = Pair[i32, str] { first: 42, second: "hello" }
+    print(p.first)
+    print(p.second)
+    var sw = p.swap()
+    print(sw.first)
+    print(sw.second)
+
+    // 2. Generic functions (both explicit [T] and type-inferred calls)
+    print(max_val[i64](100, 250))
+    print(max_val(99, 12))
+    var x: i32 = 10
+    var y: i32 = 90
+    swap_val(&x, &y)
+    print(x)
+    print(y)
+
+    var s1 = "alpha"
+    var s2 = "beta"
+    swap_val(&s1, &s2)
+    print(s1)
+    print(s2)
+
+    // 3. Generic Result[T, E] with `?` operator propagation
+    match compute_ratio(100, 5, 4) {
+        .Ok(res) {
+            print(res.first)
+            print(res.second)
+        }
+        .Err(msg) { print(msg) }
+    }
+    match compute_ratio(100, 0, 4) {
+        .Ok(res) { print(res.first) }
+        .Err(msg) { print(msg) }
+    }
+
+    // 4. Standard generic dynamic array Vec[T] (Vec[i64], Vec[str], Vec[Point])
+    var nums: Vec[i64]
+    nums.init(2)
+    defer nums.free()
+    loop i in 1..7 {
+        nums.push(i64(i * 10))
+    }
+    print(nums.len)
+    print(nums.pop())
+    nums.set(0, 99)
+    var sum: i64 = 0
+    loop v in nums.as_slice() {
+        sum += v
+    }
+    print(sum)
+
+    var words: Vec[str]
+    words.init(0)
+    defer words.free()
+    words.push("Antimony")
+    words.push("Generics")
+    words.push("Fast")
+    print(words.len)
+    print(words.get(0))
+    print(words.get(1))
+    print(words.pop())
+
+    var pts: Vec[Point]
+    pts.init(2)
+    defer pts.free()
+    pts.push(Point { x: 3, y: 4 })
+    pts.push(Point { x: 10, y: 20 })
+    var pt_sum: i32 = 0
+    loop pt in pts.as_slice() {
+        pt_sum += pt.x + pt.y
+    }
+    print(pt_sum)
+
+    // 5. Standard generic hash table HashMap[K, V] (str keys and integer keys)
+    var scores: HashMap[str, i64]
+    scores.init(4)
+    defer scores.free()
+    scores.put("alice", 100)
+    scores.put("bob", 200)
+    scores.put("charlie", 300)
+    scores.put("alice", 150)
+    print(scores.len)
+    print(scores.contains("bob"))
+    print(scores.contains("dave"))
+    // Lookup using a sliced string (different pointer, same content)
+    var full = "prefix:alice:suffix"
+    var sliced_key = full[7..12]
+    match scores.get(sliced_key) {
+        .Some(v) { print(v) }
+        .None { print(-1) }
+    }
+    print(scores.get_or("dave", -99))
+    print(scores.remove("bob"))
+    print(scores.contains("bob"))
+    print(scores.len)
+
+    var id_map: HashMap[i32, str]
+    id_map.init(4)
+    defer id_map.free()
+    loop k in 1..21 {
+        if k % 2 == 0 {
+            id_map.put(k, "even")
+        } else {
+            id_map.put(k, "odd")
+        }
+    }
+    print(id_map.len)
+    print(id_map.get_or(7, "none"))
+    print(id_map.get_or(18, "none"))
+    print(id_map.get_or(99, "none"))
+}
+"@
+$phase13_expected = "42`nhello`nhello`n42`n250`n99`n90`n10`nbeta`nalpha`n20`n5`ndiv by zero`n6`n60`n239`n3`nAntimony`nGenerics`nFast`n37`n3`ntrue`nfalse`n150`n-99`ntrue`nfalse`n2`n20`nodd`neven`nnone"
+
+Test-RunOk "phase13_generics_and_collections" $phase13_code $phase13_expected
+Test-RunLlvm "phase13_generics_and_collections_llvm" $phase13_code $phase13_expected
+
 Write-Host "`nAll tests passed."

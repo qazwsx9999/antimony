@@ -46,8 +46,13 @@ static void bprintf(Buf *b, const char *fmt, ...) {
 static void emit_mangled_ident(Buf *b, const char *prefix, const char *name) {
     bprintf(b, "%s", prefix);
     for (const char *p = name; *p; p++) {
-        if (*p == '.') bprintf(b, "__");
-        else           buf_u8(b, (uint8_t)*p);
+        if (*p == '.')      bprintf(b, "__");
+        else if (*p == '[') bprintf(b, "_L_");
+        else if (*p == ']') bprintf(b, "_R_");
+        else if (*p == ',') bprintf(b, "_C_");
+        else if (*p == '*') bprintf(b, "_P_");
+        else if (*p == ' ') continue;
+        else                buf_u8(b, (uint8_t)*p);
     }
 }
 
@@ -1444,15 +1449,21 @@ static void generate_opt_c_unit(Program *prog, NodeVec all_decls, bool release, 
     // 1. Collect all slice types across structs, globals, and functions.
     Type u8_slice = { .kind = TY_SLICE, .elem = &ty_u8 };
     get_slice_type_id(&g, &u8_slice);
-    for (int i = 0; i < all_decls.len; i++) {
-        collect_slice_types_node(&g, all_decls.items[i]);
+    for (int i = 0; i < prog->type_decls.len; i++) {
+        collect_slice_types_node(&g, prog->type_decls.items[i]);
+    }
+    for (int i = 0; i < prog->globals.len; i++) {
+        collect_slice_types_node(&g, prog->globals.items[i]->decl);
+    }
+    for (int i = 0; i < prog->fns.len; i++) {
+        collect_slice_types_node(&g, prog->fns.items[i]);
     }
 
     emit_opt_runtime_preamble(&g.hdr);
 
     // 2. Forward declare all structs and tagged union enums.
-    for (int i = 0; i < all_decls.len; i++) {
-        Node *d = all_decls.items[i];
+    for (int i = 0; i < prog->type_decls.len; i++) {
+        Node *d = prog->type_decls.items[i];
         if (d->kind == N_STRUCT) {
             emit_mangled_ident(&g.hdr, "struct sb_st_", d->name);
             bprintf(&g.hdr, ";\n");
@@ -1471,9 +1482,9 @@ static void generate_opt_c_unit(Program *prog, NodeVec all_decls, bool release, 
     }
     bprintf(&g.hdr, "\n");
 
-    // 4. Emit struct and tagged union enum definitions in declaration/layout order.
-    for (int i = 0; i < all_decls.len; i++) {
-        Node *d = all_decls.items[i];
+    // 4. Emit struct and tagged union enum definitions in topological layout order.
+    for (int i = 0; i < prog->type_decls.len; i++) {
+        Node *d = prog->type_decls.items[i];
         if (d->kind == N_STRUCT) {
             Type *st = d->type;
             emit_mangled_ident(&g.hdr, "struct sb_st_", st->name);

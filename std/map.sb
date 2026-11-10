@@ -1,0 +1,190 @@
+// std/map.sb - Generic open-addressing hash table HashMap[K, V] and Option[T].
+
+import "std/mem.sb"
+
+enum Option[T] {
+    Some(T)
+    None
+}
+
+// 64-bit FNV-1a byte hash.
+fn hash_bytes_fnv1a(p: *u8, n: i64): u64 {
+    var h: u64 = 14695981039346656037
+    var i: i64 = 0
+    loop i < n {
+        h = (h ^ u64(p[i])) *% 1099511628211
+        i += 1
+    }
+    return h
+}
+
+// Generic key hash: hashes string content when K is `str` (16-byte {ptr, len}),
+// or hashes the raw value bytes of K for scalar/enum/pointer keys.
+fn hash_key[K](k: K): u64 {
+    var kv = k
+    if sizeof(K) == 16 {
+        var sp = ptr_cast(**u8, &kv)
+        var sl = ptr_cast(*i64, ptr_cast(*u8, &kv) + 8)
+        return hash_bytes_fnv1a(*sp, *sl)
+    }
+    return hash_bytes_fnv1a(ptr_cast(*u8, &kv), i64(sizeof(K)))
+}
+
+// Entry states in `HashMap.states`: 0 = empty, 1 = occupied, 2 = tombstone.
+struct HashMap[K, V] {
+    keys: *K
+    vals: *V
+    states: *u8
+    len: i64
+    cap: i64
+}
+
+fn (m: *HashMap[K, V]) init(initial_cap: i64) {
+    m.len = 0
+    var c: i64 = 16
+    loop c < initial_cap {
+        c *= 2
+    }
+    m.cap = c
+    m.keys   = ptr_cast(*K, alloc(usize(c) * usize(sizeof(K))))
+    m.vals   = ptr_cast(*V, alloc(usize(c) * usize(sizeof(V))))
+    m.states = alloc(usize(c))
+}
+
+fn (m: *HashMap[K, V]) grow() {
+    var old_cap = m.cap
+    var old_keys = m.keys
+    var old_vals = m.vals
+    var old_states = m.states
+
+    var new_cap: i64 = 16
+    if old_cap >= 16 {
+        new_cap = old_cap * 2
+    }
+    m.cap = new_cap
+    m.len = 0
+    m.keys   = ptr_cast(*K, alloc(usize(new_cap) * usize(sizeof(K))))
+    m.vals   = ptr_cast(*V, alloc(usize(new_cap) * usize(sizeof(V))))
+    m.states = alloc(usize(new_cap))
+
+    if old_states != null {
+        var i: i64 = 0
+        loop i < old_cap {
+            if old_states[i] == 1 {
+                m.put(old_keys[i], old_vals[i])
+            }
+            i += 1
+        }
+        free_mem(ptr_cast(*u8, old_keys))
+        free_mem(ptr_cast(*u8, old_vals))
+        free_mem(old_states)
+    }
+}
+
+fn (m: *HashMap[K, V]) put(key: K, val: V) {
+    if m.cap == 0 || (m.len + 1) * 10 >= m.cap * 7 {
+        m.grow()
+    }
+    var mask = u64(m.cap - 1)
+    var idx = i64(hash_key(key) & mask)
+    var first_tomb: i64 = -1
+    loop {
+        var st = m.states[idx]
+        if st == 0 {
+            var target = idx
+            if first_tomb >= 0 {
+                target = first_tomb
+            }
+            m.keys[target] = key
+            m.vals[target] = val
+            m.states[target] = 1
+            m.len += 1
+            return
+        }
+        if st == 1 {
+            if m.keys[idx] == key {
+                m.vals[idx] = val
+                return
+            }
+        } else if first_tomb < 0 {
+            first_tomb = idx
+        }
+        idx = (idx + 1) & (m.cap - 1)
+    }
+}
+
+fn (m: HashMap[K, V]) find_slot(key: K): i64 {
+    if m.cap == 0 || m.len == 0 {
+        return -1
+    }
+    var mask = u64(m.cap - 1)
+    var start = i64(hash_key(key) & mask)
+    var idx = start
+    loop {
+        var st = m.states[idx]
+        if st == 0 {
+            return -1
+        }
+        if st == 1 && m.keys[idx] == key {
+            return idx
+        }
+        idx = (idx + 1) & (m.cap - 1)
+        if idx == start {
+            return -1
+        }
+    }
+}
+
+fn (m: HashMap[K, V]) get(key: K): Option[V] {
+    var idx = m.find_slot(key)
+    if idx < 0 {
+        return .None
+    }
+    return .Some(m.vals[idx])
+}
+
+fn (m: HashMap[K, V]) get_or(key: K, default_val: V): V {
+    var idx = m.find_slot(key)
+    if idx < 0 {
+        return default_val
+    }
+    return m.vals[idx]
+}
+
+fn (m: HashMap[K, V]) contains(key: K): bool {
+    return m.find_slot(key) >= 0
+}
+
+fn (m: *HashMap[K, V]) remove(key: K): bool {
+    var idx = m.find_slot(key)
+    if idx < 0 {
+        return false
+    }
+    m.states[idx] = 2
+    m.len -= 1
+    return true
+}
+
+fn (m: *HashMap[K, V]) clear() {
+    if m.states != null && m.cap > 0 {
+        set_mem(m.states, 0, usize(m.cap))
+    }
+    m.len = 0
+}
+
+fn (m: *HashMap[K, V]) free() {
+    if m.keys != null {
+        free_mem(ptr_cast(*u8, m.keys))
+    }
+    if m.vals != null {
+        free_mem(ptr_cast(*u8, m.vals))
+    }
+    if m.states != null {
+        free_mem(m.states)
+    }
+    m.keys = null
+    m.vals = null
+    m.states = null
+    m.len = 0
+    m.cap = 0
+}

@@ -73,6 +73,100 @@ static Node *parse_expr(Parser *p);
 static Node *parse_block(Parser *p);
 static Node *parse_stmt(Parser *p);
 
+// Parses a full type string inside `[...]` (e.g. `i32`, `*Point`, `[]u8`, `Result[i32,str]`).
+static void parse_type_arg_buf(Parser *p, Buf *b) {
+    skip_terms(p);
+    while (cur(p)->kind == T_LBRACKET && peek(p, 1)->kind == T_RBRACKET) {
+        next(p); // '['
+        next(p); // ']'
+        buf_u8(b, '[');
+        buf_u8(b, ']');
+    }
+    while (match(p, T_STAR)) {
+        buf_u8(b, '*');
+    }
+    Token *t = expect(p, T_IDENT);
+    buf_bytes(b, t->name, strlen(t->name));
+    if (match(p, T_LBRACKET)) {
+        buf_u8(b, '[');
+        for (int i = 0; ; i++) {
+            if (i > 0) buf_u8(b, ',');
+            parse_type_arg_buf(p, b);
+            skip_terms(p);
+            if (!match(p, T_COMMA)) break;
+        }
+        expect(p, T_RBRACKET);
+        buf_u8(b, ']');
+    }
+}
+
+// Parses `[T, U]` generic type parameter list on a struct, enum, or function declaration.
+static void parse_tparams(Parser *p, StrVec *tparams) {
+    if (!match(p, T_LBRACKET)) return;
+    skip_terms(p);
+    for (;;) {
+        skip_terms(p);
+        Token *tp = expect(p, T_IDENT);
+        for (int i = 0; i < tparams->len; i++) {
+            if (tparams->items[i] == tp->name) {
+                fatal(tp->pos, "duplicate type parameter '%s'", tp->name);
+            }
+        }
+        vec_push(*tparams, tp->name);
+        skip_terms(p);
+        if (!match(p, T_COMMA)) break;
+    }
+    expect(p, T_RBRACKET);
+}
+
+// Returns true if the current `[` starts a generic type argument list `[T1, T2]`
+// followed by `(`, `{` (when `!p->no_struct_lit`), or `.`, OR contains a comma `,`.
+static bool looks_like_generic_type_args(Parser *p) {
+    if (cur(p)->kind != T_LBRACKET) return false;
+    int idx = p->pos + 1;
+    int depth = 1;
+    bool has_comma = false;
+    while (idx < p->count && depth > 0) {
+        TokKind k = p->toks[idx].kind;
+        if (k == T_LBRACKET) {
+            depth++;
+        } else if (k == T_RBRACKET) {
+            depth--;
+            if (depth == 0) break;
+        } else if (k == T_COMMA && depth == 1) {
+            has_comma = true;
+        } else if (k != T_IDENT && k != T_STAR && k != T_COMMA && k != T_TERM) {
+            return false;
+        }
+        idx++;
+    }
+    if (depth != 0 || idx == p->pos + 1) return false;
+    // Empty `[]` at depth 1 is not a generic argument list.
+    TokKind after = (idx + 1 < p->count) ? p->toks[idx + 1].kind : T_EOF;
+    if (has_comma) return true;
+    if (after == T_LPAREN || after == T_DOT) return true;
+    if (!p->no_struct_lit && after == T_LBRACE) return true;
+    return false;
+}
+
+static const char *parse_generic_ident_suffix(Parser *p, const char *base_name) {
+    Buf b = {0};
+    buf_bytes(&b, base_name, strlen(base_name));
+    expect(p, T_LBRACKET);
+    buf_u8(&b, '[');
+    for (int i = 0; ; i++) {
+        if (i > 0) buf_u8(&b, ',');
+        parse_type_arg_buf(p, &b);
+        skip_terms(p);
+        if (!match(p, T_COMMA)) break;
+    }
+    expect(p, T_RBRACKET);
+    buf_u8(&b, ']');
+    const char *res = intern((const char *)b.data, (int)b.len);
+    free(b.data);
+    return res;
+}
+
 static const char *parse_type_spec(Parser *p, Pos *out_pos, DeclKind *dk, Node **len_expr, int *ptr_depth) {
     // Also accept prefix `[N]T` or `[]T` on return types / type annotations.
     if (dk && *dk == DECL_SCALAR && match(p, T_LBRACKET)) {
@@ -92,6 +186,9 @@ static const char *parse_type_spec(Parser *p, Pos *out_pos, DeclKind *dk, Node *
     else if (stars > 0) fatal(cur(p)->pos, "pointer type is not allowed here");
     Token *t = expect(p, T_IDENT);
     if (out_pos) *out_pos = t->pos;
+    if (cur(p)->kind == T_LBRACKET) {
+        return parse_generic_ident_suffix(p, t->name);
+    }
     return t->name;
 }
 
@@ -169,11 +266,15 @@ static Node *parse_primary_base(Parser *p) {
     }
     case T_IDENT: {
         next(p);
+        const char *ident_name = t->name;
+        if (looks_like_generic_type_args(p)) {
+            ident_name = parse_generic_ident_suffix(p, ident_name);
+        }
         if (match(p, T_LPAREN)) {
             bool saved_nsl = p->no_struct_lit;
             p->no_struct_lit = false;
             Node *n = new_node(N_CALL, t->pos);
-            n->name = t->name;
+            n->name = ident_name;
             skip_terms(p);
             if (cur(p)->kind != T_RPAREN) {
                 for (;;) {
@@ -189,11 +290,11 @@ static Node *parse_primary_base(Parser *p) {
             expect(p, T_RPAREN);
             return n;
         }
-        // Struct literal: `Point { x: 10, y: 20 }` or `Point {}`
+        // Struct literal: `Point { x: 10, y: 20 }` or `Pair[i32, str] { ... }`
         if (!p->no_struct_lit && cur(p)->kind == T_LBRACE) {
             next(p); // '{'
             Node *n = new_node(N_STRUCT_LIT, t->pos);
-            n->name = t->name;
+            n->name = ident_name;
             skip_terms(p);
             while (cur(p)->kind != T_RBRACE && cur(p)->kind != T_EOF) {
                 Token *fid = expect(p, T_IDENT);
@@ -215,7 +316,7 @@ static Node *parse_primary_base(Parser *p) {
             return n;
         }
         Node *n = new_node(N_IDENT, t->pos);
-        n->name = t->name;
+        n->name = ident_name;
         return n;
     }
     case T_LPAREN: {
@@ -850,7 +951,8 @@ static Node *parse_fn_header(Parser *p) {
     Token *kw = expect(p, T_FN);
     Node *fn = new_node(N_FN, kw->pos);
 
-    // Optional method receiver: `fn (self: *Vec2) method(...)` or `fn (self: Vec2) method(...)`
+    // Optional method receiver: `fn (self: *Vec[T]) method(...)` or `fn [T](self: *Vec[T]) method(...)`
+    parse_tparams(p, &fn->tparams);
     const char *recv_type_name = NULL;
     if (match(p, T_LPAREN)) {
         skip_terms(p);
@@ -869,6 +971,7 @@ static Node *parse_fn_header(Parser *p) {
     }
 
     Token *id = expect(p, T_IDENT);
+    parse_tparams(p, &fn->tparams);
     if (recv_type_name) {
         char mname[256];
         int mlen = snprintf(mname, sizeof(mname), "%s.%s", recv_type_name, id->name);
@@ -943,6 +1046,7 @@ static Node *parse_struct(Parser *p) {
     Token *id = expect(p, T_IDENT);
     Node *st = new_node(N_STRUCT, kw->pos);
     st->name = id->name;
+    parse_tparams(p, &st->tparams);
     expect(p, T_LBRACE);
     skip_terms(p);
     while (cur(p)->kind != T_RBRACE && cur(p)->kind != T_EOF) {
@@ -969,6 +1073,7 @@ static Node *parse_enum(Parser *p) {
     Token *id = expect(p, T_IDENT);
     Node *en = new_node(N_ENUM, kw->pos);
     en->name = id->name;
+    parse_tparams(p, &en->tparams);
     expect(p, T_LBRACE);
     skip_terms(p);
     while (cur(p)->kind != T_RBRACE && cur(p)->kind != T_EOF) {

@@ -193,6 +193,8 @@ typedef enum {
 typedef enum { DECL_SCALAR = 0, DECL_ARRAY, DECL_SLICE } DeclKind;
 
 typedef VEC(Node *) NodeVec;
+typedef VEC(const char *) StrVec;
+typedef VEC(Type *) TypeVec;
 
 struct Node {
     NodeKind kind;
@@ -238,6 +240,7 @@ struct Node {
     int num_slots;                        // fn: total stack slots
     int label_break, label_continue;      // codegen
     int defer_depth;                      // codegen: active defer count at loop entry
+    StrVec tparams;                       // generic declaration type parameters (`[T, U]`)
 };
 
 NodeVec parse(Token *toks, int count);
@@ -256,6 +259,7 @@ typedef VEC(DllImport) DllImportVec;
 
 typedef struct {
     NodeVec fns;            // checked function declarations
+    NodeVec type_decls;     // concrete & instantiated N_STRUCT / N_ENUM declarations in layout order
     VEC(Symbol *) globals;  // global variables, in declaration order
     Symbol *main_fn;
     DllImportVec dll_imports;

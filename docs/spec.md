@@ -133,6 +133,18 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
   To keep `if` and `loop` headers unambiguous without parentheses, a struct literal may not appear directly at the top level of an `if` or `loop` header unless enclosed in `(...)`.
 - **Field access (`.`):** `.` accesses a field on both a struct value (`v.x`) and a pointer to a struct (`ptr.x`), automatically dereferencing the pointer (with a null check in `debug` mode). There is no `->` operator.
 
+### 2.7 Enums, Tagged Unions, and `?` Error Propagation
+- **Simple Enums (`enum`):** 32-bit signed nominal types (`i32` representation) with named variants.
+- **Tagged Unions (Payload Enums):** Any variant may declare a payload type `Variant(T)` (`enum Result[T, E] { Ok(T), Err(E) }`). Tagged unions have a 4-byte discriminant tag at offset 0 followed by a naturally aligned union payload.
+- **Inferred Variant Shorthand (`.Variant` / `.Variant(arg)`):** Supported wherever the expected `enum` type is known from context.
+- **Pattern Destructuring (`match`):** `match val { .Variant(x) { ... } }` binds the variant payload to `x` inside the arm.
+- **`?` Propagation (`expr?`):** Unwraps `.Ok(v)` / `.Some(v)` or runs active `defer` blocks in LIFO order and returns `.Err(e)` / `.None` early from the enclosing function.
+
+### 2.8 Compile-Time Generics (`[T]`)
+- `struct Name[T, U]`, `enum Name[T, E]`, `fn name[T](...)`, and `fn (self: *Name[T]) method(...)` are monomorphized on demand at compile time.
+- Generic function calls support both explicit type arguments (`max_val[i64](a, b)`) and type argument inference from value parameters (`max_val(a, b)`, `swap_val(&x, &y)`).
+- Standard generic collections are provided in `std/vec.sb` (`Vec[T]`) and `std/map.sb` (`HashMap[K, V]`, `Option[T]`).
+
 ### 2.2 No implicit conversions
 Values of different types never mix implicitly. `i32 + i64` is a compile error. Conversions are explicit and use the target type name as a function:
 ```
