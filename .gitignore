@@ -6,3 +6,6 @@
 
 # Temporary test outputs
 tests/tmp/
+
+# Benchmark build outputs
+benchmarks/out/
