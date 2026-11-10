@@ -36,8 +36,8 @@ Compile and run it with `sbc`:
 
 ### Dual-Backend Architecture
 Antimony provides two backends out of the box:
-1. **Default Native x64 Backend (`sbc file.sb`):** Emits Windows `PE32+` `.exe` machine code directly in memory in **~13 milliseconds** with zero external dependencies—ideal for instant edit-compile-run iteration.
-2. **Optimizing / LLVM `-O3` Backend (`sbc file.sb --llvm` or `-O3`):** Applies full loop unrolling, function inlining, and auto-vectorization for maximum production runtime speed (matching or beating `gcc -O2`/`-O3` while preserving Antimony's exact debug overflow/bounds traps when `--release` is not passed).
+1. **Default Native x64 Backend (`sbc file.sb`):** Emits Windows `PE32+` `.exe` machine code directly in memory in **~13 milliseconds** with zero external dependencies—including register allocation (`RBX`, `R12`–`R15`), AST function inlining with zero-instruction parameter aliasing, strength reduction for power-of-two `*`/`/`/`%`, multi-register `XMM0`–`XMM5` floating-point expression evaluation, and range-loop bounds-check elimination.
+2. **Optimizing / LLVM `-O3` Backend (`sbc file.sb --llvm` or `-O3`):** Applies full loop unrolling, interprocedural inlining, and SIMD auto-vectorization for maximum production runtime speed (matching or beating `gcc -O2`/`-O3` while preserving Antimony's exact debug overflow/bounds traps when `--release` is not passed).
 
 ### Core Syntax Rules
 - **No semicolons at the end of lines:** A newline ends a statement. Writing `;` at the end of a normal statement is a compile error.
