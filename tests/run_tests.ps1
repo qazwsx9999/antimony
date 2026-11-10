@@ -1706,4 +1706,87 @@ $phase15_expected = "100`n100`n125`n125`n120`ntrue`nfalse`n500`n28`n40000`n40000
 Test-RunOk "phase15_threads_and_atomics" $phase15_code $phase15_expected
 Test-RunLlvm "phase15_threads_and_atomics_llvm" $phase15_code $phase15_expected
 
+# 24. Phase 16: Native Function Inlining, Parameter Aliasing & Strength Reduction
+$phase16_code = @"
+import "std/vec.sb"
+
+fn sq(x: i64): i64 {
+    return x * x
+}
+
+fn sum_sq(a: i64, b: i64): i64 {
+    return sq(a) + sq(b)
+}
+
+fn clamp_val(v: i64, lo: i64, hi: i64): i64 {
+    if v < lo {
+        return lo
+    }
+    if v > hi {
+        return hi
+    }
+    return v
+}
+
+fn max2(a: i64, b: i64): i64 {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn main() {
+    // 1. Multi-level and nested same-callee inlining (`max2(max2(a, b), max2(c, d))`)
+    print(sum_sq(3, 4))
+    print(max2(max2(10, 50), max2(99, 25)))
+
+    var acc: i64 = 0
+    loop i in 0..100 {
+        acc += clamp_val(i64(i), 20, 80)
+    }
+    print(acc)
+
+    // 2. Signed & unsigned power-of-two and constant division/modulo strength reduction
+    var n1: i64 = -15
+    var n2: i64 = -16
+    var n3: i64 = -17
+    print(n1 / 4)
+    print(n1 % 4)
+    print(n2 / 4)
+    print(n2 % 4)
+    print(n3 / 4)
+    print(n3 % 4)
+    print(n1 / 2)
+    print(n1 % 2)
+    print(n1 / 1)
+    print(n1 % 1)
+    print(n1 / 7)
+    print(n1 % 7)
+
+    var u: u64 = 135
+    print(u / 8)
+    print(u % 8)
+    print(u / 10)
+    print(u % 10)
+
+    // 3. Inlined Vec[T] methods inside a loop
+    var v: Vec[i64]
+    v.init(8)
+    defer v.free()
+    loop i in 0..8 {
+        v.push(i64(i * 3))
+    }
+    var total: i64 = 0
+    loop i in 0..8 {
+        v.set(i64(i), v.get(i64(i)) + 1)
+        total += v.get(i64(i))
+    }
+    print(total)
+}
+"@
+$phase16_expected = "25`n99`n4970`n-3`n-3`n-4`n0`n-4`n-1`n-7`n-1`n-15`n0`n-2`n-1`n16`n7`n13`n5`n92"
+
+Test-RunOk "phase16_inlining_and_strength_reduction" $phase16_code $phase16_expected
+Test-RunLlvm "phase16_inlining_and_strength_reduction_llvm" $phase16_code $phase16_expected
+
 Write-Host "`nAll tests passed."

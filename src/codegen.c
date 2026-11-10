@@ -31,6 +31,10 @@ typedef struct {
     int base_slots;           // local variable slots in current function
     int max_out_stack_args;   // max args > 4 across calls in current function
     VEC(Node *) defers;       // active `defer` statement bodies in current function
+    Node *cur_fn;             // outermost function currently being compiled
+    Node *inline_stack[4];    // active inlined callee stack
+    int inline_depth;
+    Node *last_top_stmt;      // last top-level statement of current function/inline body
 } CG;
 
 static uint32_t add_string(CG *cg, const char *s, int len) {
@@ -527,6 +531,9 @@ static void gen_int_op(CG *cg, TokKind op, Type *t, Pos pos) {
 // ---------------------------------------------------------------------------
 
 static void gen_expr(CG *cg, Node *n);
+static void gen_block(CG *cg, Node *b);
+static bool can_inline_fn(CG *cg, Node *callee);
+static void gen_inline_call(CG *cg, Node *n, Node *callee);
 
 // Evaluates an array or slice expression `base` into (RAX = data_ptr, RDX = len).
 static void gen_collection_ptr_len(CG *cg, Node *base) {
@@ -1105,10 +1112,75 @@ static void gen_expr(CG *cg, Node *n) {
                     return;
                 }
             }
-            if (lt->kind == TY_INT && (n->op == T_STAR || n->op == T_STARW) &&
-                (n->op == T_STARW || cg->release)) {
+            if (lt->kind == TY_INT && (n->op == T_STAR || n->op == T_STARW)) {
+                if (n->op == T_STARW || cg->release) {
+                    gen_expr(cg, n->lhs);
+                    if (imm32 > 0 && (imm32 & (imm32 - 1)) == 0) {
+                        int k = 0;
+                        while ((1 << k) < imm32) k++;
+                        if (k > 0) x_shift_imm(4, 1, RAX, (uint8_t)k);
+                    } else {
+                        x_imul_rri(1, RAX, RAX, imm32);
+                    }
+                    normalize_rax(lt);
+                    return;
+                }
+                if (lt->size == 8 && lt->is_signed) {
+                    gen_expr(cg, n->lhs);
+                    x_imul_rri(1, RAX, RAX, imm32);
+                    emit_trap_if(cg, CC_O, n->pos, "integer multiplication overflow");
+                    return;
+                }
+            }
+            if (lt->kind == TY_INT && (n->op == T_SLASH || n->op == T_PERCENT) && imm32 > 0) {
                 gen_expr(cg, n->lhs);
-                x_imul_rri(1, RAX, RAX, imm32);
+                if (imm32 == 1) {
+                    if (n->op == T_PERCENT) x_mov_ri(RAX, 0);
+                    return;
+                }
+                if ((imm32 & (imm32 - 1)) == 0) {
+                    int k = 0;
+                    while ((1 << k) < imm32) k++;
+                    if (!lt->is_signed) {
+                        if (n->op == T_SLASH) x_shift_imm(5, 1, RAX, (uint8_t)k);
+                        else                  x_alu_ri(ALU_AND, 1, RAX, imm32 - 1);
+                    } else if (n->op == T_SLASH) {
+                        x_mov_rr(1, RCX, RAX);
+                        if (k == 1) {
+                            x_shift_imm(5, 1, RCX, 63);
+                        } else {
+                            x_shift_imm(7, 1, RCX, 63);
+                            x_alu_ri(ALU_AND, 1, RCX, imm32 - 1);
+                        }
+                        x_alu_rr(ALU_ADD, 1, RAX, RCX);
+                        x_shift_imm(7, 1, RAX, (uint8_t)k);
+                        normalize_rax(lt);
+                    } else {
+                        x_mov_rr(1, RCX, RAX);
+                        if (k == 1) {
+                            x_shift_imm(5, 1, RCX, 63);
+                        } else {
+                            x_shift_imm(7, 1, RCX, 63);
+                            x_alu_ri(ALU_AND, 1, RCX, imm32 - 1);
+                        }
+                        x_alu_rr(ALU_ADD, 1, RCX, RAX);
+                        x_alu_ri(ALU_AND, 1, RCX, -imm32);
+                        x_alu_rr(ALU_SUB, 1, RAX, RCX);
+                        normalize_rax(lt);
+                    }
+                    return;
+                }
+                // Positive non-power-of-two constant divisor (> 1): cannot be 0 or -1,
+                // so skip both runtime trap branches and divide directly.
+                x_mov_ri(RCX, (uint64_t)(int64_t)imm32);
+                if (lt->is_signed) {
+                    x_cqo();
+                    x_f7(7, 1, RCX);
+                } else {
+                    x_mov_ri(RDX, 0);
+                    x_f7(6, 1, RCX);
+                }
+                if (n->op == T_PERCENT) x_mov_rr(1, RAX, RDX);
                 normalize_rax(lt);
                 return;
             }
@@ -1259,12 +1331,16 @@ static void gen_expr(CG *cg, Node *n) {
         // pass a slice by address of its 16-byte `{ptr, len}` descriptor in a
         // single register/stack argument, and the callee copies the 16 bytes into
         // its local slice slot in the prologue.
+        bool is_indirect = (n->sym == NULL && n->lhs != NULL);
+        if (!is_indirect && n->sym && !n->sym->is_extern && can_inline_fn(cg, n->sym->decl)) {
+            gen_inline_call(cg, n, n->sym->decl);
+            return;
+        }
         int nargs = n->list.len;
         if (nargs > 4 && (nargs - 4) > cg->max_out_stack_args) {
             cg->max_out_stack_args = nargs - 4;
         }
         static const int arg_regs[4] = {RCX, RDX, R8, R9};
-        bool is_indirect = (n->sym == NULL && n->lhs != NULL);
         int fn_slot = 0;
         if (is_indirect) {
             gen_expr(cg, n->lhs);
@@ -1880,13 +1956,13 @@ static void gen_stmt(CG *cg, Node *n) {
                 int addr_slot = push_temp(cg);
                 gen_init_at_addr(cg, addr_slot, n->lhs, cg->cur_ret_type);
                 cg->temp_depth--;
-                if (cg->defers.len > 0) {
+                if (cg->inline_depth == 0 && cg->defers.len > 0) {
                     emit_defers_from(cg, 0);
                 }
                 x_load(RAX, RBP, slot_disp(cg->cur_ret_ptr_slot));
             } else if (cg->cur_ret_type == &ty_str || cg->cur_ret_type->kind == TY_SLICE) {
                 gen_collection_ptr_len(cg, n->lhs);
-                if (cg->defers.len > 0) {
+                if (cg->inline_depth == 0 && cg->defers.len > 0) {
                     int s_ptr = push_temp(cg);
                     x_mov_rr(1, RAX, RDX);
                     int s_len = push_temp(cg);
@@ -1896,16 +1972,18 @@ static void gen_stmt(CG *cg, Node *n) {
                 }
             } else {
                 gen_expr(cg, n->lhs);
-                if (cg->defers.len > 0) {
+                if (cg->inline_depth == 0 && cg->defers.len > 0) {
                     int ret_slot = push_temp(cg);
                     emit_defers_from(cg, 0);
                     pop_temp(cg, ret_slot, RAX);
                 }
             }
-        } else if (cg->defers.len > 0) {
+        } else if (cg->inline_depth == 0 && cg->defers.len > 0) {
             emit_defers_from(cg, 0);
         }
-        x_jmp(cg->cur_epilogue);
+        if (!(n == cg->last_top_stmt && (cg->inline_depth > 0 || cg->defers.len == 0))) {
+            x_jmp(cg->cur_epilogue);
+        }
         return;
 
     case N_BREAK:
@@ -2110,6 +2188,221 @@ static void gen_block(CG *cg, Node *b) {
 }
 
 // ---------------------------------------------------------------------------
+// Native AST Function Inlining & Parameter Register/Slot Aliasing
+// ---------------------------------------------------------------------------
+
+static bool node_modifies_or_addrs_sym(Node *n, Symbol *s) {
+    if (!n) return false;
+    if (n->kind == N_ASSIGN) {
+        if (n->sym == s) return true;
+        Node *base = n->lhs;
+        while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
+            base = base->lhs;
+        }
+        if (base && base->kind == N_IDENT && base->sym == s) return true;
+    }
+    if (n->kind == N_ADDR) {
+        Node *base = n->lhs;
+        while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
+            base = base->lhs;
+        }
+        if (base && base->kind == N_IDENT && base->sym == s) return true;
+    }
+    if (node_modifies_or_addrs_sym(n->lhs, s)) return true;
+    if (node_modifies_or_addrs_sym(n->rhs, s)) return true;
+    if (node_modifies_or_addrs_sym(n->cond, s)) return true;
+    if (node_modifies_or_addrs_sym(n->body, s)) return true;
+    if (node_modifies_or_addrs_sym(n->els, s)) return true;
+    if (node_modifies_or_addrs_sym(n->lo, s)) return true;
+    if (node_modifies_or_addrs_sym(n->hi, s)) return true;
+    if (node_modifies_or_addrs_sym(n->by, s)) return true;
+    if (node_modifies_or_addrs_sym(n->init, s)) return true;
+    if (node_modifies_or_addrs_sym(n->step, s)) return true;
+    for (int i = 0; i < n->list.len; i++) {
+        if (node_modifies_or_addrs_sym(n->list.items[i], s)) return true;
+    }
+    return false;
+}
+
+static bool check_inline_body(Node *n, int *count) {
+    if (!n) return true;
+    if (++(*count) > 40) return false;
+    if (n->kind == N_DEFER || n->kind == N_TRY) return false;
+    if (!check_inline_body(n->lhs, count)) return false;
+    if (!check_inline_body(n->rhs, count)) return false;
+    if (!check_inline_body(n->cond, count)) return false;
+    if (!check_inline_body(n->body, count)) return false;
+    if (!check_inline_body(n->els, count)) return false;
+    if (!check_inline_body(n->lo, count)) return false;
+    if (!check_inline_body(n->hi, count)) return false;
+    if (!check_inline_body(n->by, count)) return false;
+    if (!check_inline_body(n->init, count)) return false;
+    if (!check_inline_body(n->step, count)) return false;
+    for (int i = 0; i < n->list.len; i++) {
+        if (!check_inline_body(n->list.items[i], count)) return false;
+    }
+    return true;
+}
+
+static bool can_inline_fn(CG *cg, Node *callee) {
+    if (!callee || callee->is_extern || !callee->body) return false;
+    if (cg->scratch_depth > 0) return false;
+    if (is_aggregate_type(callee->type)) return false;
+    if (callee == cg->cur_fn || cg->inline_depth >= 2) return false;
+    for (int i = 0; i < cg->inline_depth; i++) {
+        if (cg->inline_stack[i] == callee) return false;
+    }
+    for (int i = 0; i < callee->list.len; i++) {
+        Symbol *ps = callee->list.items[i]->sym;
+        if ((ps->type->kind == TY_ARRAY || is_aggregate_type(ps->type)) &&
+            node_modifies_or_addrs_sym(callee->body, ps)) {
+            return false;
+        }
+    }
+    int count = 0;
+    return check_inline_body(callee->body, &count);
+}
+
+static void shift_node_slots(Node *n, int delta) {
+    if (!n) return;
+    if (n->slot_start > 0) n->slot_start += delta;
+    if (n->slot_end > 0)   n->slot_end   += delta;
+    if (n->slot_step > 0)  n->slot_step  += delta;
+
+    switch (n->kind) {
+    case N_VAR:
+    case N_LOOP_RANGE:
+    case N_MATCH_ARM:
+        if (n->sym) {
+            n->sym->slot += delta;
+            n->sym->hw_reg = -1;
+        }
+        break;
+    case N_LOOP_ITER:
+        if (n->sym) {
+            n->sym->slot += delta;
+            n->sym->hw_reg = -1;
+        }
+        if (n->sym2) {
+            n->sym2->slot += delta;
+            n->sym2->hw_reg = -1;
+        }
+        break;
+    default:
+        break;
+    }
+
+    shift_node_slots(n->lhs, delta);
+    shift_node_slots(n->rhs, delta);
+    shift_node_slots(n->cond, delta);
+    shift_node_slots(n->body, delta);
+    shift_node_slots(n->els, delta);
+    shift_node_slots(n->lo, delta);
+    shift_node_slots(n->hi, delta);
+    shift_node_slots(n->by, delta);
+    shift_node_slots(n->init, delta);
+    shift_node_slots(n->step, delta);
+    for (int i = 0; i < n->list.len; i++) {
+        shift_node_slots(n->list.items[i], delta);
+    }
+}
+
+static void gen_inline_call(CG *cg, Node *n, Node *callee) {
+    int nargs = n->list.len;
+    int delta = cg->base_slots + cg->temp_depth;
+    cg->temp_depth += callee->num_slots;
+    if (cg->temp_depth > cg->max_temp_depth) {
+        cg->max_temp_depth = cg->temp_depth;
+    }
+
+    int *orig_slot = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
+    int *orig_hw   = nargs ? xmalloc((size_t)nargs * sizeof(int)) : NULL;
+    bool *aliased  = nargs ? xcalloc((size_t)nargs, sizeof(bool)) : NULL;
+
+    // 1. Evaluate non-aliased arguments into their reserved target slots `[RBP - 8*(delta + ps->slot)]`
+    //    before shifting `callee` (so nested calls to `callee` in arguments can also inline cleanly).
+    for (int i = 0; i < nargs; i++) {
+        Symbol *ps = callee->list.items[i]->sym;
+        Node *arg  = n->list.items[i];
+        orig_slot[i] = ps->slot;
+        orig_hw[i]   = ps->hw_reg;
+        if (arg->kind == N_IDENT && !arg->implicit_slice && arg->sym) {
+            Symbol *as = arg->sym;
+            if ((as->kind == SYM_VAR || as->kind == SYM_PARAM) && !as->is_global && !as->addr_taken &&
+                as->type == ps->type && ps->type->kind != TY_ARRAY && !is_aggregate_type(ps->type) &&
+                !node_modifies_or_addrs_sym(callee->body, ps)) {
+                aliased[i] = true;
+                continue;
+            }
+        }
+        int target_slot = delta + ps->slot;
+        if (ps->type->kind == TY_SLICE || ps->type == &ty_str) {
+            gen_collection_ptr_len(cg, arg);
+            x_store(RBP, slot_disp(target_slot), RAX);
+            x_store(RBP, slot_disp(target_slot) + 8, RDX);
+        } else {
+            gen_expr(cg, arg);
+            x_store(RBP, slot_disp(target_slot), RAX);
+        }
+    }
+
+    // 2. Shift `callee` parameter & local slots by `+delta` (or bind aliased parameters to caller's reg/slot).
+    for (int i = 0; i < nargs; i++) {
+        Symbol *ps = callee->list.items[i]->sym;
+        if (aliased[i]) {
+            Symbol *as = n->list.items[i]->sym;
+            ps->slot   = as->slot;
+            ps->hw_reg = as->hw_reg;
+        } else {
+            ps->slot  += delta;
+            ps->hw_reg = -1;
+        }
+    }
+    shift_node_slots(callee->body, delta);
+
+    // 3. Emit `callee->body` inline.
+    cg->inline_stack[cg->inline_depth++] = callee;
+    if (callee->body->list.len == 1 && callee->body->list.items[0]->kind == N_RETURN) {
+        Node *ret_expr = callee->body->list.items[0]->lhs;
+        if (ret_expr) {
+            if (callee->type == &ty_str || callee->type->kind == TY_SLICE) {
+                gen_collection_ptr_len(cg, ret_expr);
+            } else {
+                gen_expr(cg, ret_expr);
+            }
+        }
+    } else {
+        int saved_epilogue = cg->cur_epilogue;
+        Type *saved_ret_type = cg->cur_ret_type;
+        Node *saved_last_top = cg->last_top_stmt;
+        int inline_end = x_label();
+        cg->cur_epilogue = inline_end;
+        cg->cur_ret_type = callee->type;
+        cg->last_top_stmt = (callee->body->list.len > 0)
+            ? callee->body->list.items[callee->body->list.len - 1]
+            : NULL;
+        gen_block(cg, callee->body);
+        x_bind(inline_end);
+        cg->cur_epilogue = saved_epilogue;
+        cg->cur_ret_type = saved_ret_type;
+        cg->last_top_stmt = saved_last_top;
+    }
+    cg->inline_depth--;
+
+    // 4. Restore `callee` slots and release temporary frame space.
+    shift_node_slots(callee->body, -delta);
+    for (int i = 0; i < nargs; i++) {
+        Symbol *ps = callee->list.items[i]->sym;
+        ps->slot   = orig_slot[i];
+        ps->hw_reg = orig_hw[i];
+    }
+    free(orig_slot);
+    free(orig_hw);
+    free(aliased);
+    cg->temp_depth -= callee->num_slots;
+}
+
+// ---------------------------------------------------------------------------
 // Loop-weighted callee-saved register allocator (RBX, R12, R13, R14, R15)
 // ---------------------------------------------------------------------------
 
@@ -2170,6 +2463,14 @@ static void scan_node_vars(SymVec *locals, Node *n, int weight) {
         scan_node_vars(locals, n->lhs, weight);
         scan_node_vars(locals, n->rhs, weight);
         return;
+    case N_CALL: {
+        int arg_w = (n->sym && !n->sym->is_extern && n->sym->decl && n->sym->decl->body) ? weight * 2 : weight;
+        scan_node_vars(locals, n->lhs, weight);
+        for (int i = 0; i < n->list.len; i++) {
+            scan_node_vars(locals, n->list.items[i], arg_w);
+        }
+        return;
+    }
     case N_LOOP_INF:
         scan_node_vars(locals, n->body, loop_w);
         return;
@@ -2251,6 +2552,11 @@ static void gen_fn(CG *cg, Node *fn) {
     x_mov_rr(1, RBP, RSP);
     uint32_t patch = x_sub_rsp_patchable();
 
+    cg->cur_fn = fn;
+    cg->inline_depth = 0;
+    cg->last_top_stmt = (fn->body && fn->body->list.len > 0)
+        ? fn->body->list.items[fn->body->list.len - 1]
+        : NULL;
     cg->cur_epilogue = x_label();
     cg->cur_ret_type = fn->type;
     cg->cur_ret_ptr_slot = fn->slot_start;
@@ -2309,6 +2615,12 @@ static void gen_fn(CG *cg, Node *fn) {
     int frame = total_locals + out_area;
     if (frame % 16 != 0) frame += 16 - (frame % 16);
     buf_put_u32(&A.code, patch, (uint32_t)frame);
+
+    // Reset `hw_reg` on parameters and locals so subsequent inlining of `fn` starts clean.
+    for (int i = 0; i < fn->list.len; i++) {
+        fn->list.items[i]->sym->hw_reg = -1;
+    }
+    shift_node_slots(fn->body, 0);
 }
 
 // ---------------------------------------------------------------------------
