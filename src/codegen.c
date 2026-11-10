@@ -35,6 +35,8 @@ typedef struct {
     Node *inline_stack[4];    // active inlined callee stack
     int inline_depth;
     Node *last_top_stmt;      // last top-level statement of current function/inline body
+    Node *range_loops[8];     // active enclosing N_LOOP_RANGE statements for bounds-check elimination
+    int num_range_loops;
 } CG;
 
 static uint32_t add_string(CG *cg, const char *s, int len) {
@@ -333,6 +335,101 @@ static void xmm_f64_to_gpr(int gpr, int xmm, Type *t) {
     }
 }
 
+// Returns true if floating-point expression `n` can be evaluated directly in volatile
+// XMM registers `XMM[xmm .. 5]` without function calls or stack spills.
+static bool can_eval_xmm(Node *n, int xmm) {
+    if (!n || xmm > 5 || !n->type || n->type->kind != TY_FLOAT) return false;
+    if (is_simple_expr(n)) return true;
+    if (n->kind == N_CONV && n->lhs->type->kind == TY_INT && n->lhs->type->is_signed &&
+        is_simple_expr(n->lhs)) {
+        return true;
+    }
+    if (n->kind == N_UNARY && n->op == T_MINUS && can_eval_xmm(n->lhs, xmm) && xmm < 5) {
+        return true;
+    }
+    if (n->kind == N_BINARY &&
+        (n->op == T_PLUS || n->op == T_MINUS || n->op == T_STAR || n->op == T_SLASH) &&
+        xmm < 5) {
+        return can_eval_xmm(n->lhs, xmm) && can_eval_xmm(n->rhs, xmm + 1);
+    }
+    return false;
+}
+
+// Evaluates `n` directly into `XMM[xmm]` as a 64-bit IEEE-754 double (preserving f32 rounding when `n->type == &ty_f32`).
+static void gen_float_xmm(Node *n, int xmm) {
+    if (is_simple_expr(n)) {
+        if (n->kind == N_IDENT && !n->implicit_slice && n->sym->hw_reg >= 0 && n->type == &ty_f64) {
+            x_movq_xmm_gpr(xmm, n->sym->hw_reg);
+            return;
+        }
+        gen_simple_into_reg(n, RAX);
+        gpr_to_xmm_f64(xmm, RAX, n->type);
+        return;
+    }
+    if (n->kind == N_CONV && n->lhs->type->kind == TY_INT && n->lhs->type->is_signed &&
+        is_simple_expr(n->lhs)) {
+        if (n->lhs->kind == N_IDENT && !n->lhs->implicit_slice && n->lhs->sym->hw_reg >= 0) {
+            x_cvtsi2sd(xmm, n->lhs->sym->hw_reg);
+        } else {
+            gen_simple_into_reg(n->lhs, RAX);
+            x_cvtsi2sd(xmm, RAX);
+        }
+        if (n->type == &ty_f32) {
+            x_cvtsd2ss(xmm, xmm);
+            x_cvtss2sd(xmm, xmm);
+        }
+        return;
+    }
+    if (n->kind == N_UNARY && n->op == T_MINUS) {
+        x_mov_ri(RAX, 0);
+        x_movq_xmm_gpr(xmm, RAX);
+        gen_float_xmm(n->lhs, xmm + 1);
+        x_sse_sd(0x5C, xmm, xmm + 1); // subsd 0.0, lhs
+        return;
+    }
+    if (n->kind == N_BINARY) {
+        gen_float_xmm(n->lhs, xmm);
+        gen_float_xmm(n->rhs, xmm + 1);
+        uint8_t op = (n->op == T_PLUS)  ? 0x58
+                   : (n->op == T_MINUS) ? 0x5C
+                   : (n->op == T_STAR)  ? 0x59 : 0x5E;
+        x_sse_sd(op, xmm, xmm + 1);
+        if (n->type == &ty_f32) {
+            x_cvtsd2ss(xmm, xmm);
+            x_cvtss2sd(xmm, xmm);
+        }
+        return;
+    }
+}
+
+// Emits float comparison result (0 or 1 in RAX) from `XMM0` (lhs) and `XMM1` (rhs).
+static void emit_xmm_cmp_rax(TokKind op) {
+    if (op == T_LT) {
+        x_ucomisd(1, 0);
+        x_setcc(CC_A, RAX);
+    } else if (op == T_LE) {
+        x_ucomisd(1, 0);
+        x_setcc(CC_AE, RAX);
+    } else if (op == T_GT) {
+        x_ucomisd(0, 1);
+        x_setcc(CC_A, RAX);
+    } else if (op == T_GE) {
+        x_ucomisd(0, 1);
+        x_setcc(CC_AE, RAX);
+    } else if (op == T_EQ) {
+        x_ucomisd(0, 1);
+        x_setcc(CC_E, RAX);
+        x_setcc(CC_NP, RCX);
+        x_alu_rr(ALU_AND, 0, RAX, RCX);
+    } else { // T_NE
+        x_ucomisd(0, 1);
+        x_setcc(CC_NE, RAX);
+        x_setcc(CC_P, RCX);
+        x_alu_rr(ALU_OR, 0, RAX, RCX);
+    }
+    x_movzx8(RAX, RAX);
+}
+
 // Combines RAX (left) and RCX (right) of float type `t` -> RAX.
 static void gen_float_op(TokKind op, Type *t) {
     gpr_to_xmm_f64(0, RAX, t); // XMM0 = lhs
@@ -355,35 +452,9 @@ static void gen_float_op(TokKind op, Type *t) {
         x_sse_sd(0x5E, 0, 1); // divsd xmm0, xmm1
         xmm_f64_to_gpr(RAX, 0, t);
         return;
-    case T_EQ: case T_NE: case T_LT: case T_LE: case T_GT: case T_GE: {
-        // ucomisd sets ZF/PF/CF; for `<` and `<=`, swap operands and use `>` / `>=`
-        // so unordered NaN comparisons return false properly.
-        if (op == T_LT) {
-            x_ucomisd(1, 0);
-            x_setcc(CC_A, RAX);
-        } else if (op == T_LE) {
-            x_ucomisd(1, 0);
-            x_setcc(CC_AE, RAX);
-        } else if (op == T_GT) {
-            x_ucomisd(0, 1);
-            x_setcc(CC_A, RAX);
-        } else if (op == T_GE) {
-            x_ucomisd(0, 1);
-            x_setcc(CC_AE, RAX);
-        } else if (op == T_EQ) {
-            x_ucomisd(0, 1);
-            x_setcc(CC_E, RAX);
-            x_setcc(CC_NP, RCX);
-            x_alu_rr(ALU_AND, 0, RAX, RCX);
-        } else { // T_NE
-            x_ucomisd(0, 1);
-            x_setcc(CC_NE, RAX);
-            x_setcc(CC_P, RCX);
-            x_alu_rr(ALU_OR, 0, RAX, RCX);
-        }
-        x_movzx8(RAX, RAX);
+    case T_EQ: case T_NE: case T_LT: case T_LE: case T_GT: case T_GE:
+        emit_xmm_cmp_rax(op);
         return;
-    }
     default:
         die("internal error: unhandled float op in codegen");
     }
@@ -543,6 +614,32 @@ static void gen_collection_ptr_len(CG *cg, Node *base) {
     }
 }
 
+static bool node_modifies_or_addrs_sym(Node *n, Symbol *s);
+
+// Returns true if `idx` is the induction variable of an active `loop i in lo..hi`
+// whose range `[lo, hi)` is statically guaranteed to lie within `0 .. len(base)`.
+static bool is_range_loop_in_bounds(CG *cg, Node *base, Node *idx) {
+    if (!base || !idx || idx->kind != N_IDENT || !idx->sym || !idx->sym->readonly) return false;
+    for (int k = cg->num_range_loops - 1; k >= 0; k--) {
+        Node *L = cg->range_loops[k];
+        if (L->sym != idx->sym) continue;
+        if (!L->lo || !L->lo->is_const || L->lo->cval < 0) return false;
+        if (base->type->kind == TY_ARRAY && !base->implicit_slice) {
+            if (L->hi && L->hi->is_const && L->hi->cval <= base->type->array_len) {
+                return true;
+            }
+        }
+        if (base->kind == N_IDENT && base->sym && L->hi &&
+            L->hi->kind == N_CALL && L->hi->builtin == B_LEN &&
+            L->hi->list.len == 1 && L->hi->list.items[0]->kind == N_IDENT &&
+            L->hi->list.items[0]->sym == base->sym &&
+            !node_modifies_or_addrs_sym(L->body, base->sym)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Evaluates `n` (an N_INDEX node `base[idx]`), performs bounds checking
 // (`0 <= idx < len`) for arrays/slices or a debug null check for pointers,
 // and returns the element address in RAX.
@@ -556,6 +653,14 @@ static void gen_index_addr(CG *cg, Node *n) {
             x_test_rr(1, RAX, RAX);
             emit_trap_if(cg, CC_E, n->pos, "null pointer dereference");
         }
+        if (n->rhs->is_const) {
+            int64_t off = (int64_t)n->rhs->cval * elem_t->size;
+            if (off == 0) return;
+            if (off >= INT32_MIN && off <= INT32_MAX) {
+                x_alu_ri(ALU_ADD, 1, RAX, (int32_t)off);
+                return;
+            }
+        }
         if (is_simple_expr(n->rhs)) {
             x_mov_rr(1, RCX, RAX);
             gen_simple_into_reg(n->rhs, RAX);
@@ -568,6 +673,8 @@ static void gen_index_addr(CG *cg, Node *n) {
         x_alu_rr(ALU_ADD, 1, RAX, RCX);
         return;
     }
+
+    bool proven_in_bounds = is_range_loop_in_bounds(cg, n->lhs, n->rhs);
 
     // Fast path for fixed-size array variable `arr[idx]`: zero stack spills.
     if (n->lhs->kind == N_IDENT && bt->kind == TY_ARRAY && !n->lhs->implicit_slice) {
@@ -584,8 +691,10 @@ static void gen_index_addr(CG *cg, Node *n) {
             return;
         }
         gen_expr(cg, n->rhs); // RAX = idx
-        x_alu_ri(ALU_CMP, 1, RAX, bt->array_len);
-        emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        if (!proven_in_bounds) {
+            x_alu_ri(ALU_CMP, 1, RAX, bt->array_len);
+            emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        }
         scale_reg_by_size(RAX, elem_t->size, RDX);
         load_var(s, RCX);
         x_alu_rr(ALU_ADD, 1, RAX, RCX);
@@ -596,10 +705,15 @@ static void gen_index_addr(CG *cg, Node *n) {
     if (n->lhs->kind == N_IDENT && (bt->kind == TY_SLICE || bt == &ty_str) && is_simple_expr(n->rhs)) {
         Symbol *s = n->lhs->sym;
         gen_simple_into_reg(n->rhs, RAX);
-        if (!cg->release) {
+        if (!cg->release && !proven_in_bounds) {
             x_load(RDX, RBP, slot_disp(s->slot) + 8);
             x_alu_rr(ALU_CMP, 1, RAX, RDX);
             emit_trap_if(cg, CC_AE, n->rhs->pos, "index out of bounds");
+        }
+        if (n->rhs->is_const && n->rhs->cval == 0) {
+            if (s->hw_reg >= 0) x_mov_rr(1, RAX, s->hw_reg);
+            else                x_load(RAX, RBP, slot_disp(s->slot));
+            return;
         }
         scale_reg_by_size(RAX, elem_t->size, RDX);
         if (s->hw_reg >= 0) {
@@ -1047,6 +1161,19 @@ static void gen_expr(CG *cg, Node *n) {
             if (n->op == T_NE) {
                 x_alu_ri(ALU_XOR, 0, RAX, 1);
             }
+            return;
+        }
+
+        // Fast XMM register-tree evaluation for floating-point arithmetic & comparisons.
+        if (n->lhs->type->kind == TY_FLOAT && can_eval_xmm(n->lhs, 0) && can_eval_xmm(n->rhs, 1)) {
+            if (n->op == T_PLUS || n->op == T_MINUS || n->op == T_STAR || n->op == T_SLASH) {
+                gen_float_xmm(n, 0);
+                xmm_f64_to_gpr(RAX, 0, n->type);
+                return;
+            }
+            gen_float_xmm(n->lhs, 0);
+            gen_float_xmm(n->rhs, 1);
+            emit_xmm_cmp_rax(n->op);
             return;
         }
 
@@ -1610,6 +1737,31 @@ static void gen_assign(CG *cg, Node *n) {
         }
     }
 
+    // Fast XMM compound assignment (`acc += f64_expr`, `acc *= f64_expr`).
+    if (s->type == &ty_f64 && can_eval_xmm(n->rhs, 1)) {
+        TokKind binop = assign_to_binop(n->op);
+        if (binop == T_PLUS || binop == T_MINUS || binop == T_STAR || binop == T_SLASH) {
+            if (s->hw_reg >= 0) {
+                x_movq_xmm_gpr(0, s->hw_reg);
+            } else {
+                load_var(s, RAX);
+                x_movq_xmm_gpr(0, RAX);
+            }
+            gen_float_xmm(n->rhs, 1);
+            uint8_t op = (binop == T_PLUS)  ? 0x58
+                       : (binop == T_MINUS) ? 0x5C
+                       : (binop == T_STAR)  ? 0x59 : 0x5E;
+            x_sse_sd(op, 0, 1);
+            if (s->hw_reg >= 0) {
+                x_movq_gpr_xmm(s->hw_reg, 0);
+            } else {
+                x_movq_gpr_xmm(RAX, 0);
+                store_var(s, RAX);
+            }
+            return;
+        }
+    }
+
     if (is_simple_expr(n->rhs)) {
         load_var(s, RAX);
         gen_simple_into_reg(n->rhs, RCX);
@@ -1747,7 +1899,9 @@ static void gen_range_loop(CG *cg, Node *n) {
         store_var(n->sym, RAX);
 
         x_bind(l_cond);
+        if (cg->num_range_loops < 8) cg->range_loops[cg->num_range_loops++] = n;
         gen_block(cg, n->body);
+        if (cg->num_range_loops > 0 && cg->range_loops[cg->num_range_loops - 1] == n) cg->num_range_loops--;
 
         x_bind(l_cont);
         int32_t end_imm = 0;

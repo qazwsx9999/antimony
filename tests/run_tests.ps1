@@ -1789,4 +1789,55 @@ $phase16_expected = "25`n99`n4970`n-3`n-3`n-4`n0`n-4`n-1`n-7`n-1`n-15`n0`n-2`n-1
 Test-RunOk "phase16_inlining_and_strength_reduction" $phase16_code $phase16_expected
 Test-RunLlvm "phase16_inlining_and_strength_reduction_llvm" $phase16_code $phase16_expected
 
+# 25. Phase 17: XMM Expression-Tree Evaluation & Range-Loop Bounds-Check Elimination
+$phase17_code = @"
+fn mandelbrot_point(cr: f64, ci: f64, max_iter: i32): i32 {
+    var zr: f64 = 0.0
+    var zi: f64 = 0.0
+    loop iter in 0..max_iter {
+        if zr * zr + zi * zi > 4.0 {
+            return iter
+        }
+        var next_zr = zr * zr - zi * zi + cr
+        zi = 2.0 * zr * zi + ci
+        zr = next_zr
+    }
+    return max_iter
+}
+
+fn sum_slice(s: []i64): i64 {
+    var acc: i64 = 0
+    loop i in 0..len(s) {
+        acc += s[i]
+    }
+    return acc
+}
+
+fn main() {
+    // 1. Multi-register XMM expression trees (Mandelbrot kernel + compound float assignments)
+    print(mandelbrot_point(0.0, 0.0, 100))
+    print(mandelbrot_point(1.0, 1.0, 100))
+    print(mandelbrot_point(-0.5, 0.0, 100))
+
+    var f_acc: f64 = 1.5
+    loop i in 1..6 {
+        f_acc += f64(i) * 0.25 - (-0.5)
+    }
+    print(f_acc)
+
+    // 2. Range-loop bounds-check elimination on fixed-size arrays and slices
+    var arr: [16]i64 = []
+    loop i in 0..16 {
+        arr[i] = i64(i * 10)
+    }
+    print(arr[0])
+    print(arr[15])
+    print(sum_slice(arr))
+}
+"@
+$phase17_expected = "100`n2`n100`n7.75`n0`n150`n1200"
+
+Test-RunOk "phase17_xmm_and_loop_bce" $phase17_code $phase17_expected
+Test-RunLlvm "phase17_xmm_and_loop_bce_llvm" $phase17_code $phase17_expected
+
 Write-Host "`nAll tests passed."
