@@ -10,8 +10,8 @@
 #   * Only runtime is compared. Compile times are not reported here because they
 #     depend heavily on caches (e.g. Go's build cache) and are easy to misread.
 #   * Toolchains that are not installed are skipped.
-#   * `sbc --llvm` translates Antimony to C and compiles it with clang, or gcc if clang
-#     is missing, using `-O3 -march=native`. C and Rust get matching native-CPU flags
+#   * `sbc --llvm` emits LLVM IR (.ll) directly from the Antimony AST and compiles it
+#     via LLVM `clang -O3 -march=native`. C and Rust get matching native-CPU flags
 #     so that comparison is fair. Go has no equivalent flag.
 param([int]$Runs = 5)
 

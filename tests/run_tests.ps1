@@ -1064,6 +1064,13 @@ function Test-RunLlvm([string]$name, [string]$code, [string]$expected) {
     Set-Content -Path $sb -Value $code -Encoding UTF8
     $null = & $sbc $sb -o $ll --emit-llvm 2>&1
     if ($LASTEXITCODE -ne 0 -or !(Test-Path $ll)) { throw "FAIL [$name]: failed --emit-llvm" }
+    $llText = Get-Content -Path $ll -Raw
+    if ($llText -notmatch 'target triple\s*=' -or $llText -notmatch 'define\s+.*@sb_fn_main\s*\(' -or $llText -notmatch '\balloca\b') {
+        throw "FAIL [$name]: --emit-llvm did not emit genuine LLVM IR"
+    }
+    if ($llText -match '#include\s*<') {
+        throw "FAIL [$name]: --emit-llvm emitted C code instead of LLVM IR"
+    }
     $optOut = (& $sbc $sb -o $exe --llvm 2>&1) -join "`n"
     if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile with --llvm:`n$optOut" }
     $out = ((& $exe) -join "`n").Replace("`r`n", "`n").Trim()
@@ -2010,5 +2017,69 @@ fn bump_via_ptr(x: i64): i64 {
 "@
 Test-RunOk "phase18_inline_addr_taken_local" $phase18_addr_code "15"
 Test-RunOk "phase18_inline_addr_taken_local_release" $phase18_addr_code "15" -Release
+
+# Verify --emit-llvm directly emits genuine LLVM IR instructions for GEP, atomics, defer, generics, fnptrs, slices, tagged unions.
+$phase19_ir_code = @"
+enum Outcome {
+    Ok(i64)
+    Err(i32)
+}
+
+struct Boxed[T] {
+    val: T
+    tag: i64
+}
+
+fn make_box[T](v: T, t: i64): Boxed[T] {
+    return Boxed[T] { val: v, tag: t }
+}
+
+fn step(n: i64): i64 {
+    return n * 2
+}
+
+fn run_step(cb: fn(i64): i64, x: i64): i64 {
+    return cb(x)
+}
+
+fn checked_inc(x: i64): Outcome {
+    if x < 0 {
+        return Outcome.Err(1)
+    }
+    return Outcome.Ok(x + 1)
+}
+
+fn try_wrapper(s: []i64, p: *i64): Outcome {
+    var acc: i64 = 0
+    defer {
+        atomic_add(p, acc)
+    }
+    loop v in s {
+        acc += checked_inc(v)?
+    }
+    var b = make_box(acc, 3)
+    return Outcome.Ok(run_step(step, b.val + b.tag))
+}
+
+fn main() {
+    var arr: [3]i64 = [1, 2, 3]
+    var counter: i64 = 10
+    match try_wrapper(arr, &counter) {
+        Outcome.Ok(r) {
+            print(r)
+        }
+        Outcome.Err(e) {
+            print(e)
+        }
+    }
+    print(atomic_load(&counter))
+}
+"@
+Test-RunLlvm "phase19_direct_llvm_ir_features" $phase19_ir_code "24`n19"
+$phase19_ll = Get-Content -Path (Join-Path $tmp "phase19_direct_llvm_ir_features.ll") -Raw
+if ($phase19_ll -notmatch 'getelementptr ' -or $phase19_ll -notmatch 'target datalayout' -or $phase19_ll -notmatch 'atomicrmw add') {
+    throw "FAIL [phase19_direct_llvm_ir_features]: missing expected direct LLVM IR ops (getelementptr/target datalayout/atomicrmw)"
+}
+Write-Host "PASS [llvm-IR-check] phase19_direct_llvm_ir_syntax"
 
 Write-Host "`nAll tests passed."
