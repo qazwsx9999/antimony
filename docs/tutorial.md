@@ -1058,9 +1058,20 @@ fn main() {
 
 ---
 
-## 17. Complete Example Program
+## 17. Complete Example Programs
 
-See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony, or try this prime-counting benchmark:
+See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony language features, and [sbwc.sb](file:///c:/Users/soroosh/sb/examples/sbwc.sb) for a complete real-world CLI word/line/byte counter and substring search utility built using `std/mem`, `std/str`, `std/io`, `std/os`, and `std/time`:
+
+```powershell
+# Self-test mode (scans benchmarks/README.md and benchmarks/bench.sb for "fn")
+.\sbc.exe examples\sbwc.sb --run
+
+# Compile with LLVM -O3 and run against custom files
+.\sbc.exe examples\sbwc.sb --llvm --release -o sbwc.exe
+.\sbwc.exe -p struct examples\demo.sb examples\sbwc.sb
+```
+
+Or try this compact prime-counting benchmark:
 
 ```
 fn is_prime(n: i32): bool {

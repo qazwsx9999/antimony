@@ -2082,4 +2082,40 @@ if ($phase19_ll -notmatch 'getelementptr ' -or $phase19_ll -notmatch 'target dat
 }
 Write-Host "PASS [llvm-IR-check] phase19_direct_llvm_ir_syntax"
 
+# 28. End-to-end test for examples/sbwc.sb (native x64 and --llvm)
+$sbwcSrc = "c:\Users\soroosh\sb\examples\sbwc.sb"
+$sbwcNative = Join-Path $tmp "sbwc_native.exe"
+$sbwcLlvm   = Join-Path $tmp "sbwc_llvm.exe"
+$sbwcF1     = Join-Path $tmp "sbwc_sample1.txt"
+$sbwcF2     = Join-Path $tmp "sbwc_sample2.txt"
+[System.IO.File]::WriteAllBytes($sbwcF1, [System.Text.Encoding]::ASCII.GetBytes("alpha beta foo`ngamma foo`n"))
+[System.IO.File]::WriteAllBytes($sbwcF2, [System.Text.Encoding]::ASCII.GetBytes("one two`nfoo bar foo foo`n"))
+
+$null = & $sbc $sbwcSrc -o $sbwcNative 2>&1
+if ($LASTEXITCODE -ne 0) { throw "FAIL [sbwc_native]: compile failed" }
+$null = & $sbc $sbwcSrc --llvm -o $sbwcLlvm 2>&1
+if ($LASTEXITCODE -ne 0) { throw "FAIL [sbwc_llvm]: compile failed" }
+
+foreach ($pair in @(@("sbwc_native", $sbwcNative), @("sbwc_llvm", $sbwcLlvm))) {
+    $tname = $pair[0]
+    $texe  = $pair[1]
+    $lines = @(& $texe -p foo $sbwcF1 $sbwcF2)
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$tname]: exited with code $LASTEXITCODE" }
+    if ($lines.Count -ne 4) { throw "FAIL [$tname]: expected 4 lines, got $($lines.Count): $($lines -join ' | ')" }
+    if ($lines[0].Trim() -ne "lines=2 words=5 bytes=25 matches=2 $sbwcF1") { throw "FAIL [$tname]: row 0 mismatch: $($lines[0])" }
+    if ($lines[1].Trim() -ne "lines=2 words=6 bytes=24 matches=3 $sbwcF2") { throw "FAIL [$tname]: row 1 mismatch: $($lines[1])" }
+    if ($lines[2].Trim() -ne "lines=4 words=11 bytes=49 matches=5 TOTAL")  { throw "FAIL [$tname]: total mismatch: $($lines[2])" }
+    if ($lines[3].Trim() -notmatch '^elapsed_us=\d+$') { throw "FAIL [$tname]: missing elapsed_us: $($lines[3])" }
+    # Single-file run without -p omits matches= and TOTAL
+    $single = @(& $texe $sbwcF1)
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$tname-single]: exited with code $LASTEXITCODE" }
+    if ($single.Count -ne 2 -or $single[0].Trim() -ne "lines=2 words=5 bytes=25 $sbwcF1" -or $single[1].Trim() -notmatch '^elapsed_us=\d+$') {
+        throw "FAIL [$tname-single]: unexpected output: $($single -join ' | ')"
+    }
+    # Missing file returns non-zero
+    $null = & $texe (Join-Path $tmp "does_not_exist_999.txt") 2>&1
+    if ($LASTEXITCODE -eq 0) { throw "FAIL [$tname-missing]: expected non-zero exit code for missing file" }
+    Write-Host "PASS [e2e]           $tname"
+}
+
 Write-Host "`nAll tests passed."

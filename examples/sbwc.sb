@@ -1,0 +1,230 @@
+// examples/sbwc.sb - Fast CLI line/word/byte counter and substring search utility.
+//
+// Usage:
+//   sbwc [-p <pattern>] [--selftest] [-h|--help] <file>...
+//
+// Without arguments (or with --selftest), scans benchmarks/README.md and benchmarks/bench.sb
+// counting occurrences of "fn" and printing summary totals + elapsed microseconds.
+
+import "std/mem.sb"
+import "std/str.sb"
+import "std/io.sb"
+import "std/os.sb"
+import "std/time.sb"
+
+struct FileStats {
+    lines: i64
+    words: i64
+    bytes: i64
+    matches: i64
+    ok: bool
+}
+
+fn count_substr(data: str, pat: str): i64 {
+    var n = len(data)
+    var m = len(pat)
+    if m == 0 || n < m {
+        return 0
+    }
+    var count: i64 = 0
+    var i: i64 = 0
+    var first = pat[0]
+    var limit = n - m
+    loop i <= limit {
+        if data[i] == first {
+            var j: i64 = 1
+            loop j < m && data[i + j] == pat[j] {
+                j += 1
+            }
+            if j == m {
+                count += 1
+                i += m
+                continue
+            }
+        }
+        i += 1
+    }
+    return count
+}
+
+fn scan_buffer(data: str, pat: str): FileStats {
+    var n = len(data)
+    var lines: i64 = 0
+    var words: i64 = 0
+    var in_word = false
+    loop i in 0..n {
+        var b = data[i]
+        if b == 10 {
+            lines += 1
+        }
+        if is_space(b) {
+            in_word = false
+        } else {
+            if !in_word {
+                words += 1
+                in_word = true
+            }
+        }
+    }
+    return FileStats {
+        lines: lines,
+        words: words,
+        bytes: n,
+        matches: count_substr(data, pat),
+        ok: true
+    }
+}
+
+fn analyze_file(path: str, pat: str): FileStats {
+    var psb: StringBuilder
+    psb.init(usize(len(path)) + 1)
+    defer psb.free()
+    psb.append(path)
+
+    var sz = file_size(psb.cstr())
+    if sz < 0 {
+        return FileStats { lines: 0, words: 0, bytes: 0, matches: 0, ok: false }
+    }
+    if sz == 0 {
+        return FileStats { lines: 0, words: 0, bytes: 0, matches: 0, ok: true }
+    }
+
+    var raw = alloc_uninit(usize(sz))
+    if raw == null {
+        return FileStats { lines: 0, words: 0, bytes: 0, matches: 0, ok: false }
+    }
+    defer free_mem(raw)
+
+    var buf = raw[0..sz]
+    var got = read_file_into(psb.cstr(), buf)
+    if got < 0 {
+        return FileStats { lines: 0, words: 0, bytes: 0, matches: 0, ok: false }
+    }
+    return scan_buffer(str_from_ptr(raw, usize(got)), pat)
+}
+
+fn format_row(st: FileStats, has_pat: bool, label: str) {
+    var out: StringBuilder
+    out.init(96)
+    defer out.free()
+
+    out.append("lines=")
+    out.append_i64(st.lines)
+    out.append(" words=")
+    out.append_i64(st.words)
+    out.append(" bytes=")
+    out.append_i64(st.bytes)
+    if has_pat {
+        out.append(" matches=")
+        out.append_i64(st.matches)
+    }
+    out.append(" ")
+    out.append(label)
+    print(out.as_str())
+}
+
+fn print_open_error(path: str) {
+    var err: StringBuilder
+    err.init(64)
+    defer err.free()
+    err.append("sbwc: cannot read '")
+    err.append(path)
+    err.append("'")
+    eprint(err.as_str())
+}
+
+fn process_file(path: str, pat: str, has_pat: bool, total: *FileStats): bool {
+    var st = analyze_file(path, pat)
+    if !st.ok {
+        print_open_error(path)
+        return false
+    }
+    total.lines += st.lines
+    total.words += st.words
+    total.bytes += st.bytes
+    total.matches += st.matches
+    format_row(st, has_pat, path)
+    return true
+}
+
+fn print_elapsed(us: i64) {
+    var out: StringBuilder
+    out.init(32)
+    defer out.free()
+    out.append("elapsed_us=")
+    out.append_i64(us)
+    print(out.as_str())
+}
+
+fn main() {
+    var argc = arg_count()
+    var pat = ""
+    var has_pat = false
+    var selftest = false
+    var file_cnt: i32 = 0
+
+    var i: i32 = 1
+    loop i < argc {
+        var a = arg_at(i)
+        if a == "-h" || a == "--help" {
+            print("Usage: sbwc [-p <pattern>] [--selftest] <file>...")
+            return
+        } else if a == "--selftest" {
+            selftest = true
+        } else if a == "-p" {
+            if i + 1 >= argc {
+                eprint("sbwc: -p requires a pattern argument")
+                exit(1)
+            }
+            i += 1
+            pat = arg_at(i)
+            has_pat = true
+        } else {
+            file_cnt += 1
+        }
+        i += 1
+    }
+
+    var total = FileStats { lines: 0, words: 0, bytes: 0, matches: 0, ok: true }
+    var had_err = false
+    var t0 = perf_counter()
+
+    if file_cnt == 0 || selftest {
+        if !has_pat {
+            pat = "fn"
+            has_pat = true
+        }
+        if !process_file("benchmarks/README.md", pat, has_pat, &total) {
+            had_err = true
+        }
+        if !process_file("benchmarks/bench.sb", pat, has_pat, &total) {
+            had_err = true
+        }
+        format_row(total, has_pat, "TOTAL")
+    } else {
+        i = 1
+        loop i < argc {
+            var a = arg_at(i)
+            if a == "-p" {
+                i += 2
+                continue
+            }
+            if a != "--selftest" && a != "-h" && a != "--help" {
+                if !process_file(a, pat, has_pat, &total) {
+                    had_err = true
+                }
+            }
+            i += 1
+        }
+        if file_cnt >= 2 {
+            format_row(total, has_pat, "TOTAL")
+        }
+    }
+
+    var t1 = perf_counter()
+    print_elapsed(elapsed_us(t0, t1))
+
+    if had_err {
+        exit(1)
+    }
+}
