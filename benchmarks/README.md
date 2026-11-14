@@ -20,18 +20,18 @@ The script builds every available target, runs each one `-Runs` times, checks th
 
 ## Sample result
 
-Windows x64, gcc 13.1 (no clang installed), median of 7 runs, in ms (lower is better). Expect a variation of about ±20% between sessions on the same machine.
+Windows x64, Antimony `--llvm` via **LLVM Clang 23.1.5** (`-O3 -march=native`), C via `gcc 13.1 -O3 -march=native`, Go (`go build`), and Rust (`rustc -C opt-level=3 -C target-cpu=native`), median of 7 runs, in ms (lower is better). Expect a variation of about ±20% between sessions on the same machine.
 
 | Workload | sb native | sb `--llvm` | C | Go | Rust |
 |---|---:|---:|---:|---:|---:|
-| 1. Inlining + strength reduction (50M iters) | 211.7 | 21.9 | 85.6 | 91.2 | 16.4 |
-| 2. Float Mandelbrot (1000×1000, 100 iters) | 172.6 | 99.1 | 98.6 | 107.2 | 100.7 |
-| 3. Slice sum in range loop (51.2M loads) | 69.4 | 9.2 | 7.5 | 33.1 | 4.1 |
-| 4. Quicksort (200,000 i64) | 20.5 | 16.6 | 13.4 | 16.3 | 15.3 |
-| **Total** | **474.2** | **146.8** | **205.1** | **247.8** | **136.5** |
+| 1. Inlining + strength reduction (50M iters) | 188.1 | 11.8 | 70.7 | 78.7 | 15.7 |
+| 2. Float Mandelbrot (1000×1000, 100 iters) | 167.6 | 79.3 | 85.0 | 100.1 | 97.6 |
+| 3. Slice sum in range loop (51.2M loads) | 58.5 | 3.8 | 7.9 | 34.2 | 4.6 |
+| 4. Quicksort (200,000 i64) | 18.0 | 12.2 | 12.6 | 16.6 | 17.2 |
+| **Total** | **432.2** | **107.1** | **176.3** | **229.6** | **135.1** |
 
 What the numbers show:
-- **The optimizing backend is in the same range as C and Rust.** It is fastest on no workload, but within about 1.2× of the best on workloads 2 and 4.
-- **Rust won workloads 1 and 3.** The other workloads were close across all compiled targets.
-- **Workload 1 is an outlier for C.** Hand-written C (85.6 ms) is about 4× slower than Antimony's generated C (21.9 ms), even though both use gcc. The cause has not been investigated.
-- **The native backend trades runtime for compile time.** It runs about 2–4× slower than the optimizing targets, but it compiles in milliseconds with no external tools.
+- **With LLVM Clang installed, Antimony `--llvm` matches or edges out Rust and C across all four workloads (`107.1 ms` total vs `135.1 ms` Rust and `176.3 ms` C).** Note that C here was compiled with GCC 13.1 rather than Clang.
+- **On Workload 1 and Workload 3, LLVM (`sb --llvm` and Rust) vectorizes/reduces the loops tightly**, finishing well ahead of GCC and Go.
+- **Workload 1 is an outlier for GCC (`bench.c` at 70.7 ms vs Clang/LLVM at 11.8–15.7 ms).**
+- **The native backend trades runtime for compile time.** It runs about 3–4× slower than `--llvm` overall, but compiles in milliseconds with no external tools.

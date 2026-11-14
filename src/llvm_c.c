@@ -817,6 +817,16 @@ static void opt_gen_expr(OptGen *g, Buf *b, Node *n) {
             return;
         }
         if (op == T_SLASH || op == T_PERCENT) {
+            if (n->rhs->is_const && n->rhs->cval > 0) {
+                bprintf(b, "((");
+                emit_c_type(g, b, t);
+                bprintf(b, ")((");
+                opt_gen_expr(g, b, n->lhs);
+                bprintf(b, ") %s (", op == T_SLASH ? "/" : "%");
+                opt_gen_expr(g, b, n->rhs);
+                bprintf(b, ")))");
+                return;
+            }
             const char *fn = (op == T_SLASH) ? "div" : "rem";
             bprintf(b, "sb_%s_%s%d(", fn, t->is_signed ? "i" : "u", t->size * 8);
             opt_gen_expr(g, b, n->lhs);
