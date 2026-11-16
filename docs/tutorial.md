@@ -160,6 +160,22 @@ var y: i64 = i64(x) + 50
 var z: u8 = u8(x)               // Checked at runtime in debug mode!
 ```
 
+### Character Literals, Raw Strings, and Type Aliases
+- **Character literals (`'a'`, `'\n'`, `'\x41'`):** Untyped integer constants representing a single byte value; they adapt to `u8`, `i32`, `i64`, etc. or default to `i32`.
+- **Raw string literals (`` `C:\data\file.txt` ``):** Enclosed in backticks; escape sequences like `\n` or `\` are preserved literally.
+- **Type aliases (`type`):** Create transparent names for types or generic instantiations (`type Byte = u8`, `type IntPair = Pair[i64, i64]`, `type Ptr[T] = *const T`), at top level or inside functions:
+
+```
+type Byte = u8
+
+fn main() {
+    var ch: Byte = 'A'
+    var nl = '\n'
+    var path = `C:\Users\demo\notes.txt`
+    print("char={} nl={} path={}", ch, nl, path)
+}
+```
+
 ---
 
 ## 4. Operators and Overflow Safety
@@ -340,10 +356,10 @@ fn main() {
 ```
 
 ### 8.2 Slices (`a[lo..hi]`) and Slice Parameters
-A slice is a lightweight view (`{ptr, len}`) into an array. Declare slice variables or parameters with `[]` after the name:
+A slice is a lightweight view (`{ptr, len}`) into an array. Declare slice variables or parameters with `[]` after the name, or `[]const T` / `var s[]: const T` for a read-only slice view (arrays `[N]T` and mutable slices `[]T` coerce to `[]const T` automatically):
 
 ```
-fn sum(s[]: i32): i32 {
+fn sum(s[]: const i32): i32 {
     var total = 0
     loop x in s {
         total += x
@@ -429,6 +445,20 @@ print(p[1])         // 40
 
 var s[]: i32 = p[0..3]   // slice of [30, 40, 50]
 print(len(s))            // 3
+```
+
+### 9.4 Read-Only Pointers (`*const T`)
+Use `*const T` when a function or variable should inspect pointed-to data without mutating it. A mutable `*T` coerces to `*const T` implicitly, while `*const T` forbids writes (`*p = ...`), taking mutable `&*p`, or calling mutable `*T` methods:
+
+```
+fn read_val(p: *const i32): i32 {
+    return *p
+}
+
+fn main() {
+    var x = 42
+    print(read_val(&x))     // 42 (&x converts from *i32 to *const i32)
+}
 ```
 
 ---
@@ -920,6 +950,22 @@ fn main() {
 }
 ```
 
+#### Module Visibility (`pub` and `priv`)
+Use `priv` to keep helper functions, structs, enums, type aliases, constants, or globals private to a single `.sb` file. Better yet, mark your module's exported API with `pub`: any file containing at least one `pub` declaration automatically treats all non-`pub` declarations in that file as private:
+
+```
+// secret_mod.sb
+priv const MAGIC = 42       // always file-private
+
+pub fn answer(): i32 {      // exported; non-pub helpers in this file become private
+    return helper()
+}
+
+fn helper(): i32 {
+    return MAGIC
+}
+```
+
 ### 14.2 Calling Windows DLLs Directly (`extern`)
 Antimony emits imported functions directly into the PE32+ Import Table—no C compiler, header files, or `.lib` import libraries needed. You can declare a single `extern` function or group multiple imports from the same DLL:
 
@@ -993,6 +1039,7 @@ Antimony ships with native standard library modules in `std/` that you can impor
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `pop`, `get`, `set`, `as_slice`, `clear`, `free`).
 - `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `free`) and `Option[T]` (`.Some(T)` / `.None`).
 - `import "std/sort.sb"` — Generic sorting and slice algorithms (`sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, `reverse[T]`).
+- `import "std/math.sb"` — Math constants (`PI`, `TAU`, `E`, `SQRT2`, `INF`, `NAN`, `EPSILON_F64`), `f64`/`f32` CRT transcendental/rounding functions (`sqrt`, `sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow`, `floor`, `ceil`, `round`, `trunc`, `cbrt`, `hypot`, `is_nan`, `is_inf`), generic `min`/`max`/`clamp`, interpolation (`lerp`, `smoothstep`), and integer/bit utilities (`gcd`, `lcm`, `pow_i64`, `is_pow2`, `next_pow2`, `ilog2`, `div_ceil_u64`).
 - `import "std/thread.sb"` — Native Win32 OS threads (`Thread`, `spawn`, `join`, `detach`, `current_thread_id`), fast user-mode `SRWLOCK` locks (`Mutex`, `RwLock`, `CondVar`), and hardware atomic wrapper `AtomicI64` (`init`, `load`, `store`, `fetch_add`, `fetch_sub`, `cas`).
 - `import "std/io.sb"` — Native Win32 file I/O (`write_file_str`, `write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
@@ -1043,7 +1090,7 @@ fn main() {
 
 | Function | Description |
 |---|---|
-| `print(x)` | Prints any integer, float (`f32`/`f64`), enum, pointer, `bool`, or `str` followed by a newline |
+| `print(x)` / `print(fmt, args...)` | Prints any integer, float (`f32`/`f64`), enum, pointer, `bool`, or `str` followed by a newline; with multiple arguments, formats `{}` placeholders using `fmt` (`{{`/`}}` for literal braces), e.g. `print("my age is {} years old", age)` |
 | `len(x)` | Returns the length of an array, slice, or string |
 | `sizeof(T_or_expr)` | Compile-time size in bytes of a type or expression |
 | `alignof(T_or_expr)` | Compile-time alignment in bytes of a type or expression |

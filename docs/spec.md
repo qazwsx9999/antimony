@@ -46,8 +46,8 @@ An **explicit `;` is only allowed as a separator inside a C-style `loop` header*
 
 ### 1.4 Keywords
 ```
-var  const  fn  struct  return  if  else  loop  in  by  break  continue
-true  false  null
+var  const  type  fn  struct  enum  match  return  if  else  loop  in  by
+break  continue  defer  import  extern  pub  priv  true  false  null
 ```
 Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`, …) are predeclared identifiers, not keywords.
 
@@ -69,8 +69,12 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
 ### 1.7 Boolean literals
 `true`, `false`.
 
-### 1.8 String literals **[Proposed, minimal]**
-`"text"` with escapes `\n \t \\ \" \0 \xHH`. Type `str` (immutable). The full string design is deferred.
+### 1.8 String literals
+- **Escaped string:** `"text"` with escapes `\n \t \r \\ \" \' \0 \xHH`. Type `str` (immutable `{ptr, len}`).
+- **Raw string:** `` `raw text` `` enclosed in backticks; escape sequences are not interpreted (`\n` stays two characters `\` and `n`), and CRLF line endings inside multi-line raw strings are normalized to `\n`.
+
+### 1.9 Character literals
+`'a'`, `'\n'`, `'\t'`, `'\r'`, `'\\'`, `'\''`, `'\"'`, `'\0'`, `'\xHH'`. A character literal represents a single byte/ASCII code point as an untyped integer constant (adapting to `u8`, `i32`, `i64`, etc. from context, or defaulting to `i32`). Empty (`''`) or multi-character (`'ab'`) literals are compile-time errors.
 
 ---
 
@@ -94,9 +98,12 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
   var inferred = [10, 20, 30]        // length 3 and type i32 inferred
   ```
   Providing more elements than `N` is a compile error.
-- **Slice (`{ptr, len}` view):** declared with `[]` after the variable or parameter name:
+- **Slice (`{ptr, len}` view):** declared with `[]` after the variable or parameter name (or prefix `[]T`):
   ```
   var s[]: i32 = arr[1..4]
+  var ro[]: const i32 = arr    // read-only slice view (`[]const i32`)
+  ```
+- **Read-only slices (`[]const T` / `var s[]: const T`):** Allow reading (`s[i]`), slicing (`s[lo..hi]`, producing `[]const T`), and `len(s)`, while forbidding element assignment (`s[i] = ...`), taking mutable `&s[i]`, or converting `[]const T` back to `[]T`. Mutable `[]T` and `[N]T` implicitly coerce to `[]const T`.
   fn sum(a[]: i32): i32 { ... }
   ```
   A fixed-size array of element type `T` implicitly converts to a slice of element type `T` when passed to a function parameter or assigned to a slice variable.
@@ -104,16 +111,17 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
 - **Slicing (`a[lo..hi]`, `a[..hi]`, `a[lo..]`, `a[..]`):** creates a slice view `[lo, hi)`. Checks `0 <= lo <= hi <= len(a)` in all build modes.
 - **`len(a)`:** built-in returning the number of elements (an untyped constant for fixed-size arrays, or `i64` for slices and strings).
 
-### 2.5 Pointers (`*T`)
-- **Pointer type:** `*T` (and multi-level pointers `**T`, arrays of pointers `var ptrs[4]: *i32`, etc.).
-- **Address-of (`&`):** `&x` (where `x` is a `var` variable), `&arr[i]`, or `&*p`. Taking `&x` marks `x` as initialized for definite-assignment analysis so out-parameters work cleanly.
+### 2.5 Pointers (`*T` and `*const T`)
+- **Pointer type:** `*T` for a mutable pointer and `*const T` for a read-only pointer (multi-level pointers like `**T`, `*const *T`, and arrays of pointers `var ptrs[4]: *i32` are supported).
+- **Read-only coercion & enforcement:** A mutable pointer `*T` implicitly coerces to `*const T` (e.g. when passing `&x` to a `fn f(p: *const i32)` parameter), whereas `*const T` cannot coerce to `*T`. Writing through `*const T` (`*p = v`, `p[i] = v`, `p.field = v`, compound assignments), taking a mutable `&*p` / `&p[i]` / `&p.field`, calling a mutable `*T`-receiver method on `*const T`, or passing `*const i64` to atomic write built-ins is rejected at compile time. Slicing `p[lo..hi]` on `*const T` yields `[]const T`.
+- **Address-of (`&`):** `&x` (where `x` is a `var` variable), `&arr[i]`, or `&*p`. Taking `&x` (except when coerced only via read-only inspection) marks `x` as initialized for definite-assignment analysis so out-parameters work cleanly.
 - **Dereference (`*`):** `*p` reads or writes the pointee (`*p = 10`, `*p += 1`, `var y = *p`).
 - **`null`:** represents the zero pointer address (`0`). Requires an explicit pointer type (`var p: *i32 = null`). In `debug` mode, dereferencing or indexing a `null` pointer traps with source file, line, and column.
 - **Pointer arithmetic & indexing:**
   - `p + offset`, `p - offset`, `p += offset`, `p -= offset` advance or rewind `p` by `offset * sizeof(T)` bytes.
-  - `p - q` (for two pointers of the same type `*T`) returns the element difference as `isize`.
+  - `p - q` (between pointers to the same element type `T`, including `*T` and `*const T`) returns the element difference as `isize`.
   - `p[i]` is equivalent to `*(p + i)`.
-  - `p[lo..hi]` creates a slice `[]T` of length `hi - lo` starting at `p + lo` (requires an explicit upper bound `hi`).
+  - `p[lo..hi]` creates a slice `[]T` (or `[]const T` if `p` is `*const T`) of length `hi - lo` starting at `p + lo` (requires an explicit upper bound `hi`).
 
 ### 2.6 Structs (`struct`)
 - **Declaration:**
@@ -151,6 +159,16 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
 - **Stateless Anonymous Functions:** `fn(a: i32, b: i32): bool { return a < b }` defines an inline anonymous function and evaluates to its function pointer (`fn(i32, i32): bool`). Anonymous functions are stateless and cannot capture outer local variables (preserving zero hidden heap allocations).
 - **Standard Generic Sorting & Binary Search (`std/sort.sb`):** Provides `sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, and `reverse[T]`.
 - **Concurrency & Hardware Atomics (`std/thread.sb`):** Provides Win32 OS threads (`Thread`, `spawn`), `Mutex` / `RwLock` (`SRWLOCK`), `CondVar` (`CONDITION_VARIABLE`), `AtomicI64`, and hardware atomic built-ins (`atomic_load`, `atomic_store`, `atomic_add`, `atomic_cas`).
+
+### 2.10 Type Aliases (`type`)
+- **Syntax:** `type Alias = TargetType` or generic `type Alias[T, ...] = TargetType`, usable at top level and (without type parameters) inside function blocks:
+  ```
+  type Byte = u8
+  type IntVec = Vec[i64]
+  type Pair[T] = Box[T]
+  type ReadBuf = []const u8
+  ```
+- Type aliases are transparent (not distinct nominal types): `Alias` and `TargetType` are interchangeable anywhere a type is expected, including struct literals, methods, and pointer/slice types. Recursive alias cycles are compile-time errors.
 
 ### 2.2 No implicit conversions
 Values of different types never mix implicitly. `i32 + i64` is a compile error. Conversions are explicit and use the target type name as a function:
@@ -265,11 +283,16 @@ fn log(msg: str) {
 ### 5.3 Declaration order
 Functions may be called before they are declared in the file.
 
-### 5.4 Entry point **[Proposed]**
+### 5.4 Entry point
 ```
 fn main() { ... }
 ```
 `main` takes no parameters and returns no value. The process exit code is set with the built-in `exit(code: i32)`; returning normally exits with `0`.
+
+### 5.5 Module visibility (`pub` / `priv`)
+Top-level declarations (`fn`, `struct`, `enum`, `type`, `var`, `const`, `extern`) support optional `pub` or `priv` modifiers:
+- `priv` restricts a symbol (including methods declared `priv fn (self: *S) helper()`) to the source file in which it was declared; referencing it from another imported file is a compile-time error.
+- **Opt-in module encapsulation:** If a file declares at least one `pub` symbol, all top-level declarations in that file without `pub` become private (`priv`) to that file automatically. Files that use neither `pub` nor `priv` remain public to importing files for backwards compatibility.
 
 ---
 
@@ -444,10 +467,11 @@ IEEE-754 semantics. Floating-point arithmetic is never checked (infinities and N
 
 ---
 
-## 9. Built-ins **[Proposed, minimal]**
+## 9. Built-ins
 | Built-in | Description |
 |---|---|
-| `print(x)` | prints an integer, float, `bool`, or `str`, followed by a newline |
+| `print(x)` | prints an integer, float, `bool`, pointer, or `str`, followed by a newline |
+| `print(fmt, args...)` | formatted output: `fmt` is a string literal using `{}` placeholders for each argument (`{{` and `}}` escape literal braces), followed by a newline |
 | `exit(code: i32)` | terminates the process with `code` |
 | `rev(range)` | reverse range; only valid in a `loop` header |
 | `T(x)` | conversion to scalar type `T` (§2.3) |
@@ -460,8 +484,9 @@ IEEE-754 semantics. Floating-point arithmetic is never checked (infinities and N
 
 ```ebnf
 File        = { TopDecl TERM } ;
-TopDecl     = FnDecl | VarDecl | ConstDecl ;
+TopDecl     = [ "pub" | "priv" ] ( FnDecl | StructDecl | EnumDecl | TypeDecl | VarDecl | ConstDecl ) ;
 
+TypeDecl    = "type" Ident [ "[" Ident { "," Ident } "]" ] "=" Type ;
 FnDecl      = "fn" Ident "(" [ Params ] ")" [ ":" Type ] Block ;
 Params      = Param { "," Param } [ "," ] ;
 Param       = Ident ":" Type ;
@@ -587,9 +612,6 @@ fn main() {
 1. Sections marked **[Proposed]**: comments, shadowing, top-level `var`, read-only parameters, `main`/`exit`, labels, built-ins.
 2. Arrays and slices (and `loop x in arr`).
 3. Structs, and the brace-ambiguity rule for struct literals in conditions.
-4. Pointers / references, including read-only references (important for aliasing optimizations).
-5. Strings (full design).
-6. Modules / imports / visibility.
-7. Error handling.
-8. Generics (impacts compile time).
-9. Target platform for the first native backend (OS, object format, calling convention).
+4. Strings (full ownership/allocation design beyond `str` views and `std/str.sb`).
+5. Generic type inference for nested generic type arguments.
+6. Self-hosting / cross-platform backends (Linux/macOS ELF/Mach-O).

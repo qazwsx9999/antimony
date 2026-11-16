@@ -1,0 +1,169 @@
+{
+  "Main Function": {
+    "prefix": "main",
+    "body": [
+      "fn main() {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Antimony main entry point"
+  },
+  "Function": {
+    "prefix": "fn",
+    "body": [
+      "fn ${1:name}(${2:params})${3:: ${4:i32}} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Define a function"
+  },
+  "Method": {
+    "prefix": "fnm",
+    "body": [
+      "fn (${1:self}: *${2:Type}) ${3:method}(${4:params})${5:: ${6:void}} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Define a method on a receiver type"
+  },
+  "Struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:Name} {",
+      "\t${2:field}: ${3:i32}",
+      "}"
+    ],
+    "description": "Define a struct"
+  },
+  "Enum": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:Name} {",
+      "\t${2:VariantA}",
+      "\t${3:VariantB}",
+      "}"
+    ],
+    "description": "Define an enum"
+  },
+  "Type Alias": {
+    "prefix": "type",
+    "body": [
+      "type ${1:Alias} = ${2:Target}"
+    ],
+    "description": "Define a type alias"
+  },
+  "If Statement": {
+    "prefix": "if",
+    "body": [
+      "if ${1:cond} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "If statement"
+  },
+  "If-Else Statement": {
+    "prefix": "ife",
+    "body": [
+      "if ${1:cond} {",
+      "\t$2",
+      "} else {",
+      "\t$0",
+      "}"
+    ],
+    "description": "If-else statement"
+  },
+  "Match Statement": {
+    "prefix": "match",
+    "body": [
+      "match ${1:expr} {",
+      "\t${2:.Variant} {",
+      "\t\t$3",
+      "\t}",
+      "\telse {",
+      "\t\t$0",
+      "\t}",
+      "}"
+    ],
+    "description": "Match statement"
+  },
+  "Range Loop": {
+    "prefix": "loopr",
+    "body": [
+      "loop ${1:i} in ${2:0}..${3:n} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Range loop"
+  },
+  "C-Style Loop": {
+    "prefix": "loopfor",
+    "body": [
+      "loop var ${1:i} = ${2:0}; ${1:i} < ${3:n}; ${1:i} += ${4:1} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "C-style loop"
+  },
+  "Conditional Loop": {
+    "prefix": "loopc",
+    "body": [
+      "loop ${1:cond} {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Conditional loop"
+  },
+  "Infinite Loop": {
+    "prefix": "loop",
+    "body": [
+      "loop {",
+      "\t$0",
+      "}"
+    ],
+    "description": "Infinite loop"
+  },
+  "Variable": {
+    "prefix": "var",
+    "body": [
+      "var ${1:name}: ${2:i32} = ${3:0}"
+    ],
+    "description": "Variable declaration"
+  },
+  "Constant": {
+    "prefix": "const",
+    "body": [
+      "const ${1:NAME} = ${2:0}"
+    ],
+    "description": "Constant declaration"
+  },
+  "Defer": {
+    "prefix": "defer",
+    "body": [
+      "defer ${1:cleanup()}"
+    ],
+    "description": "Defer statement"
+  },
+  "Import": {
+    "prefix": "import",
+    "body": [
+      "import \"${1:std/io.sb}\""
+    ],
+    "description": "Import module"
+  },
+  "Extern Block": {
+    "prefix": "extern",
+    "body": [
+      "extern \"${1:kernel32.dll}\" {",
+      "\tfn ${2:FuncName}(${3:params}): ${4:i32}",
+      "}"
+    ],
+    "description": "Extern DLL block"
+  },
+  "Print": {
+    "prefix": "print",
+    "body": [
+      "print(${1:\"${2:msg}\"})"
+    ],
+    "description": "Print statement"
+  }
+}

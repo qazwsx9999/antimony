@@ -73,7 +73,8 @@ char *i128_str(i128 v, char *buf);
 typedef enum {
     T_EOF, T_TERM, T_SEMI, T_IDENT, T_INT, T_FLOAT, T_STR,
     // keywords
-    T_VAR, T_CONST, T_FN, T_STRUCT, T_ENUM, T_MATCH, T_DEFER, T_IMPORT, T_EXTERN,
+    T_VAR, T_CONST, T_FN, T_STRUCT, T_ENUM, T_TYPE, T_MATCH, T_DEFER,
+    T_IMPORT, T_EXTERN, T_PUB, T_PRIV,
     T_RETURN, T_IF, T_ELSE, T_LOOP, T_IN, T_BY,
     T_BREAK, T_CONTINUE, T_TRUE, T_FALSE, T_NULL,
     // punctuation
@@ -131,6 +132,7 @@ typedef struct Type {
     int align;         // alignment in bytes (1, 2, 4, 8)
     bool is_signed;
     bool is_tagged;    // TY_ENUM: true if any variant carries a payload
+    bool is_const_elem;// TY_PTR / TY_SLICE: read-only element (`*const T`, `[]const T`)
     int payload_offset;// TY_ENUM: byte offset of union payload when is_tagged
     struct Type *elem; // TY_ARRAY / TY_SLICE / TY_PTR element type, or TY_FN return type
     int array_len;     // TY_ARRAY element count
@@ -152,7 +154,7 @@ typedef struct Node Node;
 
 typedef enum { SYM_VAR, SYM_PARAM, SYM_CONST, SYM_FN, SYM_TYPE, SYM_BUILTIN } SymKind;
 typedef enum {
-    B_PRINT = 1, B_EXIT, B_REV, B_LEN, B_SIZEOF, B_ALIGNOF, B_PTR_CAST,
+    B_PRINT = 1, B_PRINT_FMT, B_EXIT, B_REV, B_LEN, B_SIZEOF, B_ALIGNOF, B_PTR_CAST,
     B_ATOMIC_LOAD, B_ATOMIC_STORE, B_ATOMIC_ADD, B_ATOMIC_CAS
 } BuiltinId;
 
@@ -175,9 +177,14 @@ typedef struct Symbol {
     bool addr_taken;     // local var: address taken (&x) -> cannot live in register
     bool is_const_alias; // inlined param: bound to a compile-time constant argument
     int use_score;       // loop-weighted reference count for register allocation
-    int hw_reg;          // allocated callee-saved register (RBX, R12..R15), or -1 if stack
+    int hw_reg;          // allocated callee-saved register (RBX, R12..R15, RDI, RSI), or -1 if stack
+    int xmm_reg;         // allocated callee-saved XMM register (XMM6..XMM13), or -1 if GPR/stack
+    bool known_nonneg;   // statically guaranteed non-negative integer value (e.g. non-negative loop var)
+    struct Symbol *alias_of; // inlined param: underlying caller symbol
     bool is_extern;      // fn: imported from Windows DLL
     int iat_slot;        // extern fn: slot index in PE32+ Import Address Table
+    bool is_pub;         // explicitly marked `pub`
+    bool is_priv;        // private to declaring file (`priv` or non-`pub` in a `pub` module)
 } Symbol;
 
 // ---------------------------------------------------------------------------
@@ -192,7 +199,7 @@ typedef enum {
     N_VAR, N_CONST, N_ASSIGN, N_EXPR_STMT, N_IF, N_MATCH, N_MATCH_ARM, N_DEFER, N_BLOCK, N_RETURN,
     N_BREAK, N_CONTINUE, N_LOOP_INF, N_LOOP_COND, N_LOOP_RANGE, N_LOOP_ITER, N_LOOP_C,
     // declarations
-    N_FN, N_PARAM, N_STRUCT, N_FIELD_DECL, N_ENUM, N_ENUM_VAR, N_IMPORT
+    N_FN, N_PARAM, N_STRUCT, N_FIELD_DECL, N_ENUM, N_ENUM_VAR, N_TYPE_ALIAS, N_IMPORT
 } NodeKind;
 
 typedef enum { DECL_SCALAR = 0, DECL_ARRAY, DECL_SLICE } DeclKind;
@@ -217,6 +224,8 @@ struct Node {
     Pos type_pos;
     DeclKind decl_kind;     // DECL_SCALAR / DECL_ARRAY (`x[N]`) / DECL_SLICE (`x[]`)
     int ptr_depth;          // number of leading `*` in type annotation (`*i32` = 1, `**i32` = 2)
+    uint32_t ptr_const_mask;// bit i = 1 if pointer level i (0=innermost) is `*const`
+    bool is_const_slice;    // true for `[]const T` or `var x[]: const T`
     Node *len_expr;         // DECL_ARRAY: N expression
 
     Node *lhs, *rhs;        // operands; var/const/assign value in rhs; return value in lhs
@@ -227,6 +236,8 @@ struct Node {
     bool rev;
     bool implicit_slice;    // coercion from fixed array `[N]T` to slice `[]T`
     bool is_extern;         // N_FN: declared with `extern "dll"`
+    bool is_pub;            // top-level decl explicitly marked `pub`
+    bool is_priv;           // top-level decl private to declaring file
     const char *dll_name;   // N_FN: interned DLL name for extern functions
     const char *label;      // loop label
 
@@ -281,6 +292,8 @@ bool fits(i128 v, Type *t);
 // ---------------------------------------------------------------------------
 
 enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
+enum { XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7,
+       XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, XMM15 };
 enum { CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A,
        CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G };
 enum { ALU_ADD = 0, ALU_OR = 1, ALU_AND = 4, ALU_SUB = 5, ALU_XOR = 6, ALU_CMP = 7 };
@@ -317,8 +330,10 @@ void x_mov_ri(int dst, uint64_t imm);
 void x_load(int dst, int base, int32_t disp);          // mov dst, [base+disp] (64-bit)
 void x_load_sized(int dst, int base, int32_t disp, int size, bool is_signed);
 void x_load_sib_sized(int dst, int base, int index, int scale, int size, bool is_signed);
+void x_load_sib_disp_sized(int dst, int base, int index, int scale, int32_t disp, int size, bool is_signed);
 void x_store(int base, int32_t disp, int src);         // mov [base+disp], src (64-bit)
 void x_store_sized(int base, int32_t disp, int src, int size);
+void x_store_sib_disp_sized(int base, int index, int scale, int32_t disp, int src, int size);
 void x_store8(int base, int32_t disp, int src);        // mov byte [base+disp], src8
 void x_store8_imm(int base, int32_t disp, uint8_t imm);
 void x_load_rip(int dst, int sec, uint32_t off);
@@ -327,10 +342,12 @@ void x_lea_rip(int dst, int sec, uint32_t off);
 void x_lea_label(int dst, int label);
 void x_lea(int dst, int base, int32_t disp);
 void x_lea_sib(int dst, int base, int index, int scale);
+void x_lea_sib_disp(int dst, int base, int index, int scale, int32_t disp);
 void x_rep_stosb(void);
 void x_alu_rr(int alu, int w, int dst, int src);
 void x_alu_ri(int alu, int w, int dst, int32_t imm);
 void x_alu_rm(int alu, int w, int dst, int base, int32_t disp);   // dst = dst op [base+disp]
+void x_alu_rm_sib_disp(int alu, int w, int dst, int base, int index, int scale, int32_t disp);
 void x_alu_mr_rip(int alu, int sec, uint32_t off, int src);       // [rip+x] op= src (64-bit)
 void x_test_rr(int w, int a, int b);
 void x_imul_rr(int w, int dst, int src);
@@ -346,6 +363,7 @@ void x_movsxd(int dst, int src);
 void x_movzx8(int dst, int src);
 void x_movzx16(int dst, int src);
 void x_setcc(int cc, int r);
+void x_cmovcc(int cc, int w, int dst, int src);
 void x_jmp(int label);
 void x_jcc(int cc, int label);
 void x_call(int label);
@@ -361,9 +379,20 @@ void x_leave(void);
 uint32_t x_sub_rsp_patchable(void);     // returns offset of imm32
 void x_rep_movsb(void);
 void x_rep_stosb(void);
-// SSE2 scalar double/float helpers (XMM0, XMM1 <-> RAX, RCX)
+// SSE2 scalar double/float helpers
 void x_movq_xmm_gpr(int xmm, int gpr);
 void x_movq_gpr_xmm(int gpr, int xmm);
+void x_xorpd(int xmm_dst, int xmm_src);
+void x_movsd_rr(int xmm_dst, int xmm_src);
+void x_load_sd(int xmm_dst, int base, int32_t disp);
+void x_store_sd(int base, int32_t disp, int xmm_src);
+void x_load_sd_rip(int xmm_dst, int sec, uint32_t off);
+void x_sse_sd_rip(uint8_t op, int xmm_dst, int sec, uint32_t off);
+void x_ucomisd_rip(int xmm_a, int sec, uint32_t off);
+void x_movups_load(int xmm_dst, int base, int32_t disp);
+void x_movups_store(int base, int32_t disp, int xmm_src);
+void x_load_sd_sib_disp(int xmm_dst, int base, int index, int scale, int32_t disp);
+void x_store_sd_sib_disp(int base, int index, int scale, int32_t disp, int xmm_src);
 void x_cvtss2sd(int xmm_dst, int xmm_src);
 void x_cvtsd2ss(int xmm_dst, int xmm_src);
 void x_cvtsi2sd(int xmm_dst, int gpr_src);

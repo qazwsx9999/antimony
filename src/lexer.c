@@ -35,8 +35,8 @@ static bool triggers_term(TokKind k) {
 static TokKind lookup_keyword(const char *s, int len) {
     static const struct { const char *kw; TokKind kind; } tab[] = {
         {"var", T_VAR}, {"const", T_CONST}, {"fn", T_FN}, {"struct", T_STRUCT},
-        {"enum", T_ENUM}, {"match", T_MATCH}, {"defer", T_DEFER},
-        {"import", T_IMPORT}, {"extern", T_EXTERN},
+        {"enum", T_ENUM}, {"type", T_TYPE}, {"match", T_MATCH}, {"defer", T_DEFER},
+        {"import", T_IMPORT}, {"extern", T_EXTERN}, {"pub", T_PUB}, {"priv", T_PRIV},
         {"return", T_RETURN}, {"if", T_IF}, {"else", T_ELSE}, {"loop", T_LOOP},
         {"in", T_IN}, {"by", T_BY}, {"break", T_BREAK}, {"continue", T_CONTINUE},
         {"true", T_TRUE}, {"false", T_FALSE}, {"null", T_NULL},
@@ -46,6 +46,35 @@ static TokKind lookup_keyword(const char *s, int len) {
             return tab[i].kind;
     }
     return T_IDENT;
+}
+
+static uint8_t decode_escape(const char **pp, int *col, Pos pos) {
+    const char *p = *pp;
+    p++; (*col)++; // consume '\\'
+    uint8_t out = 0;
+    switch (*p) {
+    case 'n':  out = '\n'; p++; (*col)++; break;
+    case 't':  out = '\t'; p++; (*col)++; break;
+    case 'r':  out = '\r'; p++; (*col)++; break;
+    case '\\': out = '\\'; p++; (*col)++; break;
+    case '"':  out = '"';  p++; (*col)++; break;
+    case '\'': out = '\''; p++; (*col)++; break;
+    case '0':  out = 0;    p++; (*col)++; break;
+    case 'x': {
+        p++; (*col)++;
+        int hi = hex_val(p[0]), lo = hex_val(p[1]);
+        if (hi < 0 || lo < 0) fatal(pos, "invalid \\x escape");
+        out = (uint8_t)((hi << 4) | lo);
+        p += 2; (*col) += 2;
+        break;
+    }
+    default:
+        if (*p == '\0' || *p == '\n' || *p == '\r')
+            fatal(pos, "unterminated escape sequence");
+        fatal(pos, "unknown escape sequence '\\%c'", *p);
+    }
+    *pp = p;
+    return out;
 }
 
 Token *lex(const char *src, int *count) {
@@ -185,25 +214,7 @@ Token *lex(const char *src, int *count) {
                 if (*p == '\n' || *p == '\r')
                     fatal(pos, "unterminated string literal");
                 if (*p == '\\') {
-                    ADV();
-                    switch (*p) {
-                    case 'n':  buf_u8(&b, '\n'); ADV(); break;
-                    case 't':  buf_u8(&b, '\t'); ADV(); break;
-                    case 'r':  buf_u8(&b, '\r'); ADV(); break;
-                    case '\\': buf_u8(&b, '\\'); ADV(); break;
-                    case '"':  buf_u8(&b, '"');  ADV(); break;
-                    case '0':  buf_u8(&b, 0);    ADV(); break;
-                    case 'x': {
-                        ADV();
-                        int hi = hex_val(p[0]), lo = hex_val(p[1]);
-                        if (hi < 0 || lo < 0) fatal(pos, "invalid \\x escape");
-                        buf_u8(&b, (uint8_t)((hi << 4) | lo));
-                        ADV(); ADV();
-                        break;
-                    }
-                    default:
-                        fatal(pos, "unknown escape sequence '\\%c'", *p);
-                    }
+                    buf_u8(&b, decode_escape(&p, &col, pos));
                 } else {
                     buf_u8(&b, (uint8_t)*p);
                     ADV();
@@ -217,6 +228,58 @@ Token *lex(const char *src, int *count) {
             t.pos = pos;
             t.str = (const char *)b.data;
             t.str_len = (int)b.len - 1;
+            vec_push(out, t);
+            continue;
+        }
+
+        // Raw string literal: `...` (no escape processing, multiline allowed).
+        if (c == '`') {
+            ADV();
+            Buf b = {0};
+            while (*p && *p != '`') {
+                if (*p == '\r' && p[1] == '\n') {
+                    ADV();
+                    continue;
+                }
+                buf_u8(&b, (uint8_t)*p);
+                ADV();
+            }
+            if (*p != '`') fatal(pos, "unterminated raw string literal");
+            ADV();
+            buf_u8(&b, 0);
+            Token t = {0};
+            t.kind = T_STR;
+            t.pos = pos;
+            t.str = (const char *)b.data;
+            t.str_len = (int)b.len - 1;
+            vec_push(out, t);
+            continue;
+        }
+
+        // Character literal: `'a'`, `'\n'`, `'\''`, `'\x41'` -> untyped integer constant.
+        if (c == '\'') {
+            ADV();
+            if (*p == '\0' || *p == '\n' || *p == '\r')
+                fatal(pos, "unterminated character literal");
+            if (*p == '\'')
+                fatal(pos, "empty character literal");
+            uint64_t val = 0;
+            if (*p == '\\') {
+                val = decode_escape(&p, &col, pos);
+            } else {
+                val = (uint8_t)*p;
+                ADV();
+            }
+            if (*p != '\'') {
+                if (*p == '\0' || *p == '\n' || *p == '\r')
+                    fatal(pos, "unterminated character literal");
+                fatal(pos, "multi-character literal is not allowed");
+            }
+            ADV();
+            Token t = {0};
+            t.kind = T_INT;
+            t.pos = pos;
+            t.ival = val;
             vec_push(out, t);
             continue;
         }
@@ -335,10 +398,13 @@ const char *tok_name(TokKind k) {
     case T_FN: return "'fn'";
     case T_STRUCT: return "'struct'";
     case T_ENUM: return "'enum'";
+    case T_TYPE: return "'type'";
     case T_MATCH: return "'match'";
     case T_DEFER: return "'defer'";
     case T_IMPORT: return "'import'";
     case T_EXTERN: return "'extern'";
+    case T_PUB: return "'pub'";
+    case T_PRIV: return "'priv'";
     case T_RETURN: return "'return'";
     case T_IF: return "'if'";
     case T_ELSE: return "'else'";

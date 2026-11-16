@@ -2118,4 +2118,340 @@ foreach ($pair in @(@("sbwc_native", $sbwcNative), @("sbwc_llvm", $sbwcLlvm))) {
     Write-Host "PASS [e2e]           $tname"
 }
 
+# 29. Phase 20: Remaining Language Design Features
+#     (formatted print, char literals, raw strings, type aliases, *const/[]const, pub/priv)
+
+# 29a. Formatted print("...", args...)
+$fmt_print_code = @'
+fn main() {
+    var age: i32 = 25
+    print("my age is {} years old", age)
+    var b: bool = true
+    var pi: f64 = 2.5
+    var u: u64 = 99
+    var ch: u8 = 'A'
+    print("mix: {} {} {} {} {} {}", -7, b, false, pi, u, ch)
+    print("escaped {{braces}} and value={{x={}}}", 42)
+    print("first={} second={}", "hi", "bye")
+    print("{}-{}", 10, 20)
+    print("single {} arg literal stays literal")
+}
+'@
+$fmt_print_expected = @(
+    "my age is 25 years old"
+    "mix: -7 true false 2.5 99 65"
+    "escaped {braces} and value={x=42}"
+    "first=hi second=bye"
+    "10-20"
+    "single {} arg literal stays literal"
+) -join "`n"
+Test-RunOk   "phase20_fmt_print"      $fmt_print_code $fmt_print_expected
+Test-RunLlvm "phase20_fmt_print_llvm" $fmt_print_code $fmt_print_expected
+
+Test-CompileError "fmt_print_unmatched_open"  'fn main() { print("bad {", 1) }'      "invalid '{'"
+Test-CompileError "fmt_print_unmatched_close" 'fn main() { print("bad }", 1) }'      "unmatched '}'"
+Test-CompileError "fmt_print_named_spec"      'fn main() { print("bad {x}", 1) }'    "invalid '{'"
+Test-CompileError "fmt_print_too_few_args"    'fn main() { print("{} {}", 1) }'      "too many '{}' placeholders"
+Test-CompileError "fmt_print_too_many_args"   'fn main() { print("{}", 1, 2) }'      "too many arguments for 'print'"
+Test-CompileError "fmt_print_nonlit"          "fn main() {`n var s = `"{}`"`n print(s, 1)`n}" "must be a string literal"
+
+# 29b. Character literals and raw string literals
+$char_raw_code = @'
+fn is_upper(c: u8): bool {
+    return c >= 'A' && c <= 'Z'
+}
+
+fn main() {
+    var a: u8 = 'A'
+    var z: u8 = 'z'
+    var d = 'z' - 'a'
+    var nl = '\n'
+    var tab = '\t'
+    var sq = '\''
+    var hex: u8 = '\x41'
+    print("ch={} {} {} {} {} {} {} {}", a == hex && a == '\x41', is_upper(a), is_upper(z), d, nl, tab, sq, '\0')
+
+    var raw1 = `C:\Users\demo\n\t\"`
+    print(raw1)
+    print(len(raw1))
+    var raw2 = `say "hi" & 'bye'`
+    print(raw2)
+}
+'@
+$char_raw_expected = @(
+    "ch=true true false 25 10 9 39 0"
+    'C:\Users\demo\n\t\"'
+    "19"
+    "say `"hi`" & 'bye'"
+) -join "`n"
+Test-RunOk   "phase20_char_and_raw_str"      $char_raw_code $char_raw_expected
+Test-RunLlvm "phase20_char_and_raw_str_llvm" $char_raw_code $char_raw_expected
+
+Test-CompileError "char_empty"        "fn main() { var c = '' }"         "empty character literal"
+Test-CompileError "char_multi"        "fn main() { var c = 'ab' }"       "multi-character literal"
+Test-CompileError "char_unterminated" "fn main() {`n var c = 'a`n}" "unterminated character literal"
+Test-CompileError "raw_str_unterm"    'fn main() { var s = `abc }'      "unterminated raw string literal"
+
+# 29c. Type aliases (top-level, forward, generic, method-on-alias, local)
+$type_alias_code = @'
+type PairAlias = Pair
+
+struct Pair {
+    x: i32
+    y: i32
+}
+
+struct Wrap[T] {
+    item: T
+}
+
+type Byte = u8
+type ReadBytes = []const Byte
+type ConstI32Ptr = *const i32
+type WrapAlias[T] = Wrap[T]
+
+fn (p: *PairAlias) sum(): i32 {
+    return p.x + p.y
+}
+
+fn sum_bytes(b: ReadBytes): i32 {
+    var acc: i32 = 0
+    loop v in b {
+        acc += i32(v)
+    }
+    return acc
+}
+
+fn read_ptr(p: ConstI32Ptr): i32 {
+    return *p
+}
+
+fn main() {
+    type LocalI64 = i64
+    var p = PairAlias { x: 11, y: 31 }
+    print("sum={} size={}", p.sum(), sizeof(PairAlias))
+
+    var w = WrapAlias[LocalI64] { item: 777 }
+    print("wrap={}", w.item)
+
+    var arr[3]: Byte = ['A', 'B', 1]
+    var v: i32 = 123
+    var cp = ptr_cast(ConstI32Ptr, &v)
+    print("bytes={} cp={}", sum_bytes(arr), read_ptr(cp))
+}
+'@
+$type_alias_expected = @(
+    "sum=42 size=8"
+    "wrap=777"
+    "bytes=132 cp=123"
+) -join "`n"
+Test-RunOk   "phase20_type_aliases"      $type_alias_code $type_alias_expected
+Test-RunLlvm "phase20_type_aliases_llvm" $type_alias_code $type_alias_expected
+
+Test-CompileError "type_alias_cycle"         "type A = B`ntype B = A`nfn main() { var x: A = 1 }" "cyclic type alias"
+Test-CompileError "type_alias_local_generic" "fn main() { type L[T] = T }"                       "only allowed at top level"
+
+# 29d. Read-only pointers (*const T) and read-only slices ([]const T)
+$const_ptr_code = @'
+struct Counter {
+    val: i32
+}
+
+fn (c: *const Counter) get(): i32 {
+    return c.val
+}
+
+fn (c: *Counter) bump() {
+    c.val += 1
+}
+
+fn sum_ro(s[]: const i32, p: *const i32): i32 {
+    var total = *p
+    loop x in s {
+        total += x
+    }
+    return total
+}
+
+fn main() {
+    var ctr = Counter { val: 10 }
+    ctr.bump()
+    var cp: *const Counter = &ctr
+    print("ctr={} cp={}", ctr.get(), cp.get())
+
+    var arr[4]: i32 = [1, 2, 3, 4]
+    var mp: *i32 = &arr[0]
+    var rop: *const i32 = mp
+    var ros = rop[1..4]
+    var rp2: *const i32 = &*rop
+    var rp3: *const i32 = &ros[1]
+    print("ro={} diff={} eq={} deref={} elem={}", sum_ro(arr, rop), (rop + 2) - mp, mp == rop, *rp2, *rp3)
+
+    var mut_sl[]: i32 = arr[0..2]
+    var ro_sl: []const i32 = mut_sl
+    print("ro_sl={} len={}", ro_sl[1], len(ro_sl))
+}
+'@
+$const_ptr_expected = @(
+    "ctr=11 cp=11"
+    "ro=11 diff=2 eq=true deref=1 elem=3"
+    "ro_sl=2 len=2"
+) -join "`n"
+Test-RunOk   "phase20_const_ptr_slice"      $const_ptr_code $const_ptr_expected
+Test-RunLlvm "phase20_const_ptr_slice_llvm" $const_ptr_code $const_ptr_expected
+
+Test-CompileError "const_ptr_write"       "fn f(p: *const i32) { *p = 5 }`nfn main() {}"                  "cannot mutate or take mutable address"
+Test-CompileError "const_ptr_index_write" "fn f(p: *const i32) { p[0] = 5 }`nfn main() {}"                "cannot mutate or take mutable address"
+Test-CompileError "const_ptr_field_write" "struct S { x: i32 }`nfn f(p: *const S) { p.x = 5 }`nfn main() {}" "cannot mutate or take mutable address"
+Test-CompileError "const_slice_write"     "fn f(s[]: const i32) { s[0] = 5 }`nfn main() {}"              "cannot mutate or take mutable address"
+Test-CompileError "const_ptr_addr_deref"  "fn f(cp: *const i32) { var mp: *i32 = &*cp }`nfn main() {}"   "type mismatch"
+Test-CompileError "const_slice_addr_elem" "fn f(cs[]: const i32) { var mp: *i32 = &cs[0] }`nfn main() {}" "type mismatch"
+Test-CompileError "const_ptr_addr_write"  "fn f(cp: *const i32) { *(&*cp) = 5 }`nfn main() {}"            "cannot mutate or take mutable address"
+Test-CompileError "const_ptr_to_mut"      "fn f(cp: *const i32) { var mp: *i32 = cp }`nfn main() {}"     "type mismatch"
+Test-CompileError "const_slice_to_mut"    "fn f(cs[]: const i32) { var ms[]: i32 = cs }`nfn main() {}"  "type mismatch"
+Test-CompileError "const_ptr_mut_method"  "struct C { x: i32 }`nfn (c: *C) m() { c.x += 1 }`nfn f(cp: *const C) { cp.m() }`nfn main() {}" "cannot call mutable pointer-receiver method"
+Test-CompileError "const_ptr_atomic"      "fn f(cp: *const i64) { atomic_store(cp, 1) }`nfn main() {}"   "cannot mutate read-only pointer"
+
+# 29e. Module visibility (pub and priv)
+Set-Content -Path (Join-Path $tmp "vis_pub_mod.sb") -Value @'
+priv const SECRET_PAD = 7
+pub const VIS_BASE = 100
+
+priv struct HiddenBox {
+    v: i32
+}
+
+priv type HiddenAlias = i32
+
+pub struct PubPt {
+    x: i32
+    y: i32
+}
+
+pub type PtAlias = PubPt
+
+fn internal_mul(a: i32, b: i32): i32 {
+    return a * b + SECRET_PAD
+}
+
+priv fn explicit_priv(a: i32): i32 {
+    return a + 1
+}
+
+priv fn (p: *PubPt) secret_scale(): i32 {
+    return p.x + p.y
+}
+
+pub fn (p: *const PubPt) read_total(): i32 {
+    return p.x * 10 + p.y
+}
+
+pub fn compute_pub(a: i32, b: i32): i32 {
+    var h = HiddenBox { v: explicit_priv(internal_mul(a, b)) }
+    var d: HiddenAlias = h.v
+    return d
+}
+'@ -Encoding UTF8
+
+Set-Content -Path (Join-Path $tmp "vis_legacy_mod.sb") -Value @'
+const LEGACY_BIAS = 5
+fn legacy_add(a: i32, b: i32): i32 {
+    return a + b + LEGACY_BIAS
+}
+priv fn legacy_secret(): i32 {
+    return 99
+}
+'@ -Encoding UTF8
+
+$vis_ok_code = @'
+import "vis_pub_mod.sb"
+import "vis_legacy_mod.sb"
+
+fn main() {
+    var p = PtAlias { x: 2, y: 3 }
+    print("{} {} {} {}", VIS_BASE, compute_pub(3, 4), p.read_total(), legacy_add(10, 20))
+}
+'@
+Test-RunOk   "phase20_visibility"      $vis_ok_code "100 20 23 35"
+Test-RunLlvm "phase20_visibility_llvm" $vis_ok_code "100 20 23 35"
+
+Test-CompileError "vis_implicit_priv_fn" "import `"vis_pub_mod.sb`"`nfn main() { print(internal_mul(2, 3)) }" "cannot access private"
+Test-CompileError "vis_explicit_priv_fn" "import `"vis_pub_mod.sb`"`nfn main() { print(explicit_priv(2)) }"    "cannot access private"
+Test-CompileError "vis_priv_const"       "import `"vis_pub_mod.sb`"`nfn main() { print(SECRET_PAD) }"          "cannot access private"
+Test-CompileError "vis_priv_struct"      "import `"vis_pub_mod.sb`"`nfn main() { var h = HiddenBox { v: 1 } }" "cannot access private"
+Test-CompileError "vis_priv_alias"       "import `"vis_pub_mod.sb`"`nfn main() { var x: HiddenAlias = 1 }"   "cannot access private"
+Test-CompileError "vis_priv_method"      "import `"vis_pub_mod.sb`"`nfn main() { var p = PubPt { x: 1, y: 2 }`n print(p.secret_scale()) }" "cannot access private"
+Test-CompileError "vis_legacy_priv_fn"   "import `"vis_legacy_mod.sb`"`nfn main() { print(legacy_secret()) }" "cannot access private"
+
+# 30. Phase 21: std/math.sb Standard Math Library
+$math_test_code = @'
+import "std/math.sb"
+
+fn main() {
+    // Constants in both f64 and f32 contexts + IEEE-754 predicates
+    var pi32: f32 = PI
+    print("pi32={} nan={} inf={} neg_inf={} fin={}",
+          approx_eq_f32(pi32, 3.1415927, 1.0e-5),
+          is_nan(NAN), is_inf(INF), is_inf(NEG_INF), is_finite(PI))
+
+    // CRT f64 trig, exp/log, pow, modf/frexp, rounding
+    var ipart: f64 = 0.0
+    var fpart = modf(3.75, &ipart)
+    var fexp: i32 = 0
+    var mant = frexp(12.0, &fexp)
+    print("sqrt={} pow={} sin2+cos2={} hypot={} cbrt={} exp2={} log2={} fmod={}",
+          approx_eq(sqrt(144.0), 12.0, 1.0e-12),
+          approx_eq(pow(2.0 + 1.0, 3.0 + 1.0), 81.0, 1.0e-12),
+          approx_eq(sin(0.7) * sin(0.7) + cos(0.7) * cos(0.7), 1.0, 1.0e-12),
+          approx_eq(hypot(3.0, 4.0), 5.0, 1.0e-12),
+          approx_eq(cbrt(-27.0), -3.0, 1.0e-12),
+          approx_eq(exp2(10.0), 1024.0, 1.0e-9),
+          approx_eq(log2(256.0), 8.0, 1.0e-12),
+          approx_eq(fmod(7.5, 2.0), 1.5, 1.0e-12))
+
+    print("modf={} {} frexp={} {} ldexp={}",
+          ipart, fpart, mant, fexp, ldexp(0.75, 4))
+
+    print("round={} {} trunc={} fract={} expm1={} log1p={} copysign={}",
+          round(2.5), round(-2.5), trunc(-3.9),
+          approx_eq(fract(-3.25), -0.25, 1.0e-12),
+          approx_eq(expm1(1.0e-8), 1.0e-8, 1.0e-15),
+          approx_eq(log1p(1.0e-8), 1.0e-8, 1.0e-15),
+          copysign(4.5, -1.0))
+
+    // f32 CRT bindings + wrappers
+    var s32 = sqrtf(49.0)
+    var p32 = powf(2.0, 5.0)
+    print("f32={} {} {} {} {}",
+          approx_eq_f32(s32, 7.0, 1.0e-5),
+          approx_eq_f32(p32, 32.0, 1.0e-5),
+          roundf(-2.5), truncf(-3.9), fabsf(-5.5))
+
+    // Generics, interpolation, angles, integer math
+    print("gen={} {} {} deg={} lerp={} smooth={}",
+          min(10, -4), max(i64(7), i64(99)), clamp(150, 0, 100),
+          approx_eq(rad_to_deg(deg_to_rad(180.0)), 180.0, 1.0e-11),
+          lerp(10.0, 20.0, 0.25),
+          smoothstep(0.0, 10.0, 5.0))
+
+    print("int={} {} {} {} {} {} {} {}",
+          gcd(48, -18), lcm(12, 18), pow_i64(3, 10),
+          is_pow2(64), next_pow2(1000), next_pow2(0xFFFFFFFFFFFFFFFF),
+          ilog2(1024), div_ceil_u64(17, 5))
+}
+'@
+$math_test_expected = @(
+    "pi32=true nan=true inf=true neg_inf=true fin=true"
+    "sqrt=true pow=true sin2+cos2=true hypot=true cbrt=true exp2=true log2=true fmod=true"
+    "modf=3.0 0.75 frexp=0.75 4 ldexp=12.0"
+    "round=3.0 -3.0 trunc=-3.0 fract=true expm1=true log1p=true copysign=-4.5"
+    "f32=true true -3.0 -3.0 5.5"
+    "gen=-4 99 100 deg=true lerp=12.5 smooth=0.5"
+    "int=6 36 59049 true 1024 0 10 4"
+) -join "`n"
+Test-RunOk   "phase21_std_math"      $math_test_code $math_test_expected
+Test-RunLlvm "phase21_std_math_llvm" $math_test_code $math_test_expected
+
+Test-CompileError "math_priv_crt_hidden" "import `"std/math.sb`"`nfn main() { print(_isnan(1.0)) }" "cannot access private"
+
 Write-Host "`nAll tests passed."

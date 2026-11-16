@@ -1,0 +1,89 @@
+{
+  "name": "antimony",
+  "displayName": "Antimony (sb)",
+  "description": "Syntax highlighting, snippets, outline symbols, hover docs, and build/run support for the Antimony (.sb) programming language.",
+  "version": "0.1.0",
+  "publisher": "antimony-lang",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Snippets"
+  ],
+  "keywords": [
+    "antimony",
+    "sb",
+    "syntax",
+    "language"
+  ],
+  "activationEvents": [
+    "onLanguage:antimony"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "antimony",
+        "aliases": [
+          "Antimony",
+          "antimony",
+          "sb"
+        ],
+        "extensions": [
+          ".sb"
+        ],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/sb-light.svg",
+          "dark": "./icons/sb-dark.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "antimony",
+        "scopeName": "source.sb",
+        "path": "./syntaxes/antimony.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "antimony",
+        "path": "./snippets/antimony.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "antimony.runFile",
+        "title": "Antimony: Compile & Run Current File",
+        "icon": "$(play)"
+      },
+      {
+        "command": "antimony.buildFile",
+        "title": "Antimony: Compile Current File",
+        "icon": "$(tools)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "antimony.runFile",
+          "when": "editorLangId == antimony",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Antimony",
+      "properties": {
+        "antimony.compilerPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the Antimony compiler (sbc / sbc.exe). Leave empty to auto-detect sbc.exe in the workspace root or PATH."
+        }
+      }
+    }
+  }
+}

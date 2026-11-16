@@ -52,17 +52,22 @@ static void mem_disp(int reg, int base, int32_t disp) {
     }
 }
 
-static void mem_sib(int reg, int base, int index, int scale) {
+static void mem_sib_disp(int reg, int base, int index, int scale, int32_t disp) {
     int ss = (scale == 8) ? 3 : (scale == 4) ? 2 : (scale == 2) ? 1 : 0;
     int b = base & 7;
     int x = index & 7;
-    if (b == RBP) {
-        modrm(1, reg, 4);
-        emit8((uint8_t)((ss << 6) | (x << 3) | b));
-        emit8(0);
-    } else {
+    uint8_t sib = (uint8_t)((ss << 6) | (x << 3) | b);
+    if (disp == 0 && b != RBP) {
         modrm(0, reg, 4);
-        emit8((uint8_t)((ss << 6) | (x << 3) | b));
+        emit8(sib);
+    } else if (disp >= -128 && disp <= 127) {
+        modrm(1, reg, 4);
+        emit8(sib);
+        emit8((uint8_t)(int8_t)disp);
+    } else {
+        modrm(2, reg, 4);
+        emit8(sib);
+        emit32((uint32_t)disp);
     }
 }
 
@@ -138,32 +143,27 @@ void x_load_sized(int dst, int base, int32_t disp, int size, bool is_signed) {
     }
 }
 
-void x_load_sib_sized(int dst, int base, int index, int scale, int size, bool is_signed) {
+void x_load_sib_disp_sized(int dst, int base, int index, int scale, int32_t disp, int size, bool is_signed) {
     if (size == 8) {
         emit_rex(1, dst, index, base);
         emit8(0x8B);
-        mem_sib(dst, base, index, scale);
     } else if (size == 4) {
-        if (is_signed) {
-            emit_rex(1, dst, index, base);
-            emit8(0x63); // movsxd r64, [base+index*scale]
-            mem_sib(dst, base, index, scale);
-        } else {
-            emit_rex(0, dst, index, base);
-            emit8(0x8B); // mov r32, [base+index*scale]
-            mem_sib(dst, base, index, scale);
-        }
+        emit_rex(is_signed ? 1 : 0, dst, index, base);
+        emit8(is_signed ? 0x63 : 0x8B); // movsxd / mov r32, [base+index*scale+disp]
     } else if (size == 2) {
         emit_rex(1, dst, index, base);
         emit8(0x0F);
         emit8(is_signed ? 0xBF : 0xB7);
-        mem_sib(dst, base, index, scale);
     } else {
         emit_rex(1, dst, index, base);
         emit8(0x0F);
         emit8(is_signed ? 0xBE : 0xB6);
-        mem_sib(dst, base, index, scale);
     }
+    mem_sib_disp(dst, base, index, scale, disp);
+}
+
+void x_load_sib_sized(int dst, int base, int index, int scale, int size, bool is_signed) {
+    x_load_sib_disp_sized(dst, base, index, scale, 0, size, is_signed);
 }
 
 void x_store(int base, int32_t disp, int src) {
@@ -187,6 +187,25 @@ void x_store_sized(int base, int32_t disp, int src, int size) {
     } else {
         x_store8(base, disp, src);
     }
+}
+
+void x_store_sib_disp_sized(int base, int index, int scale, int32_t disp, int src, int size) {
+    if (size == 8) {
+        emit_rex(1, src, index, base);
+        emit8(0x89);
+    } else if (size == 4) {
+        emit_rex(0, src, index, base);
+        emit8(0x89);
+    } else if (size == 2) {
+        emit8(0x66);
+        emit_rex(0, src, index, base);
+        emit8(0x89);
+    } else {
+        uint8_t rex = 0x40 | (((src >> 3) & 1) << 2) | (((index >> 3) & 1) << 1) | ((base >> 3) & 1);
+        if (rex != 0x40 || (src & 7) >= 4) emit8(rex);
+        emit8(0x88);
+    }
+    mem_sib_disp(src, base, index, scale, disp);
 }
 
 void x_store8(int base, int32_t disp, int src) {
@@ -236,10 +255,14 @@ void x_lea(int dst, int base, int32_t disp) {
     mem_disp(dst, base, disp);
 }
 
-void x_lea_sib(int dst, int base, int index, int scale) {
+void x_lea_sib_disp(int dst, int base, int index, int scale, int32_t disp) {
     emit_rex(1, dst, index, base);
     emit8(0x8D);
-    mem_sib(dst, base, index, scale);
+    mem_sib_disp(dst, base, index, scale, disp);
+}
+
+void x_lea_sib(int dst, int base, int index, int scale) {
+    x_lea_sib_disp(dst, base, index, scale, 0);
 }
 
 // alu: ADD=0 OR=1 AND=4 SUB=5 XOR=6 CMP=7
@@ -266,6 +289,12 @@ void x_alu_rm(int alu, int w, int dst, int base, int32_t disp) {
     emit_rex(w, dst, 0, base);
     emit8((uint8_t)((alu << 3) | 3));
     mem_disp(dst, base, disp);
+}
+
+void x_alu_rm_sib_disp(int alu, int w, int dst, int base, int index, int scale, int32_t disp) {
+    emit_rex(w, dst, index, base);
+    emit8((uint8_t)((alu << 3) | 3));
+    mem_sib_disp(dst, base, index, scale, disp);
 }
 
 void x_alu_mr_rip(int alu, int sec, uint32_t off, int src) {
@@ -362,6 +391,13 @@ void x_setcc(int cc, int r) {
     emit8(0x0F);
     emit8((uint8_t)(0x90 + cc));
     modrm(3, 0, r);
+}
+
+void x_cmovcc(int cc, int w, int dst, int src) {
+    emit_rex(w, dst, 0, src);
+    emit8(0x0F);
+    emit8((uint8_t)(0x40 + cc));
+    modrm(3, dst, src);
 }
 
 static void emit_rel32_to(int label) {
@@ -468,6 +504,104 @@ void x_movq_gpr_xmm(int gpr, int xmm) {
     emit8(0x0F);
     emit8(0x7E);
     modrm(3, xmm, gpr);
+}
+
+// xorpd xmm_dst, xmm_src: 66 0F 57 /r
+void x_xorpd(int xmm_dst, int xmm_src) {
+    emit8(0x66);
+    emit_rex(0, xmm_dst, 0, xmm_src);
+    emit8(0x0F);
+    emit8(0x57);
+    modrm(3, xmm_dst, xmm_src);
+}
+
+// movsd xmm_dst, xmm_src: F2 0F 10 /r
+void x_movsd_rr(int xmm_dst, int xmm_src) {
+    if (xmm_dst == xmm_src) return;
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, 0, xmm_src);
+    emit8(0x0F);
+    emit8(0x10);
+    modrm(3, xmm_dst, xmm_src);
+}
+
+// movsd xmm_dst, [base+disp]: F2 0F 10 /r
+void x_load_sd(int xmm_dst, int base, int32_t disp) {
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, 0, base);
+    emit8(0x0F);
+    emit8(0x10);
+    mem_disp(xmm_dst, base, disp);
+}
+
+// movsd [base+disp], xmm_src: F2 0F 11 /r
+void x_store_sd(int base, int32_t disp, int xmm_src) {
+    emit8(0xF2);
+    emit_rex(0, xmm_src, 0, base);
+    emit8(0x0F);
+    emit8(0x11);
+    mem_disp(xmm_src, base, disp);
+}
+
+// movsd xmm_dst, [rip+disp32]: F2 0F 10 /r
+void x_load_sd_rip(int xmm_dst, int sec, uint32_t off) {
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, 0, 0);
+    emit8(0x0F);
+    emit8(0x10);
+    rip_rel(xmm_dst, sec, off, 0);
+}
+
+// Scalar double op with RIP-relative m64 operand: F2 0F <op> /r
+void x_sse_sd_rip(uint8_t op, int xmm_dst, int sec, uint32_t off) {
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, 0, 0);
+    emit8(0x0F);
+    emit8(op);
+    rip_rel(xmm_dst, sec, off, 0);
+}
+
+// ucomisd xmm_a, [rip+disp32]: 66 0F 2E /r
+void x_ucomisd_rip(int xmm_a, int sec, uint32_t off) {
+    emit8(0x66);
+    emit_rex(0, xmm_a, 0, 0);
+    emit8(0x0F);
+    emit8(0x2E);
+    rip_rel(xmm_a, sec, off, 0);
+}
+
+// movups xmm_dst, [base+disp]: 0F 10 /r
+void x_movups_load(int xmm_dst, int base, int32_t disp) {
+    emit_rex(0, xmm_dst, 0, base);
+    emit8(0x0F);
+    emit8(0x10);
+    mem_disp(xmm_dst, base, disp);
+}
+
+// movups [base+disp], xmm_src: 0F 11 /r
+void x_movups_store(int base, int32_t disp, int xmm_src) {
+    emit_rex(0, xmm_src, 0, base);
+    emit8(0x0F);
+    emit8(0x11);
+    mem_disp(xmm_src, base, disp);
+}
+
+// movsd xmm_dst, [base+index*scale+disp]: F2 0F 10 /r
+void x_load_sd_sib_disp(int xmm_dst, int base, int index, int scale, int32_t disp) {
+    emit8(0xF2);
+    emit_rex(0, xmm_dst, index, base);
+    emit8(0x0F);
+    emit8(0x10);
+    mem_sib_disp(xmm_dst, base, index, scale, disp);
+}
+
+// movsd [base+index*scale+disp], xmm_src: F2 0F 11 /r
+void x_store_sd_sib_disp(int base, int index, int scale, int32_t disp, int xmm_src) {
+    emit8(0xF2);
+    emit_rex(0, xmm_src, index, base);
+    emit8(0x0F);
+    emit8(0x11);
+    mem_sib_disp(xmm_src, base, index, scale, disp);
 }
 
 // cvtss2sd xmm_dst, xmm_src: F3 0F 5A /r

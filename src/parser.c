@@ -73,7 +73,7 @@ static Node *parse_expr(Parser *p);
 static Node *parse_block(Parser *p);
 static Node *parse_stmt(Parser *p);
 
-// Parses a full type string inside `[...]` or `fn(...)` (e.g. `i32`, `*Point`, `[]u8`, `Result[i32,str]`, `fn(i32,i32):bool`).
+// Parses a full type string inside `[...]` or `fn(...)` (e.g. `i32`, `*Point`, `*const u8`, `[]const u8`, `Result[i32,str]`, `fn(i32,i32):bool`).
 static void parse_type_arg_buf(Parser *p, Buf *b) {
     skip_terms(p);
     while (cur(p)->kind == T_LBRACKET && peek(p, 1)->kind == T_RBRACKET) {
@@ -81,9 +81,15 @@ static void parse_type_arg_buf(Parser *p, Buf *b) {
         next(p); // ']'
         buf_u8(b, '[');
         buf_u8(b, ']');
+        if (match(p, T_CONST)) {
+            buf_bytes(b, "const ", 6);
+        }
     }
     while (match(p, T_STAR)) {
         buf_u8(b, '*');
+        if (match(p, T_CONST)) {
+            buf_bytes(b, "const ", 6);
+        }
     }
     if (match(p, T_FN)) {
         buf_bytes(b, "fn(", 3);
@@ -162,7 +168,7 @@ static bool looks_like_generic_type_args(Parser *p) {
             if (depth == 0) break;
         } else if (k == T_COMMA && depth == 1) {
             has_comma = true;
-        } else if (k != T_IDENT && k != T_STAR && k != T_COMMA && k != T_TERM &&
+        } else if (k != T_IDENT && k != T_STAR && k != T_CONST && k != T_COMMA && k != T_TERM &&
                    k != T_FN && k != T_LPAREN && k != T_RPAREN && k != T_COLON) {
             return false;
         }
@@ -195,23 +201,42 @@ static const char *parse_generic_ident_suffix(Parser *p, const char *base_name) 
     return res;
 }
 
-static const char *parse_type_spec(Parser *p, Pos *out_pos, DeclKind *dk, Node **len_expr, int *ptr_depth) {
-    // Also accept prefix `[N]T` or `[]T` on return types / type annotations.
+static const char *parse_type_spec(Parser *p, Pos *out_pos, DeclKind *dk, Node **len_expr,
+                                   int *ptr_depth, uint32_t *ptr_const_mask, bool *is_const_slice) {
+    if (ptr_const_mask) *ptr_const_mask = 0;
+    if (is_const_slice) *is_const_slice = false;
+    // Also accept prefix `[N]T`, `[]T`, or `[]const T` on return types / type annotations.
     if (dk && *dk == DECL_SCALAR && match(p, T_LBRACKET)) {
         if (match(p, T_RBRACKET)) {
             *dk = DECL_SLICE;
+            if (is_const_slice && match(p, T_CONST)) {
+                *is_const_slice = true;
+            }
         } else {
             *dk = DECL_ARRAY;
             *len_expr = parse_expr(p);
             expect(p, T_RBRACKET);
         }
+    } else if (dk && *dk == DECL_SLICE && is_const_slice && !*is_const_slice && match(p, T_CONST)) {
+        // Supports postfix slice syntax `var s[]: const T`.
+        *is_const_slice = true;
     }
     int stars = 0;
+    bool const_levels[32] = {0};
     while (match(p, T_STAR)) {
+        if (stars < 32) const_levels[stars] = match(p, T_CONST);
+        else            (void)match(p, T_CONST);
         stars++;
     }
     if (ptr_depth) *ptr_depth = stars;
     else if (stars > 0) fatal(cur(p)->pos, "pointer type is not allowed here");
+    if (ptr_const_mask) {
+        uint32_t mask = 0;
+        for (int i = 0; i < stars && i < 32; i++) {
+            if (const_levels[stars - 1 - i]) mask |= (1u << i);
+        }
+        *ptr_const_mask = mask;
+    }
     if (cur(p)->kind == T_FN) {
         if (out_pos) *out_pos = cur(p)->pos;
         Buf b = {0};
@@ -226,6 +251,11 @@ static const char *parse_type_spec(Parser *p, Pos *out_pos, DeclKind *dk, Node *
         return parse_generic_ident_suffix(p, t->name);
     }
     return t->name;
+}
+
+static void parse_decl_type_spec(Parser *p, Node *n) {
+    n->type_name = parse_type_spec(p, &n->type_pos, &n->decl_kind, &n->len_expr,
+                                   &n->ptr_depth, &n->ptr_const_mask, &n->is_const_slice);
 }
 
 static void parse_var_brackets(Parser *p, DeclKind *dk, Node **len_expr) {
@@ -410,7 +440,7 @@ static Node *parse_primary_base(Parser *p) {
                 param->name = pid->name;
                 parse_var_brackets(p, &param->decl_kind, &param->len_expr);
                 expect(p, T_COLON);
-                param->type_name = parse_type_spec(p, &param->type_pos, &param->decl_kind, &param->len_expr, &param->ptr_depth);
+                parse_decl_type_spec(p, param);
                 vec_push(fn->list, param);
                 skip_terms(p);
                 if (!match(p, T_COMMA)) break;
@@ -420,7 +450,7 @@ static Node *parse_primary_base(Parser *p) {
         }
         expect(p, T_RPAREN);
         if (match(p, T_COLON)) {
-            fn->type_name = parse_type_spec(p, &fn->type_pos, &fn->decl_kind, &fn->len_expr, &fn->ptr_depth);
+            parse_decl_type_spec(p, fn);
         }
         bool saved_nsl = p->no_struct_lit;
         p->no_struct_lit = false;
@@ -553,6 +583,9 @@ static Node *parse_unary(Parser *p) {
     if (t->kind == T_STAR) {
         next(p);
         Node *n = new_node(N_DEREF, t->pos);
+        if (match(p, T_CONST)) {
+            n->op = T_CONST; // only valid inside type expressions (`sizeof(*const T)`, `ptr_cast(*const T, x)`)
+        }
         n->lhs = parse_unary(p);
         return n;
     }
@@ -668,7 +701,7 @@ static Node *parse_var_no_term(Parser *p) {
     n->name = id->name;
     parse_var_brackets(p, &n->decl_kind, &n->len_expr);
     if (match(p, T_COLON)) {
-        n->type_name = parse_type_spec(p, &n->type_pos, &n->decl_kind, &n->len_expr, &n->ptr_depth);
+        parse_decl_type_spec(p, n);
         if (match(p, T_ASSIGN)) {
             skip_terms(p);
             n->rhs = parse_expr(p);
@@ -688,11 +721,23 @@ static Node *parse_const_no_term(Parser *p) {
     Node *n = new_node(N_CONST, kw->pos);
     n->name = id->name;
     if (match(p, T_COLON)) {
-        n->type_name = parse_type_spec(p, &n->type_pos, NULL, NULL, NULL);
+        n->type_name = parse_type_spec(p, &n->type_pos, NULL, NULL, NULL, NULL, NULL);
     }
     expect(p, T_ASSIGN);
     skip_terms(p);
     n->rhs = parse_expr(p);
+    return n;
+}
+
+static Node *parse_type_alias(Parser *p) {
+    Token *kw = expect(p, T_TYPE);
+    Token *id = expect(p, T_IDENT);
+    Node *n = new_node(N_TYPE_ALIAS, kw->pos);
+    n->name = id->name;
+    parse_tparams(p, &n->tparams);
+    expect(p, T_ASSIGN);
+    skip_terms(p);
+    parse_decl_type_spec(p, n);
     return n;
 }
 
@@ -908,6 +953,11 @@ static Node *parse_stmt(Parser *p) {
         expect_term(p);
         return n;
     }
+    case T_TYPE: {
+        Node *n = parse_type_alias(p);
+        expect_term(p);
+        return n;
+    }
     case T_IF: {
         Node *n = parse_if(p);
         expect_term(p);
@@ -1051,7 +1101,7 @@ static Node *parse_fn_header(Parser *p) {
         Node *rparam = new_node(N_PARAM, rid->pos);
         rparam->name = rid->name;
         expect(p, T_COLON);
-        rparam->type_name = parse_type_spec(p, &rparam->type_pos, &rparam->decl_kind, &rparam->len_expr, &rparam->ptr_depth);
+        parse_decl_type_spec(p, rparam);
         if (rparam->decl_kind != DECL_SCALAR || rparam->ptr_depth > 1) {
             fatal(rparam->type_pos, "method receiver must be a struct/enum type 'T' or pointer '*T'");
         }
@@ -1082,7 +1132,7 @@ static Node *parse_fn_header(Parser *p) {
             param->name = pid->name;
             parse_var_brackets(p, &param->decl_kind, &param->len_expr);
             expect(p, T_COLON);
-            param->type_name = parse_type_spec(p, &param->type_pos, &param->decl_kind, &param->len_expr, &param->ptr_depth);
+            parse_decl_type_spec(p, param);
             vec_push(fn->list, param);
             skip_terms(p);
             if (!match(p, T_COMMA)) break;
@@ -1093,7 +1143,7 @@ static Node *parse_fn_header(Parser *p) {
     expect(p, T_RPAREN);
 
     if (match(p, T_COLON)) {
-        fn->type_name = parse_type_spec(p, &fn->type_pos, &fn->decl_kind, &fn->len_expr, &fn->ptr_depth);
+        parse_decl_type_spec(p, fn);
     }
     return fn;
 }
@@ -1146,7 +1196,7 @@ static Node *parse_struct(Parser *p) {
         fd->name = fid->name;
         parse_var_brackets(p, &fd->decl_kind, &fd->len_expr);
         expect(p, T_COLON);
-        fd->type_name = parse_type_spec(p, &fd->type_pos, &fd->decl_kind, &fd->len_expr, &fd->ptr_depth);
+        parse_decl_type_spec(p, fd);
         vec_push(st->list, fd);
         if (match(p, T_COMMA)) {
             skip_terms(p);
@@ -1172,7 +1222,7 @@ static Node *parse_enum(Parser *p) {
         Node *ev = new_node(N_ENUM_VAR, vid->pos);
         ev->name = vid->name;
         if (match(p, T_LPAREN)) {
-            ev->type_name = parse_type_spec(p, &ev->type_pos, &ev->decl_kind, &ev->len_expr, &ev->ptr_depth);
+            parse_decl_type_spec(p, ev);
             expect(p, T_RPAREN);
         }
         if (match(p, T_ASSIGN)) {
@@ -1195,8 +1245,17 @@ NodeVec parse(Token *toks, int count) {
     NodeVec decls = {0};
     skip_terms(&p);
     while (cur(&p)->kind != T_EOF) {
+        Token *vis_tok = cur(&p);
+        bool is_pub  = match(&p, T_PUB);
+        bool is_priv = !is_pub && match(&p, T_PRIV);
         Token *t = cur(&p);
+        if ((is_pub || is_priv) && (t->kind == T_PUB || t->kind == T_PRIV)) {
+            fatal(t->pos, "duplicate visibility modifier %s", tok_name(t->kind));
+        }
         if (t->kind == T_IMPORT) {
+            if (is_pub || is_priv) {
+                fatal(vis_tok->pos, "'%s' is not allowed on 'import'", is_pub ? "pub" : "priv");
+            }
             vec_push(decls, parse_import(&p));
         } else if (t->kind == T_EXTERN) {
             next(&p); // consume 'extern'
@@ -1208,30 +1267,55 @@ NodeVec parse(Token *toks, int count) {
             if (match(&p, T_LBRACE)) {
                 skip_terms(&p);
                 while (cur(&p)->kind != T_RBRACE && cur(&p)->kind != T_EOF) {
-                    vec_push(decls, parse_extern_fn(&p, dll_name));
+                    Node *ef = parse_extern_fn(&p, dll_name);
+                    ef->is_pub = is_pub;
+                    ef->is_priv = is_priv;
+                    vec_push(decls, ef);
                     skip_terms(&p);
                 }
                 expect(&p, T_RBRACE);
                 expect_term(&p);
             } else {
-                vec_push(decls, parse_extern_fn(&p, dll_name));
+                Node *ef = parse_extern_fn(&p, dll_name);
+                ef->is_pub = is_pub;
+                ef->is_priv = is_priv;
+                vec_push(decls, ef);
             }
         } else if (t->kind == T_FN) {
-            vec_push(decls, parse_fn(&p));
+            Node *n = parse_fn(&p);
+            n->is_pub = is_pub;
+            n->is_priv = is_priv;
+            vec_push(decls, n);
         } else if (t->kind == T_STRUCT) {
-            vec_push(decls, parse_struct(&p));
+            Node *n = parse_struct(&p);
+            n->is_pub = is_pub;
+            n->is_priv = is_priv;
+            vec_push(decls, n);
         } else if (t->kind == T_ENUM) {
-            vec_push(decls, parse_enum(&p));
+            Node *n = parse_enum(&p);
+            n->is_pub = is_pub;
+            n->is_priv = is_priv;
+            vec_push(decls, n);
+        } else if (t->kind == T_TYPE) {
+            Node *n = parse_type_alias(&p);
+            expect_term(&p);
+            n->is_pub = is_pub;
+            n->is_priv = is_priv;
+            vec_push(decls, n);
         } else if (t->kind == T_VAR) {
             Node *n = parse_var_no_term(&p);
             expect_term(&p);
+            n->is_pub = is_pub;
+            n->is_priv = is_priv;
             vec_push(decls, n);
         } else if (t->kind == T_CONST) {
             Node *n = parse_const_no_term(&p);
             expect_term(&p);
+            n->is_pub = is_pub;
+            n->is_priv = is_priv;
             vec_push(decls, n);
         } else {
-            fatal(t->pos, "expected 'import', 'extern', 'fn', 'struct', 'enum', 'var', or 'const' at top level, got %s", tok_name(t->kind));
+            fatal(t->pos, "expected 'import', 'extern', 'fn', 'struct', 'enum', 'type', 'var', or 'const' at top level, got %s", tok_name(t->kind));
         }
         skip_terms(&p);
     }

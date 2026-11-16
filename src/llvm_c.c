@@ -628,9 +628,9 @@ static void emit_llvm_runtime_preamble(Buf *b) {
         "target triple = \"x86_64-pc-windows-msvc\"\n\n"
         "%%sb.slice = type { ptr, i64 }\n"
         "@sb_stdout_handle = internal global ptr null, align 8\n"
-        "@.str.nl    = private unnamed_addr constant [2 x i8] c\"\\0A\\00\", align 1\n"
-        "@.str.true  = private unnamed_addr constant [6 x i8] c\"true\\0A\\00\", align 1\n"
-        "@.str.false = private unnamed_addr constant [7 x i8] c\"false\\0A\\00\", align 1\n\n"
+        "@.str.nl        = private unnamed_addr constant [2 x i8] c\"\\0A\\00\", align 1\n"
+        "@.str.true_raw  = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n"
+        "@.str.false_raw = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n\n"
         "declare ptr @GetStdHandle(i32)\n"
         "declare i32 @WriteFile(ptr, ptr, i32, ptr, ptr)\n"
         "declare void @ExitProcess(i32) #1\n"
@@ -675,15 +675,18 @@ static void emit_llvm_runtime_preamble(Buf *b) {
         "  call void @ExitProcess(i32 101)\n"
         "  unreachable\n"
         "}\n\n"
-        "define internal void @sb_rt_print_u64(i64 %%v0) #2 {\n"
+        "define internal void @sb_rt_print_nl() #2 {\n"
+        "entry:\n"
+        "  call void @sb_rt_write(ptr @.str.nl, i32 1)\n"
+        "  ret void\n"
+        "}\n\n"
+        "define internal void @sb_rt_print_u64_raw(i64 %%v0) #2 {\n"
         "entry:\n"
         "  %%buf = alloca [32 x i8], align 1\n"
-        "  %%p31 = getelementptr inbounds [32 x i8], ptr %%buf, i64 0, i64 31\n"
-        "  store i8 10, ptr %%p31, align 1\n"
         "  br label %%loop\n"
         "loop:\n"
         "  %%v = phi i64 [ %%v0, %%entry ], [ %%q, %%loop ]\n"
-        "  %%pos = phi i64 [ 31, %%entry ], [ %%pos1, %%loop ]\n"
+        "  %%pos = phi i64 [ 32, %%entry ], [ %%pos1, %%loop ]\n"
         "  %%pos1 = sub nsw i64 %%pos, 1\n"
         "  %%rem = urem i64 %%v, 10\n"
         "  %%q = udiv i64 %%v, 10\n"
@@ -700,18 +703,22 @@ static void emit_llvm_runtime_preamble(Buf *b) {
         "  call void @sb_rt_write(ptr %%sptr, i32 %%len32)\n"
         "  ret void\n"
         "}\n\n"
-        "define internal void @sb_rt_print_i64(i64 %%v) #2 {\n"
+        "define internal void @sb_rt_print_u64(i64 %%v0) #2 {\n"
+        "entry:\n"
+        "  call void @sb_rt_print_u64_raw(i64 %%v0)\n"
+        "  call void @sb_rt_print_nl()\n"
+        "  ret void\n"
+        "}\n\n"
+        "define internal void @sb_rt_print_i64_raw(i64 %%v) #2 {\n"
         "entry:\n"
         "  %%buf = alloca [32 x i8], align 1\n"
-        "  %%p31 = getelementptr inbounds [32 x i8], ptr %%buf, i64 0, i64 31\n"
-        "  store i8 10, ptr %%p31, align 1\n"
         "  %%is_neg = icmp slt i64 %%v, 0\n"
         "  %%neg_v = sub i64 0, %%v\n"
         "  %%u0 = select i1 %%is_neg, i64 %%neg_v, i64 %%v\n"
         "  br label %%loop\n"
         "loop:\n"
         "  %%u = phi i64 [ %%u0, %%entry ], [ %%q, %%loop ]\n"
-        "  %%pos = phi i64 [ 31, %%entry ], [ %%pos1, %%loop ]\n"
+        "  %%pos = phi i64 [ 32, %%entry ], [ %%pos1, %%loop ]\n"
         "  %%pos1 = sub nsw i64 %%pos, 1\n"
         "  %%rem = urem i64 %%u, 10\n"
         "  %%q = udiv i64 %%u, 10\n"
@@ -736,11 +743,15 @@ static void emit_llvm_runtime_preamble(Buf *b) {
         "  call void @sb_rt_write(ptr %%sptr, i32 %%len32)\n"
         "  ret void\n"
         "}\n\n"
-        "define internal void @sb_rt_print_f64(double %%x) #2 {\n"
+        "define internal void @sb_rt_print_i64(i64 %%v) #2 {\n"
+        "entry:\n"
+        "  call void @sb_rt_print_i64_raw(i64 %%v)\n"
+        "  call void @sb_rt_print_nl()\n"
+        "  ret void\n"
+        "}\n\n"
+        "define internal void @sb_rt_print_f64_raw(double %%x) #2 {\n"
         "entry:\n"
         "  %%buf = alloca [64 x i8], align 1\n"
-        "  %%p63 = getelementptr inbounds [64 x i8], ptr %%buf, i64 0, i64 63\n"
-        "  store i8 10, ptr %%p63, align 1\n"
         "  %%neg = fcmp olt double %%x, 0.0\n"
         "  %%nx = fneg double %%x\n"
         "  %%ax = select i1 %%neg, double %%nx, double %%x\n"
@@ -767,7 +778,7 @@ static void emit_llvm_runtime_preamble(Buf *b) {
         "floop:\n"
         "  %%fi = phi i32 [ 0, %%floop_pre ], [ %%fi1, %%floop ]\n"
         "  %%fcur = phi i64 [ %%fp, %%floop_pre ], [ %%fq, %%floop ]\n"
-        "  %%pos = phi i64 [ 63, %%floop_pre ], [ %%pos1, %%floop ]\n"
+        "  %%pos = phi i64 [ 64, %%floop_pre ], [ %%pos1, %%floop ]\n"
         "  %%pos1 = sub nsw i64 %%pos, 1\n"
         "  %%frem = urem i64 %%fcur, 10\n"
         "  %%fq = udiv i64 %%fcur, 10\n"
@@ -810,29 +821,46 @@ static void emit_llvm_runtime_preamble(Buf *b) {
         "  call void @sb_rt_write(ptr %%sptr, i32 %%len32)\n"
         "  ret void\n"
         "}\n\n"
-        "define internal void @sb_rt_print_bool(i8 %%b) #2 {\n"
+        "define internal void @sb_rt_print_f64(double %%x) #2 {\n"
+        "entry:\n"
+        "  call void @sb_rt_print_f64_raw(double %%x)\n"
+        "  call void @sb_rt_print_nl()\n"
+        "  ret void\n"
+        "}\n\n"
+        "define internal void @sb_rt_print_bool_raw(i8 %%b) #2 {\n"
         "entry:\n"
         "  %%z = icmp eq i8 %%b, 0\n"
         "  br i1 %%z, label %%f, label %%t\n"
         "t:\n"
-        "  call void @sb_rt_write(ptr @.str.true, i32 5)\n"
+        "  call void @sb_rt_write(ptr @.str.true_raw, i32 4)\n"
         "  ret void\n"
         "f:\n"
-        "  call void @sb_rt_write(ptr @.str.false, i32 6)\n"
+        "  call void @sb_rt_write(ptr @.str.false_raw, i32 5)\n"
         "  ret void\n"
         "}\n\n"
-        "define internal void @sb_rt_print_str(%%sb.slice %%s) #2 {\n"
+        "define internal void @sb_rt_print_bool(i8 %%b) #2 {\n"
+        "entry:\n"
+        "  call void @sb_rt_print_bool_raw(i8 %%b)\n"
+        "  call void @sb_rt_print_nl()\n"
+        "  ret void\n"
+        "}\n\n"
+        "define internal void @sb_rt_print_str_raw(%%sb.slice %%s) #2 {\n"
         "entry:\n"
         "  %%sp = extractvalue %%sb.slice %%s, 0\n"
         "  %%sl = extractvalue %%sb.slice %%s, 1\n"
         "  %%pos = icmp sgt i64 %%sl, 0\n"
-        "  br i1 %%pos, label %%write_s, label %%write_nl\n"
+        "  br i1 %%pos, label %%write_s, label %%done\n"
         "write_s:\n"
         "  %%l32 = trunc i64 %%sl to i32\n"
         "  call void @sb_rt_write(ptr %%sp, i32 %%l32)\n"
-        "  br label %%write_nl\n"
-        "write_nl:\n"
-        "  call void @sb_rt_write(ptr @.str.nl, i32 1)\n"
+        "  br label %%done\n"
+        "done:\n"
+        "  ret void\n"
+        "}\n\n"
+        "define internal void @sb_rt_print_str(%%sb.slice %%s) #2 {\n"
+        "entry:\n"
+        "  call void @sb_rt_print_str_raw(%%sb.slice %%s)\n"
+        "  call void @sb_rt_print_nl()\n"
         "  ret void\n"
         "}\n\n"
         "define internal i8 @sb_str_eq(%%sb.slice %%a, %%sb.slice %%b) #0 {\n"
@@ -1105,7 +1133,7 @@ static LlvmVal llvm_emit_arith_op(LlvmGen *g, TokKind op, LlvmVal lhs, LlvmVal r
     llvm_ensure_block(g);
 
     if (lhs_t->kind == TY_PTR && (op == T_PLUS || op == T_MINUS)) {
-        if (op == T_MINUS && rhs_t == lhs_t) {
+        if (op == T_MINUS && rhs_t->kind == TY_PTR) {
             const char *p1 = llvm_tmp(g);
             const char *p2 = llvm_tmp(g);
             const char *diff = llvm_tmp(g);
@@ -1209,6 +1237,29 @@ static LlvmVal llvm_emit_arith_op(LlvmGen *g, TokKind op, LlvmVal lhs, LlvmVal r
             tmp, lty, opname, lhs_t->is_signed ? "i" : "u", bits,
             lty, lhs.op, lty, rhs.op, msg_sym, msg_len);
     return (LlvmVal){ tmp, lty };
+}
+
+static void llvm_emit_print_val(LlvmGen *g, Node *arg, bool with_nl) {
+    LlvmVal av = llvm_gen_expr(g, arg);
+    const char *suf = with_nl ? "" : "_raw";
+    if (arg->type == &ty_str) {
+        bprintf(&g->out, "  call void @sb_rt_print_str%s(%%sb.slice %s)\n", suf, av.op);
+    } else if (arg->type == &ty_bool) {
+        bprintf(&g->out, "  call void @sb_rt_print_bool%s(i8 %s)\n", suf, av.op);
+    } else if (arg->type->kind == TY_FLOAT) {
+        if (arg->type == &ty_f32) {
+            const char *d = llvm_tmp(g);
+            bprintf(&g->out, "  %s = fpext float %s to double\n", d, av.op);
+            av.op = d;
+        }
+        bprintf(&g->out, "  call void @sb_rt_print_f64%s(double %s)\n", suf, av.op);
+    } else if (arg->type->kind == TY_PTR || arg->type->kind == TY_FN || !arg->type->is_signed) {
+        LlvmVal u64 = llvm_to_i64(g, av, arg->type);
+        bprintf(&g->out, "  call void @sb_rt_print_u64%s(i64 %s)\n", suf, u64.op);
+    } else {
+        LlvmVal i64 = llvm_to_i64(g, av, arg->type);
+        bprintf(&g->out, "  call void @sb_rt_print_i64%s(i64 %s)\n", suf, i64.op);
+    }
 }
 
 static LlvmVal llvm_gen_expr(LlvmGen *g, Node *n) {
@@ -1588,29 +1639,14 @@ static LlvmVal llvm_gen_expr(LlvmGen *g, Node *n) {
 
     case N_CALL: {
         if (n->builtin == B_PRINT) {
-            Node *arg = n->list.items[0];
-            LlvmVal av = llvm_gen_expr(g, arg);
-            if (arg->type == &ty_str) {
-                bprintf(&g->out, "  call void @sb_rt_print_str(%%sb.slice %s)\n", av.op);
-            } else if (arg->type == &ty_bool) {
-                bprintf(&g->out, "  call void @sb_rt_print_bool(i8 %s)\n", av.op);
-            } else if (arg->type->kind == TY_FLOAT) {
-                if (arg->type == &ty_f32) {
-                    const char *d = llvm_tmp(g);
-                    bprintf(&g->out, "  %s = fpext float %s to double\n", d, av.op);
-                    av.op = d;
-                }
-                bprintf(&g->out, "  call void @sb_rt_print_f64(double %s)\n", av.op);
-            } else if (arg->type->kind == TY_PTR || arg->type->kind == TY_FN) {
-                LlvmVal u64 = llvm_to_i64(g, av, arg->type);
-                bprintf(&g->out, "  call void @sb_rt_print_u64(i64 %s)\n", u64.op);
-            } else if (arg->type->is_signed) {
-                LlvmVal i64 = llvm_to_i64(g, av, arg->type);
-                bprintf(&g->out, "  call void @sb_rt_print_i64(i64 %s)\n", i64.op);
-            } else {
-                LlvmVal u64 = llvm_to_i64(g, av, arg->type);
-                bprintf(&g->out, "  call void @sb_rt_print_u64(i64 %s)\n", u64.op);
+            llvm_emit_print_val(g, n->list.items[0], true);
+            return (LlvmVal){ NULL, "void" };
+        }
+        if (n->builtin == B_PRINT_FMT) {
+            for (int i = 0; i < n->list.len; i++) {
+                llvm_emit_print_val(g, n->list.items[i], false);
             }
+            bprintf(&g->out, "  call void @sb_rt_print_nl()\n");
             return (LlvmVal){ NULL, "void" };
         }
         if (n->builtin == B_EXIT) {
@@ -1779,6 +1815,7 @@ static void llvm_gen_stmt(LlvmGen *g, Node *n) {
     }
 
     case N_CONST:
+    case N_TYPE_ALIAS:
         return;
 
     case N_ASSIGN:

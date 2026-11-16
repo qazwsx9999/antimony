@@ -87,6 +87,7 @@ typedef struct {
     AssignSet assigned;     // current definite-assignment state
     NodeVec generic_structs;
     NodeVec generic_enums;
+    NodeVec generic_type_aliases;
     NodeVec generic_fns;    // generic free functions AND generic methods
     Program *prog;
 } Checker;
@@ -150,6 +151,7 @@ static Symbol *define(Checker *c, SymKind kind, const char *name, Type *type, Po
     sym->is_global = (c->cur == c->global);
     sym->var_index = -1;
     sym->hw_reg = -1;
+    sym->xmm_reg = -1;
     vec_push(c->cur->syms, sym);
     return sym;
 }
@@ -159,11 +161,28 @@ static void resolve_global_const(Checker *c, Symbol *s);
 static void layout_struct(Checker *c, Type *st);
 static void layout_enum(Checker *c, Type *et);
 static Type *resolve_type_str(Checker *c, const char *str, Pos pos);
-static Type *make_ptr_type(Type *elem, Pos pos);
+static Type *resolve_type_str_ex(Checker *c, const char *str, bool under_ptr, Pos pos);
+static Type *resolve_decl_type(Checker *c, Node *d);
+static Type *make_ptr_type_ex(Type *elem, bool is_const_elem, Pos pos);
 static Type *make_array_type(Type *elem, int len, Pos pos);
 static Type *make_slice_type(Type *elem, Pos pos);
+static Type *make_slice_type_ex(Type *elem, bool is_const_elem, Pos pos);
 static StructField *find_field(Type *st, const char *name);
 static void materialize(Node *n);
+
+static void check_sym_visible(Symbol *s, Pos ref_pos) {
+    if (s && s->is_priv && s->pos.file_id != ref_pos.file_id) {
+        fatal(ref_pos, "cannot access private '%s' declared in '%s'",
+              s->name, file_name_of(s->pos));
+    }
+}
+
+static void check_decl_visible(Node *d, Pos ref_pos) {
+    if (d && d->is_priv && d->pos.file_id != ref_pos.file_id) {
+        fatal(ref_pos, "cannot access private '%s' declared in '%s'",
+              d->name ? d->name : "", file_name_of(d->pos));
+    }
+}
 
 // Splits `"Name[Arg1,Arg2]"` into `base_out = "Name"` and `args_out = ["Arg1", "Arg2"]`.
 // Returns false if `name` does not have top-level `[...]`.
@@ -243,19 +262,11 @@ static Node *clone_ast_subst(Node *src, StrVec *tparams, TypeVec *targs) {
     dst->tparams.cap = 0;
 
     if (dst->type_name) {
-        const char *sub = subst_type_str(dst->type_name, tparams, targs);
-        while (sub[0] == '[' && sub[1] == ']') {
-            dst->decl_kind = DECL_SLICE;
-            sub = intern(sub + 2, (int)strlen(sub + 2));
-        }
-        while (sub[0] == '*') {
-            dst->ptr_depth++;
-            sub = intern(sub + 1, (int)strlen(sub + 1));
-        }
-        dst->type_name = sub;
+        dst->type_name = subst_type_str(dst->type_name, tparams, targs);
     }
     if (dst->name && (dst->kind == N_IDENT || dst->kind == N_CALL ||
-                      dst->kind == N_STRUCT_LIT || dst->kind == N_FN)) {
+                      dst->kind == N_STRUCT_LIT || dst->kind == N_FN ||
+                      dst->kind == N_TYPE_ALIAS)) {
         dst->name = subst_type_str(dst->name, tparams, targs);
     }
 
@@ -301,9 +312,18 @@ static Symbol *instantiate_generic_type(Checker *c, const char *name, Pos pos) {
         }
     }
     if (!tmpl) {
+        for (int i = 0; i < c->generic_type_aliases.len; i++) {
+            if (c->generic_type_aliases.items[i]->name == base_name) {
+                tmpl = c->generic_type_aliases.items[i];
+                break;
+            }
+        }
+    }
+    if (!tmpl) {
         free(arg_strs.items);
         return NULL;
     }
+    check_decl_visible(tmpl, pos);
     if (arg_strs.len != tmpl->tparams.len) {
         fatal(pos, "generic type '%s' expects %d type argument(s), got %d",
               base_name, tmpl->tparams.len, arg_strs.len);
@@ -336,6 +356,19 @@ static Symbol *instantiate_generic_type(Checker *c, const char *name, Pos pos) {
 
     Scope *saved_cur = c->cur;
     c->cur = c->global;
+    if (tmpl->kind == N_TYPE_ALIAS) {
+        Symbol *s = define(c, SYM_TYPE, canon_name, NULL, tmpl->pos);
+        s->is_pub = tmpl->is_pub;
+        s->is_priv = tmpl->is_priv;
+        s->decl = cloned;
+        s->state = 1;
+        s->type = resolve_decl_type(c, cloned);
+        s->state = 2;
+        cloned->sym = s;
+        cloned->type = s->type;
+        c->cur = saved_cur;
+        return s;
+    }
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = (tmpl->kind == N_STRUCT) ? TY_STRUCT : TY_ENUM;
     t->name = canon_name;
@@ -345,7 +378,9 @@ static Symbol *instantiate_generic_type(Checker *c, const char *name, Pos pos) {
         t->align = 4;
         t->is_signed = true;
     }
-    Symbol *s = define(c, SYM_TYPE, canon_name, t, pos);
+    Symbol *s = define(c, SYM_TYPE, canon_name, t, tmpl->pos);
+    s->is_pub = tmpl->is_pub;
+    s->is_priv = tmpl->is_priv;
     cloned->sym  = s;
     cloned->type = t;
     if (t->kind == TY_STRUCT) layout_struct(c, t);
@@ -356,32 +391,46 @@ static Symbol *instantiate_generic_type(Checker *c, const char *name, Pos pos) {
 
 static Type *resolve_type(Checker *c, const char *name, Pos pos);
 
-// Resolves a full type string (`"i32"`, `"*Point"`, `"[]u8"`, `"Vec[i32]"`) into a `Type *`.
-static Type *resolve_type_str(Checker *c, const char *str, Pos pos) {
-    int slice_depth = 0;
-    while (str[0] == '[' && str[1] == ']') {
-        slice_depth++;
+// Resolves a full type string (`"i32"`, `"*Point"`, `"*const u8"`, `"[]const u8"`, `"Vec[i32]"`) into a `Type *`.
+static Type *resolve_type_str_ex(Checker *c, const char *str, bool under_ptr, Pos pos) {
+    if (str[0] == '[' && str[1] == ']') {
         str += 2;
+        bool is_c = false;
+        if (strncmp(str, "const ", 6) == 0) {
+            is_c = true;
+            str += 6;
+        }
+        Type *elem = resolve_type_str_ex(c, str, under_ptr, pos);
+        if (!under_ptr) {
+            if (elem->kind == TY_STRUCT && elem->state != 2) layout_struct(c, elem);
+            else if (elem->kind == TY_ENUM && elem->state != 2) layout_enum(c, elem);
+        }
+        return make_slice_type_ex(elem, is_c, pos);
     }
-    int ptr_depth = 0;
-    while (*str == '*') {
-        ptr_depth++;
+    if (str[0] == '*') {
         str++;
+        bool is_c = false;
+        if (strncmp(str, "const ", 6) == 0) {
+            is_c = true;
+            str += 6;
+        }
+        Type *elem = resolve_type_str_ex(c, str, true, pos);
+        return make_ptr_type_ex(elem, is_c, pos);
     }
     const char *base_name = intern(str, (int)strlen(str));
     Type *t = resolve_type(c, base_name, pos);
-    if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) {
-        layout_struct(c, t);
-    } else if (ptr_depth == 0 && t->kind == TY_ENUM && t->state != 2) {
-        layout_enum(c, t);
-    }
-    for (int i = 0; i < ptr_depth; i++) {
-        t = make_ptr_type(t, pos);
-    }
-    for (int i = 0; i < slice_depth; i++) {
-        t = make_slice_type(t, pos);
+    if (!under_ptr) {
+        if (t->kind == TY_STRUCT && t->state != 2) {
+            layout_struct(c, t);
+        } else if (t->kind == TY_ENUM && t->state != 2) {
+            layout_enum(c, t);
+        }
     }
     return t;
+}
+
+static Type *resolve_type_str(Checker *c, const char *str, Pos pos) {
+    return resolve_type_str_ex(c, str, false, pos);
 }
 
 static Type *make_fn_type(TypeVec *params, Type *ret, Pos pos);
@@ -391,12 +440,22 @@ static Type *resolve_type(Checker *c, const char *name, Pos pos) {
     if (strncmp(name, "fn(", 3) == 0) {
         return resolve_fn_type_str(c, name, pos);
     }
-    Symbol *s = lookup_in(c->global, name);
+    Symbol *s = lookup(c, name);
     if (!s && strchr(name, '[')) {
         s = instantiate_generic_type(c, name, pos);
     }
     if (!s || s->kind != SYM_TYPE) {
         fatal(pos, "unknown type '%s'", name);
+    }
+    check_sym_visible(s, pos);
+    if (!s->type && s->decl && s->decl->kind == N_TYPE_ALIAS) {
+        if (s->state == 1) {
+            fatal(s->pos, "cyclic type alias definition involving '%s'", s->name);
+        }
+        s->state = 1;
+        s->type = resolve_decl_type(c, s->decl);
+        s->state = 2;
+        s->decl->type = s->type;
     }
     return s->type;
 }
@@ -486,20 +545,21 @@ static Type *resolve_fn_type_str(Checker *c, const char *name, Pos pos) {
     return ft;
 }
 
-static Type *make_ptr_type(Type *elem, Pos pos) {
+static Type *make_ptr_type_ex(Type *elem, bool is_const_elem, Pos pos) {
     if (elem == &ty_void || elem->kind == TY_SLICE) {
         fatal(pos, "pointer to '%s' is not supported yet", elem->name);
     }
     for (int i = 0; i < ptr_types.len; i++) {
         Type *t = ptr_types.items[i];
-        if (t->elem == elem) return t;
+        if (t->elem == elem && t->is_const_elem == is_const_elem) return t;
     }
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf), "*%s", elem->name);
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), is_const_elem ? "*const %s" : "*%s", elem->name);
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = TY_PTR;
     t->name = intern(buf, n);
     t->elem = elem;
+    t->is_const_elem = is_const_elem;
     t->size = 8;
     t->align = 8;
     vec_push(ptr_types, t);
@@ -515,7 +575,7 @@ static Type *make_array_type(Type *elem, int len, Pos pos) {
         Type *t = array_types.items[i];
         if (t->elem == elem && t->array_len == len) return t;
     }
-    char buf[128];
+    char buf[256];
     int n = snprintf(buf, sizeof(buf), "[%d]%s", len, elem->name);
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = TY_ARRAY;
@@ -528,24 +588,29 @@ static Type *make_array_type(Type *elem, int len, Pos pos) {
     return t;
 }
 
-static Type *make_slice_type(Type *elem, Pos pos) {
+static Type *make_slice_type_ex(Type *elem, bool is_const_elem, Pos pos) {
     if (elem->kind == TY_ARRAY || elem->kind == TY_SLICE) {
         fatal(pos, "slices of '%s' are not supported yet", elem->name);
     }
     for (int i = 0; i < slice_types.len; i++) {
         Type *t = slice_types.items[i];
-        if (t->elem == elem) return t;
+        if (t->elem == elem && t->is_const_elem == is_const_elem) return t;
     }
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf), "[]%s", elem->name);
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf), is_const_elem ? "[]const %s" : "[]%s", elem->name);
     Type *t = xcalloc(1, sizeof(Type));
     t->kind = TY_SLICE;
     t->name = intern(buf, n);
     t->elem = elem;
+    t->is_const_elem = is_const_elem;
     t->size = 16; // {ptr, len}
     t->align = 8;
     vec_push(slice_types, t);
     return t;
+}
+
+static Type *make_slice_type(Type *elem, Pos pos) {
+    return make_slice_type_ex(elem, false, pos);
 }
 
 static int alloc_slot(Checker *c) {
@@ -579,8 +644,10 @@ static Type *resolve_decl_type(Checker *c, Node *d);
 // registers its concrete `SYM_FN` under `canon_name`, and appends `cloned` to `c->prog->fns`.
 static Symbol *instantiate_fn_from_targs(Checker *c, Node *tmpl, const char *canon_name,
                                          StrVec *tparams, TypeVec *targs, Pos pos) {
+    check_decl_visible(tmpl, pos);
     Symbol *existing = lookup_in(c->global, canon_name);
     if (existing && existing->kind == SYM_FN) {
+        check_sym_visible(existing, pos);
         return existing;
     }
 
@@ -613,7 +680,9 @@ static Symbol *instantiate_fn_from_targs(Checker *c, Node *tmpl, const char *can
         }
     }
 
-    Symbol *s = define(c, SYM_FN, canon_name, ret, pos);
+    Symbol *s = define(c, SYM_FN, canon_name, ret, tmpl->pos);
+    s->is_pub = tmpl->is_pub;
+    s->is_priv = tmpl->is_priv;
     s->decl = cloned;
     cloned->sym  = s;
     cloned->type = ret;
@@ -639,6 +708,7 @@ static Symbol *instantiate_generic_method(Checker *c, Type *base_t, const char *
             free(m_tparams.items);
             continue;
         }
+        check_decl_visible(m, pos);
         TypeVec targs = {0};
         for (int k = 0; k < arg_strs.len; k++) {
             vec_push(targs, resolve_type_str(c, arg_strs.items[k], pos));
@@ -684,12 +754,15 @@ static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk
         if (arg_t->kind != TY_SLICE && arg_t->kind != TY_ARRAY) return;
         arg_t = arg_t->elem;
         pat_str += 2;
+        if (strncmp(pat_str, "const ", 6) == 0) pat_str += 6;
     }
     while (*pat_str == '*') {
         if (arg_t->kind != TY_PTR) return;
         arg_t = arg_t->elem;
         pat_str++;
+        if (strncmp(pat_str, "const ", 6) == 0) pat_str += 6;
     }
+    if (strncmp(pat_str, "const ", 6) == 0) pat_str += 6;
     const char *p_intern = intern(pat_str, (int)strlen(pat_str));
     for (int i = 0; i < tparams->len; i++) {
         if (tparams->items[i] == p_intern) {
@@ -763,6 +836,7 @@ static Symbol *instantiate_generic_fn_call(Checker *c, Node *call_node) {
         free(explicit_args.items);
         return NULL;
     }
+    check_decl_visible(tmpl, call_node->pos);
 
     TypeVec targs = {0};
     if (has_explicit) {
@@ -819,75 +893,72 @@ static Symbol *instantiate_generic_fn_call(Checker *c, Node *call_node) {
 
 static Type *resolve_decl_type(Checker *c, Node *d) {
     if (!d->type_name) return NULL;
-    Type *base = resolve_type(c, d->type_name, d->type_pos);
-    if (d->ptr_depth == 0 && base->kind == TY_STRUCT && base->state != 2) {
-        layout_struct(c, base);
-    } else if (d->ptr_depth == 0 && base->kind == TY_ENUM && base->state != 2) {
-        layout_enum(c, base);
-    }
+    bool under_ptr = (d->ptr_depth > 0) || (d->type_name[0] == '*');
+    Type *base = resolve_type_str_ex(c, d->type_name, under_ptr, d->type_pos);
     for (int i = 0; i < d->ptr_depth; i++) {
-        base = make_ptr_type(base, d->type_pos);
+        bool is_c = (i < 32) ? ((d->ptr_const_mask & (1u << i)) != 0) : false;
+        base = make_ptr_type_ex(base, is_c, d->type_pos);
     }
     if (d->decl_kind == DECL_ARRAY) {
         int n = eval_array_len(c, d->len_expr);
         return make_array_type(base, n, d->pos);
     }
     if (d->decl_kind == DECL_SLICE) {
-        return make_slice_type(base, d->pos);
+        return make_slice_type_ex(base, d->is_const_slice, d->pos);
     }
     return base;
 }
 
-// If `arg` is a type expression (`T`, `*T`, `**T`, `Vec[i32]`, etc.) passed to `sizeof`, `alignof`,
-// or `ptr_cast`, resolves and returns that `Type *`; otherwise returns NULL.
+// If `arg` is a type expression (`T`, `*T`, `*const T`, `**T`, `Vec[i32]`, etc.) passed to `sizeof`,
+// `alignof`, or `ptr_cast`, resolves and returns that `Type *`; otherwise returns NULL.
 static Type *try_resolve_type_arg(Checker *c, Node *arg) {
     int ptr_depth = 0;
+    bool ptr_const[32] = {0};
     Node *cur = arg;
     while (cur && cur->kind == N_DEREF) {
+        if (ptr_depth < 32) ptr_const[ptr_depth] = (cur->op == T_CONST);
         ptr_depth++;
         cur = cur->lhs;
     }
-    if (cur && cur->kind == N_INDEX && cur->lhs && cur->lhs->kind == N_IDENT &&
-        cur->rhs && cur->rhs->kind == N_IDENT) {
-        char gname[256];
-        int glen = snprintf(gname, sizeof(gname), "%s[%s]", cur->lhs->name, cur->rhs->name);
-        const char *canon = intern(gname, glen);
-        Symbol *s = lookup_in(c->global, canon);
-        if (!s) s = instantiate_generic_type(c, canon, cur->pos);
-        if (s && s->kind == SYM_TYPE) {
-            Type *t = s->type;
-            if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) layout_struct(c, t);
-            else if (t->kind == TY_ENUM && t->state != 2) layout_enum(c, t);
-            for (int i = 0; i < ptr_depth; i++) t = make_ptr_type(t, arg->pos);
-            return t;
+    Type *t = NULL;
+    if (cur && cur->kind == N_INDEX && cur->lhs && cur->lhs->kind == N_IDENT) {
+        Type *targ = try_resolve_type_arg(c, cur->rhs);
+        if (targ) {
+            char gname[256];
+            int glen = snprintf(gname, sizeof(gname), "%s[%s]", cur->lhs->name, targ->name);
+            const char *canon = intern(gname, glen);
+            Symbol *s = lookup_in(c->global, canon);
+            if (!s) s = instantiate_generic_type(c, canon, cur->pos);
+            if (s && s->kind == SYM_TYPE) {
+                check_sym_visible(s, cur->pos);
+                t = s->type ? s->type : resolve_type(c, s->name, cur->pos);
+            }
         }
-    }
-    if (cur && cur->kind == N_IDENT) {
+    } else if (cur && cur->kind == N_IDENT) {
         if (cur->name[0] == '*' || cur->name[0] == '[' || strncmp(cur->name, "fn(", 3) == 0) {
-            Type *t = resolve_type_str(c, cur->name, cur->pos);
-            for (int i = 0; i < ptr_depth; i++) {
-                t = make_ptr_type(t, arg->pos);
+            t = resolve_type_str_ex(c, cur->name, ptr_depth > 0, cur->pos);
+        } else {
+            Symbol *s = lookup(c, cur->name);
+            if (!s && strchr(cur->name, '[')) {
+                s = instantiate_generic_type(c, cur->name, cur->pos);
             }
-            return t;
-        }
-        Symbol *s = lookup(c, cur->name);
-        if (!s && strchr(cur->name, '[')) {
-            s = instantiate_generic_type(c, cur->name, cur->pos);
-        }
-        if (s && s->kind == SYM_TYPE) {
-            Type *t = s->type;
-            if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) {
-                layout_struct(c, t);
-            } else if (t->kind == TY_ENUM && t->state != 2) {
-                layout_enum(c, t);
+            if (s && s->kind == SYM_TYPE) {
+                check_sym_visible(s, cur->pos);
+                t = s->type ? s->type : resolve_type(c, s->name, cur->pos);
             }
-            for (int i = 0; i < ptr_depth; i++) {
-                t = make_ptr_type(t, arg->pos);
-            }
-            return t;
         }
     }
-    return NULL;
+    if (!t) return NULL;
+    if (ptr_depth == 0 && t->kind == TY_STRUCT && t->state != 2) {
+        layout_struct(c, t);
+    } else if (ptr_depth == 0 && t->kind == TY_ENUM && t->state != 2) {
+        layout_enum(c, t);
+    }
+    for (int i = ptr_depth - 1; i >= 0; i--) {
+        bool is_c = (i < 32) ? ptr_const[i] : false;
+        t = make_ptr_type_ex(t, is_c, arg->pos);
+    }
+    return t;
 }
 
 static void layout_enum(Checker *c, Type *et) {
@@ -1010,16 +1081,43 @@ static StructField *find_field(Type *st, const char *name) {
     return NULL;
 }
 
-// Verifies that an lvalue (`x`, `p.x`, `arr[i]`) is not rooted at a read-only
-// value parameter, range-loop variable, or immutable string without an intervening pointer dereference.
+static Node *lval_walk_root(Node *lval, Type **out_ptr_or_slice) {
+    if (out_ptr_or_slice) *out_ptr_or_slice = NULL;
+    Node *base = lval;
+    while (base && (base->kind == N_FIELD || base->kind == N_INDEX || base->kind == N_DEREF)) {
+        if (base->lhs->type && (base->lhs->type->kind == TY_PTR || base->lhs->type->kind == TY_SLICE)) {
+            if (out_ptr_or_slice) *out_ptr_or_slice = base->lhs->type;
+            return base->lhs;
+        }
+        base = base->lhs;
+    }
+    return base;
+}
+
+static bool lval_is_const_rooted(Node *lval) {
+    Type *root_t = NULL;
+    lval_walk_root(lval, &root_t);
+    return root_t && root_t->is_const_elem;
+}
+
+// Verifies that an lvalue (`x`, `p.x`, `arr[i]`, `*p`) is not rooted at a read-only
+// pointer (`*const T`), read-only slice (`[]const T`), parameter, range-loop variable, or `str`.
 static void check_lvalue_mutable(Node *lval, Pos pos) {
     if (lval && lval->kind == N_INDEX && lval->lhs->type == &ty_str) {
         fatal(pos, "cannot mutate or take address of byte in immutable 'str'");
     }
-    Node *base = lval;
-    while (base && (base->kind == N_FIELD || base->kind == N_INDEX)) {
-        if (base->lhs->type && (base->lhs->type->kind == TY_PTR || base->lhs->type->kind == TY_SLICE)) return;
-        base = base->lhs;
+    if (lval && lval->kind == N_DEREF && lval->lhs && lval->lhs->type &&
+        lval->lhs->type->kind == TY_PTR && lval->lhs->type->is_const_elem) {
+        fatal(pos, "cannot mutate or take mutable address through read-only pointer '%s'",
+              lval->lhs->type->name);
+    }
+    Type *root_t = NULL;
+    Node *base = lval_walk_root(lval, &root_t);
+    if (root_t) {
+        if (root_t->is_const_elem) {
+            fatal(pos, "cannot mutate or take mutable address through read-only '%s'", root_t->name);
+        }
+        return;
     }
     if (base && (base->kind == N_STRUCT_LIT || base->kind == N_ENUM_LIT || base->kind == N_CALL)) {
         fatal(pos, "cannot mutate or take address of temporary '%s' value", base->type->name);
@@ -1053,10 +1151,24 @@ static void coerce(Node *n, Type *target) {
         }
         return;
     }
-    // Fixed-size array `[N]T` implicitly coerces to slice `[]T` (e.g. when passed to a function).
+    // Fixed-size array `[N]T` implicitly coerces to slice `[]T` or `[]const T`.
     if (target->kind == TY_SLICE && n->type && n->type->kind == TY_ARRAY &&
         n->type->elem == target->elem) {
         n->implicit_slice = true;
+        return;
+    }
+    // Mutable pointer `*T` implicitly coerces to read-only pointer `*const T`.
+    if (target->kind == TY_PTR && target->is_const_elem &&
+        n->type && n->type->kind == TY_PTR && !n->type->is_const_elem &&
+        n->type->elem == target->elem) {
+        n->type = target;
+        return;
+    }
+    // Mutable slice `[]T` implicitly coerces to read-only slice `[]const T`.
+    if (target->kind == TY_SLICE && target->is_const_elem &&
+        n->type && n->type->kind == TY_SLICE && !n->type->is_const_elem &&
+        n->type->elem == target->elem) {
+        n->type = target;
         return;
     }
     // `null` coerces to any pointer type `*T` or function pointer type `fn(...): ...`.
@@ -1195,6 +1307,94 @@ static i128 eval_const_binary(Pos pos, int op, i128 a, i128 b, Type *lt) {
     }
 }
 
+static void check_expr(Checker *c, Node *n, Type *expected);
+
+static void check_printable_arg(Checker *c, Node *arg) {
+    check_expr(c, arg, NULL);
+    materialize(arg);
+    if (arg->type->kind == TY_VOID) {
+        fatal(arg->pos, "cannot print a void expression");
+    }
+    if (arg->type->kind == TY_STRUCT || arg->type->kind == TY_ARRAY ||
+        arg->type->kind == TY_SLICE || (arg->type->kind == TY_ENUM && arg->type->is_tagged)) {
+        fatal(arg->pos, "cannot print value of type '%s'", arg->type->name);
+    }
+}
+
+static Node *make_str_node_from_buf(Buf *seg, Pos pos) {
+    Node *sn = xcalloc(1, sizeof(Node));
+    sn->kind = N_STR;
+    sn->pos  = pos;
+    sn->type = &ty_str;
+    sn->str_len = (int)seg->len;
+    char *s = xmalloc(seg->len + 1);
+    if (seg->len > 0) memcpy(s, seg->data, seg->len);
+    s[seg->len] = '\0';
+    sn->str = s;
+    seg->len = 0;
+    return sn;
+}
+
+static void check_fmt_print(Checker *c, Node *n, Symbol *print_sym, Type *expected) {
+    Node *fmt = n->list.items[0];
+    if (fmt->kind != N_STR) {
+        fatal(fmt->pos, "format argument to 'print' with multiple arguments must be a string literal");
+    }
+    NodeVec parts = {0};
+    Buf seg = {0};
+    int arg_idx = 1;
+    const char *fs = fmt->str;
+    int flen = fmt->str_len;
+    for (int i = 0; i < flen; ) {
+        if (fs[i] == '{') {
+            if (i + 1 < flen && fs[i + 1] == '{') {
+                buf_u8(&seg, '{');
+                i += 2;
+                continue;
+            }
+            if (i + 1 < flen && fs[i + 1] == '}') {
+                if (seg.len > 0) vec_push(parts, make_str_node_from_buf(&seg, fmt->pos));
+                if (arg_idx >= n->list.len) {
+                    fatal(fmt->pos, "too many '{}' placeholders in 'print' format string (only %d argument(s) provided)",
+                          n->list.len - 1);
+                }
+                Node *arg = n->list.items[arg_idx++];
+                check_printable_arg(c, arg);
+                vec_push(parts, arg);
+                i += 2;
+                continue;
+            }
+            fatal(fmt->pos, "invalid '{' in 'print' format string (use '{}' for arguments or '{{' for literal '{')");
+        } else if (fs[i] == '}') {
+            if (i + 1 < flen && fs[i + 1] == '}') {
+                buf_u8(&seg, '}');
+                i += 2;
+                continue;
+            }
+            fatal(fmt->pos, "unmatched '}' in 'print' format string (use '}}' for literal '}')");
+        } else {
+            buf_u8(&seg, (uint8_t)fs[i++]);
+        }
+    }
+    if (seg.len > 0) vec_push(parts, make_str_node_from_buf(&seg, fmt->pos));
+    free(seg.data);
+    if (arg_idx < n->list.len) {
+        fatal(n->list.items[arg_idx]->pos,
+              "too many arguments for 'print' format string (expected %d argument(s) for '{}' placeholders, got %d)",
+              arg_idx - 1, n->list.len - 1);
+    }
+    free(n->list.items);
+    n->list = parts;
+    n->builtin = B_PRINT_FMT;
+    Symbol *bs = xcalloc(1, sizeof(Symbol));
+    bs->kind = SYM_BUILTIN;
+    bs->name = print_sym->name;
+    bs->builtin = B_PRINT_FMT;
+    n->sym = bs;
+    n->type = &ty_void;
+    if (expected) coerce(n, expected);
+}
+
 static void check_expr(Checker *c, Node *n, Type *expected) {
     switch (n->kind) {
     case N_INT:
@@ -1225,9 +1425,11 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     case N_ADDR: {
         // Address-of `&x`, `&arr[i]`, or `&*p`.
         Node *opd = n->lhs;
+        bool ro_addr = false;
         if (opd->kind == N_IDENT) {
             Symbol *s = lookup(c, opd->name);
             if (!s) fatal(opd->pos, "undeclared identifier '%s'", opd->name);
+            check_sym_visible(s, opd->pos);
             if (s->kind != SYM_VAR) {
                 fatal(opd->pos, "can only take address '&' of a variable or array element (not '%s')", opd->name);
             }
@@ -1246,16 +1448,25 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             if (opd->is_const) {
                 fatal(n->pos, "cannot take address '&' of constant or enum variant");
             }
-            check_lvalue_mutable(opd, n->pos);
+            if (opd->kind == N_INDEX && opd->lhs->type == &ty_str) {
+                fatal(n->pos, "cannot mutate or take address of byte in immutable 'str'");
+            }
+            ro_addr = lval_is_const_rooted(opd);
+            if (!ro_addr) {
+                check_lvalue_mutable(opd, n->pos);
+            }
         } else {
             fatal(n->pos, "operand of '&' must be a variable, array element, struct field, or pointer dereference");
         }
-        n->type = make_ptr_type(opd->type, n->pos);
+        n->type = make_ptr_type_ex(opd->type, ro_addr, n->pos);
         if (expected) coerce(n, expected);
         return;
     }
 
     case N_DEREF: {
+        if (n->op == T_CONST) {
+            fatal(n->pos, "unexpected 'const' in pointer dereference");
+        }
         check_expr(c, n->lhs, NULL);
         if (n->lhs->type->kind != TY_PTR) {
             fatal(n->pos, "cannot dereference non-pointer type '%s'", n->lhs->type->name);
@@ -1266,12 +1477,18 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     }
 
     case N_STRUCT_LIT: {
-        Symbol *s = lookup_in(c->global, n->name);
+        Symbol *s = lookup(c, n->name);
         if (!s && strchr(n->name, '[')) {
             s = instantiate_generic_type(c, n->name, n->pos);
             if (s) n->name = s->name;
         }
-        if (!s || s->kind != SYM_TYPE || s->type->kind != TY_STRUCT) {
+        if (s && s->kind == SYM_TYPE) {
+            check_sym_visible(s, n->pos);
+            if (!s->type && s->decl && s->decl->kind == N_TYPE_ALIAS) {
+                resolve_type(c, s->name, n->pos);
+            }
+        }
+        if (!s || s->kind != SYM_TYPE || !s->type || s->type->kind != TY_STRUCT) {
             fatal(n->pos, "'%s' is not a struct type", n->name);
         }
         Type *st = s->type;
@@ -1337,30 +1554,33 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 s = instantiate_generic_type(c, n->lhs->name, n->lhs->pos);
                 if (s) n->lhs->name = s->name;
             }
-            if (s && s->kind == SYM_TYPE && s->type->kind == TY_ENUM) {
-                Type *et = s->type;
-                if (et->state != 2) layout_enum(c, et);
-                StructField *sf = find_field(et, n->name);
-                if (!sf) {
-                    fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
+            if (s && s->kind == SYM_TYPE) {
+                check_sym_visible(s, n->lhs->pos);
+                Type *et = s->type ? s->type : resolve_type(c, s->name, n->lhs->pos);
+                if (et->kind == TY_ENUM) {
+                    if (et->state != 2) layout_enum(c, et);
+                    StructField *sf = find_field(et, n->name);
+                    if (!sf) {
+                        fatal(n->pos, "enum '%s' has no variant named '%s'", et->name, n->name);
+                    }
+                    if (sf->has_payload) {
+                        fatal(n->pos, "enum variant '%s.%s' requires a payload of type '%s'",
+                              et->name, n->name, sf->type->name);
+                    }
+                    if (et->is_tagged) {
+                        n->kind = N_ENUM_LIT;
+                        n->type = et;
+                        n->cval = sf->offset;
+                        n->lhs  = NULL;
+                        if (c->cur_fn) n->slot_start = alloc_slots_bytes(c, et->size);
+                    } else {
+                        n->type = et;
+                        n->is_const = true;
+                        n->cval = sf->offset;
+                    }
+                    if (expected) coerce(n, expected);
+                    return;
                 }
-                if (sf->has_payload) {
-                    fatal(n->pos, "enum variant '%s.%s' requires a payload of type '%s'",
-                          et->name, n->name, sf->type->name);
-                }
-                if (et->is_tagged) {
-                    n->kind = N_ENUM_LIT;
-                    n->type = et;
-                    n->cval = sf->offset;
-                    n->lhs  = NULL;
-                    if (c->cur_fn) n->slot_start = alloc_slots_bytes(c, et->size);
-                } else {
-                    n->type = et;
-                    n->is_const = true;
-                    n->cval = sf->offset;
-                }
-                if (expected) coerce(n, expected);
-                return;
             }
             // If `lhs` is an uninitialized variable `var p: Point`, allow writing `p.x = 1`,
             // and mark `p` as assigned on first field access.
@@ -1506,7 +1726,8 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             fatal(n->pos, "slice lower bound (%d) > upper bound (%d)",
                   (int)n->lo->cval, (int)n->hi->cval);
         }
-        n->type = (bt == &ty_str) ? &ty_str : make_slice_type(bt->elem, n->pos);
+        bool keep_const = (bt->kind == TY_PTR || bt->kind == TY_SLICE) && bt->is_const_elem;
+        n->type = (bt == &ty_str) ? &ty_str : make_slice_type_ex(bt->elem, keep_const, n->pos);
         if (expected) coerce(n, expected);
         return;
     }
@@ -1560,6 +1781,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
     case N_IDENT: {
         Symbol *s = lookup(c, n->name);
         if (!s) fatal(n->pos, "undeclared identifier '%s'", n->name);
+        check_sym_visible(s, n->pos);
         if (s->kind == SYM_TYPE || s->kind == SYM_BUILTIN) {
             fatal(n->pos, "'%s' is not a value", n->name);
         }
@@ -1703,8 +1925,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
 
         // Pointer arithmetic (`p + offset`, `p - offset`, and `p - q`).
         if (n->lhs->type->kind == TY_PTR && (op == T_PLUS || op == T_MINUS)) {
-            if (op == T_MINUS && n->rhs->type == n->lhs->type) {
-                // `p - q` -> element difference of type `isize`.
+            if (op == T_MINUS && n->rhs->type->kind == TY_PTR &&
+                (n->rhs->type == n->lhs->type || n->rhs->type->elem == n->lhs->type->elem)) {
+                // `p - q` -> element difference of type `isize` (allowed between `*T` and `*const T`).
                 n->type = &ty_isize;
                 if (expected) coerce(n, expected);
                 return;
@@ -1725,6 +1948,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 coerce(n->lhs, n->rhs->type);
             } else if (n->rhs->type == &ty_null && (n->lhs->type->kind == TY_PTR || n->lhs->type->kind == TY_FN)) {
                 coerce(n->rhs, n->lhs->type);
+            } else if (n->lhs->type->kind == TY_PTR && n->rhs->type->kind == TY_PTR &&
+                       n->lhs->type->elem == n->rhs->type->elem) {
+                // Comparing `*T` and `*const T` with matching element types is allowed.
             } else if (n->lhs->type != n->rhs->type) {
                 fatal(n->pos, "cannot compare different pointer types '%s' and '%s'",
                       n->lhs->type->name, n->rhs->type->name);
@@ -1918,6 +2144,10 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     vs = instantiate_generic_type(c, n->lhs->name, n->lhs->pos);
                     if (vs) n->lhs->name = vs->name;
                 }
+                if (vs) check_sym_visible(vs, n->lhs->pos);
+                if (vs && vs->kind == SYM_TYPE && !vs->type && vs->decl && vs->decl->kind == N_TYPE_ALIAS) {
+                    resolve_type(c, vs->name, n->lhs->pos);
+                }
                 if (vs && vs->kind == SYM_TYPE && vs->type->kind == TY_ENUM) {
                     Type *et = vs->type;
                     if (et->state != 2) layout_enum(c, et);
@@ -1950,7 +2180,8 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     if (!ms && strchr(vs->type->name, '[')) {
                         ms = instantiate_generic_method(c, vs->type, n->name, n->pos);
                     }
-                    if (ms && ms->kind == SYM_FN && ms->decl->list.items[0]->type->kind == TY_PTR) {
+                    if (ms && ms->kind == SYM_FN && ms->decl->list.items[0]->type->kind == TY_PTR &&
+                        !ms->decl->list.items[0]->type->is_const_elem) {
                         c->assigned |= (1ULL << vs->var_index);
                     }
                 }
@@ -1973,6 +2204,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             Symbol *ms = lookup_in(c->global, intern(mname, mlen));
             if (!ms && strchr(base_t->name, '[')) {
                 ms = instantiate_generic_method(c, base_t, n->name, n->pos);
+            }
+            if (ms && ms->kind == SYM_FN) {
+                check_sym_visible(ms, n->pos);
             }
             if (!ms || ms->kind != SYM_FN) {
                 // Check if `base_t` is a struct with a function-pointer field named `n->name`!
@@ -2035,7 +2269,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     fatal(n->pos, "cannot call pointer-receiver method '%s.%s' on non-addressable '%s' value",
                           base_t->name, n->name, base_t->name);
                 }
-                check_lvalue_mutable(recv_arg, n->pos);
+                if (!recv_pt->is_const_elem) {
+                    check_lvalue_mutable(recv_arg, n->pos);
+                }
                 Node *addr = xcalloc(1, sizeof(Node));
                 addr->kind = N_ADDR;
                 addr->pos  = recv_arg->pos;
@@ -2049,6 +2285,14 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 deref->lhs  = recv_arg;
                 deref->type = base_t;
                 recv_arg    = deref;
+            } else if (recv_pt->kind == TY_PTR && rt->kind == TY_PTR) {
+                if (rt->is_const_elem && !recv_pt->is_const_elem) {
+                    fatal(n->pos, "cannot call mutable pointer-receiver method '%s.%s' on '%s'",
+                          base_t->name, n->name, rt->name);
+                }
+                if (recv_pt->is_const_elem && !rt->is_const_elem) {
+                    coerce(recv_arg, recv_pt);
+                }
             }
 
             vec_push(n->list, NULL);
@@ -2077,9 +2321,13 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             s = instantiate_generic_fn_call(c, n);
         }
         if (!s) fatal(n->pos, "undeclared function or type '%s'", n->name);
+        check_sym_visible(s, n->pos);
 
         // Type conversion: `i64(x)`, `f64(x)`, `f32(x)` (spec §2.2, §2.3)
         if (s->kind == SYM_TYPE) {
+            if (!s->type && s->decl && s->decl->kind == N_TYPE_ALIAS) {
+                resolve_type(c, s->name, n->pos);
+            }
             if (n->list.len != 1) {
                 fatal(n->pos, "type conversion '%s(...)' takes exactly 1 argument", n->name);
             }
@@ -2174,13 +2422,13 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 fatal(n->pos, "'rev(...)' is only valid inside a 'loop' range header");
             }
             if (s->builtin == B_PRINT) {
-                if (n->list.len != 1) fatal(n->pos, "'print' takes 1 argument");
-                Node *arg = n->list.items[0];
-                check_expr(c, arg, NULL);
-                materialize(arg);
-                if (arg->type->kind == TY_VOID) {
-                    fatal(arg->pos, "cannot print a void expression");
+                if (n->list.len < 1) fatal(n->pos, "'print' takes at least 1 argument");
+                if (n->list.len > 1) {
+                    check_fmt_print(c, n, s, expected);
+                    return;
                 }
+                Node *arg = n->list.items[0];
+                check_printable_arg(c, arg);
                 n->type = &ty_void;
                 if (expected) coerce(n, expected);
                 return;
@@ -2276,6 +2524,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
                     fatal(p->pos, "'atomic_store' requires a '*i64' pointer first argument (got '%s')", p->type->name);
                 }
+                if (p->type->is_const_elem) {
+                    fatal(p->pos, "'atomic_store' cannot mutate read-only pointer '%s'", p->type->name);
+                }
                 check_expr(c, n->list.items[1], &ty_i64);
                 n->type = &ty_void;
                 if (expected) coerce(n, expected);
@@ -2288,6 +2539,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
                     fatal(p->pos, "'atomic_add' requires a '*i64' pointer first argument (got '%s')", p->type->name);
                 }
+                if (p->type->is_const_elem) {
+                    fatal(p->pos, "'atomic_add' cannot mutate read-only pointer '%s'", p->type->name);
+                }
                 check_expr(c, n->list.items[1], &ty_i64);
                 n->type = &ty_i64;
                 if (expected) coerce(n, expected);
@@ -2299,6 +2553,9 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                 check_expr(c, p, NULL);
                 if (p->type->kind != TY_PTR || p->type->elem != &ty_i64) {
                     fatal(p->pos, "'atomic_cas' requires a '*i64' pointer first argument (got '%s')", p->type->name);
+                }
+                if (p->type->is_const_elem) {
+                    fatal(p->pos, "'atomic_cas' cannot mutate read-only pointer '%s'", p->type->name);
                 }
                 check_expr(c, n->list.items[1], &ty_i64);
                 check_expr(c, n->list.items[2], &ty_i64);
@@ -2413,6 +2670,12 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         return;
     }
 
+    case N_CONV:
+    case N_ENUM_LIT:
+        // Already type-checked and lowered (e.g. during generic call argument inference).
+        if (expected) coerce(n, expected);
+        return;
+
     default:
         fatal(n->pos, "internal error: unexpected expression node");
     }
@@ -2502,6 +2765,7 @@ static void check_assign(Checker *c, Node *n) {
     } else {
         Symbol *s = lookup(c, n->name);
         if (!s) fatal(n->pos, "undeclared identifier '%s'", n->name);
+        check_sym_visible(s, n->pos);
         if (s->kind == SYM_CONST) fatal(n->pos, "cannot assign to constant '%s'", n->name);
         if (s->kind == SYM_PARAM) fatal(n->pos, "cannot assign to parameter '%s' (parameters are read-only)", n->name);
         if (s->kind != SYM_VAR)   fatal(n->pos, "cannot assign to '%s'", n->name);
@@ -2578,6 +2842,19 @@ static void check_assign(Checker *c, Node *n) {
 
 static bool check_stmt(Checker *c, Node *n) {
     switch (n->kind) {
+    case N_TYPE_ALIAS: {
+        if (n->tparams.len > 0) {
+            fatal(n->pos, "generic type aliases are only allowed at top level");
+        }
+        Type *t = resolve_decl_type(c, n);
+        Symbol *s = define(c, SYM_TYPE, n->name, t, n->pos);
+        s->decl = n;
+        s->state = 2;
+        n->sym = s;
+        n->type = t;
+        return false;
+    }
+
     case N_VAR: {
         Type *decl_t = resolve_decl_type(c, n);
         int explicit_len = 0;
@@ -2837,6 +3114,10 @@ static bool check_stmt(Checker *c, Node *n) {
                         if (!ts && strchr(pat->lhs->name, '[')) {
                             ts = instantiate_generic_type(c, pat->lhs->name, pat->lhs->pos);
                             if (ts) pat->lhs->name = ts->name;
+                        }
+                        if (ts) check_sym_visible(ts, pat->lhs->pos);
+                        if (ts && ts->kind == SYM_TYPE && !ts->type && ts->decl && ts->decl->kind == N_TYPE_ALIAS) {
+                            resolve_type(c, ts->name, pat->lhs->pos);
                         }
                         if (!ts || ts->kind != SYM_TYPE || ts->type != st) {
                             fatal(pat->pos, "expected variant of enum '%s'", st->name);
@@ -3250,8 +3531,26 @@ Program check(NodeVec decls) {
     register_dll_import(&prog, k32, intern("WriteFile", 9));
     register_dll_import(&prog, k32, intern("ExitProcess", 11));
 
-    // Pass 1: register all top-level names so structs, enums, constants, and functions
-    // can be referenced in any declaration order (spec §5.3).
+    // Enforce opt-in module visibility: any file declaring at least one `pub` symbol
+    // treats its non-`pub` declarations as `priv` to that file; `priv` is always file-private.
+    int max_fid = 0;
+    for (int i = 0; i < decls.len; i++) {
+        if (decls.items[i]->pos.file_id > max_fid) max_fid = decls.items[i]->pos.file_id;
+    }
+    bool *file_has_pub = xcalloc((size_t)(max_fid + 1), sizeof(bool));
+    for (int i = 0; i < decls.len; i++) {
+        if (decls.items[i]->is_pub) file_has_pub[decls.items[i]->pos.file_id] = true;
+    }
+    for (int i = 0; i < decls.len; i++) {
+        Node *d = decls.items[i];
+        if (file_has_pub[d->pos.file_id] && !d->is_pub) {
+            d->is_priv = true;
+        }
+    }
+    free(file_has_pub);
+
+    // Pass 1: register all top-level names so structs, enums, type aliases, constants,
+    // and functions can be referenced in any declaration order (spec §5.3).
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
         if (d->kind == N_STRUCT) {
@@ -3264,6 +3563,8 @@ Program check(NodeVec decls) {
             st->name = d->name;
             st->decl = d;
             Symbol *s = define(&c, SYM_TYPE, d->name, st, d->pos);
+            s->is_pub = d->is_pub;
+            s->is_priv = d->is_priv;
             d->sym = s;
             d->type = st;
         } else if (d->kind == N_ENUM) {
@@ -3279,11 +3580,25 @@ Program check(NodeVec decls) {
             et->align = 4;
             et->is_signed = true;
             Symbol *s = define(&c, SYM_TYPE, d->name, et, d->pos);
+            s->is_pub = d->is_pub;
+            s->is_priv = d->is_priv;
             d->sym = s;
             d->type = et;
+        } else if (d->kind == N_TYPE_ALIAS) {
+            if (d->tparams.len > 0) {
+                vec_push(c.generic_type_aliases, d);
+                continue;
+            }
+            Symbol *s = define(&c, SYM_TYPE, d->name, NULL, d->pos);
+            s->decl = d;
+            s->is_pub = d->is_pub;
+            s->is_priv = d->is_priv;
+            d->sym = s;
         } else if (d->kind == N_CONST) {
             Symbol *s = define(&c, SYM_CONST, d->name, &ty_untyped_int, d->pos);
             s->decl = d;
+            s->is_pub = d->is_pub;
+            s->is_priv = d->is_priv;
             d->sym = s;
         }
     }
@@ -3298,6 +3613,12 @@ Program check(NodeVec decls) {
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
         if (d->kind == N_STRUCT && d->tparams.len == 0) layout_struct(&c, d->type);
+    }
+    for (int i = 0; i < decls.len; i++) {
+        Node *d = decls.items[i];
+        if (d->kind == N_TYPE_ALIAS && d->tparams.len == 0) {
+            resolve_type(&c, d->name, d->pos);
+        }
     }
 
     VEC(Symbol *) extern_syms = {0};
@@ -3355,6 +3676,10 @@ Program check(NodeVec decls) {
                           d->name2, base_t->kind == TY_STRUCT ? "field" : "variant",
                           base_t->name, d->name2);
                 }
+                // Canonicalize method name to the resolved target type (e.g. through type aliases).
+                char canon_m[256];
+                int cmlen = snprintf(canon_m, sizeof(canon_m), "%s.%s", base_t->name, d->name2);
+                d->name = intern(canon_m, cmlen);
             }
             if (d->is_extern) {
                 Symbol *existing = lookup_in(c.global, d->name);
@@ -3369,6 +3694,7 @@ Program check(NodeVec decls) {
                         }
                     }
                     if (same_params) {
+                        if (!d->is_priv) existing->is_priv = false;
                         d->sym = existing;
                         d->type = ret;
                         continue;
@@ -3376,6 +3702,8 @@ Program check(NodeVec decls) {
                 }
                 Symbol *s = define(&c, SYM_FN, d->name, ret, d->pos);
                 s->is_extern = true;
+                s->is_pub = d->is_pub;
+                s->is_priv = d->is_priv;
                 s->decl = d;
                 d->sym = s;
                 d->type = ret;
@@ -3383,6 +3711,8 @@ Program check(NodeVec decls) {
                 vec_push(extern_syms, s);
             } else {
                 Symbol *s = define(&c, SYM_FN, d->name, ret, d->pos);
+                s->is_pub = d->is_pub;
+                s->is_priv = d->is_priv;
                 s->decl = d;
                 d->sym = s;
                 d->type = ret;
@@ -3390,6 +3720,8 @@ Program check(NodeVec decls) {
             }
         } else if (d->kind == N_VAR) {
             Symbol *s = define(&c, SYM_VAR, d->name, NULL, d->pos);
+            s->is_pub = d->is_pub;
+            s->is_priv = d->is_priv;
             s->decl = d;
             d->sym = s;
             vec_push(prog.globals, s);
