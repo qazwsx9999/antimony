@@ -172,6 +172,9 @@ static void materialize(Node *n);
 
 static void check_sym_visible(Symbol *s, Pos ref_pos) {
     if (s && s->is_priv && s->pos.file_id != ref_pos.file_id) {
+        for (int i = 0; i < s->priv_files.len; i++) {
+            if (s->priv_files.items[i] == ref_pos.file_id) return;
+        }
         fatal(ref_pos, "cannot access private '%s' declared in '%s'",
               s->name, file_name_of(s->pos));
     }
@@ -3694,7 +3697,11 @@ Program check(NodeVec decls) {
                         }
                     }
                     if (same_params) {
-                        if (!d->is_priv) existing->is_priv = false;
+                        if (!d->is_priv) {
+                            existing->is_priv = false;
+                        } else if (existing->is_priv && d->pos.file_id != existing->pos.file_id) {
+                            vec_push(existing->priv_files, d->pos.file_id);
+                        }
                         d->sym = existing;
                         d->type = ret;
                         continue;

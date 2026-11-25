@@ -1,32 +1,36 @@
-// std/mem.sb - Native Win32 process heap allocation, arena allocator, and memory utilities.
+// =============================================================================
+// Antimony Standard Library: std/mem.sb
+// Native Win32 process heap allocation, arena allocator, and memory utilities.
+// =============================================================================
 
 const HEAP_ZERO_MEMORY: u32 = 8
 
-extern "kernel32.dll" {
+priv extern "kernel32.dll" {
     fn GetProcessHeap(): usize
     fn HeapAlloc(hHeap: usize, dwFlags: u32, dwBytes: usize): *u8
     fn HeapReAlloc(hHeap: usize, dwFlags: u32, lpMem: *u8, dwBytes: usize): *u8
     fn HeapFree(hHeap: usize, dwFlags: u32, lpMem: *u8): i32
 }
 
-extern "msvcrt.dll" {
-    fn memcpy(dst: *u8, src: *u8, n: usize): *u8
+priv extern "msvcrt.dll" {
+    fn memcpy(dst: *u8, src: *const u8, n: usize): *u8
+    fn memmove(dst: *u8, src: *const u8, n: usize): *u8
     fn memset(dst: *u8, val: i32, n: usize): *u8
-    fn memcmp(a: *u8, b: *u8, n: usize): i32
+    fn memcmp(a: *const u8, b: *const u8, n: usize): i32
 }
 
 // Allocates `size` zero-initialized bytes from the Win32 process heap.
-fn alloc(size: usize): *u8 {
+pub fn alloc(size: usize): *u8 {
     return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size)
 }
 
 // Allocates `size` uninitialized bytes from the Win32 process heap.
-fn alloc_uninit(size: usize): *u8 {
+pub fn alloc_uninit(size: usize): *u8 {
     return HeapAlloc(GetProcessHeap(), 0, size)
 }
 
 // Resizes a heap block previously allocated with `alloc` or `alloc_uninit` (zero-filling new bytes).
-fn realloc_mem(ptr: *u8, new_size: usize): *u8 {
+pub fn realloc_mem(ptr: *u8, new_size: usize): *u8 {
     if ptr == null {
         return alloc(new_size)
     }
@@ -34,44 +38,81 @@ fn realloc_mem(ptr: *u8, new_size: usize): *u8 {
 }
 
 // Frees a heap block previously allocated with `alloc`, `alloc_uninit`, or `realloc_mem`.
-fn free_mem(ptr: *u8) {
+pub fn free_mem(ptr: *u8) {
     if ptr != null {
         HeapFree(GetProcessHeap(), 0, ptr)
     }
 }
 
-// Copies `n` bytes from `src` to `dst`.
-fn copy_mem(dst: *u8, src: *u8, n: usize) {
+// Allocates `count` zero-initialized elements of type `T`.
+pub fn alloc_typed[T](count: usize): *T {
+    if count == 0 {
+        return null
+    }
+    return ptr_cast(*T, alloc(count * usize(sizeof(T))))
+}
+
+// Copies `n` non-overlapping bytes from `src` to `dst`.
+pub fn copy_mem(dst: *u8, src: *const u8, n: usize) {
+    if n == 0 {
+        return
+    }
     memcpy(dst, src, n)
 }
 
+// Copies `n` bytes from `src` to `dst` (safe when regions overlap).
+pub fn move_mem(dst: *u8, src: *const u8, n: usize) {
+    if n == 0 {
+        return
+    }
+    memmove(dst, src, n)
+}
+
 // Fills `n` bytes at `dst` with `byte_val`.
-fn set_mem(dst: *u8, byte_val: u8, n: usize) {
+pub fn set_mem(dst: *u8, byte_val: u8, n: usize) {
+    if n == 0 {
+        return
+    }
     memset(dst, i32(byte_val), n)
 }
 
 // Compares `n` bytes at `a` and `b`; returns < 0, 0, or > 0.
-fn cmp_mem(a: *u8, b: *u8, n: usize): i32 {
+pub fn cmp_mem(a: *const u8, b: *const u8, n: usize): i32 {
+    if n == 0 {
+        return 0
+    }
     return memcmp(a, b, n)
 }
 
-// Fast linear bump-pointer arena backed by the process heap.
-struct Arena {
+// Returns true if `n` bytes at `a` and `b` are identical.
+pub fn eq_mem(a: *const u8, b: *const u8, n: usize): bool {
+    return cmp_mem(a, b, n) == 0
+}
+
+// -----------------------------------------------------------------------------
+// Fast linear bump-pointer arena backed by the process heap
+// -----------------------------------------------------------------------------
+
+pub struct Arena {
     base: *u8
     cap: usize
     used: usize
 }
 
-fn arena_init(a: *Arena, capacity: usize) {
+pub fn arena_init(a: *Arena, capacity: usize) {
     a.base = alloc(capacity)
     a.cap  = capacity
     a.used = 0
 }
 
-fn arena_alloc(a: *Arena, size: usize, align: usize): *u8 {
-    var mask = align - 1
+pub fn arena_alloc(a: *Arena, size: usize, align: usize): *u8 {
+    var al = align
+    if al == 0 {
+        al = 1
+    }
+    var mask = al - 1
     var aligned = (a.used + mask) & ~mask
-    if aligned + size > a.cap {
+    if aligned < a.used || aligned + size < aligned || aligned + size > a.cap {
         return null
     }
     var p = a.base + aligned
@@ -79,33 +120,36 @@ fn arena_alloc(a: *Arena, size: usize, align: usize): *u8 {
     return p
 }
 
-fn arena_reset(a: *Arena) {
+pub fn arena_reset(a: *Arena) {
     if a.base != null && a.used > 0 {
         set_mem(a.base, 0, a.used)
     }
     a.used = 0
 }
 
-fn arena_free(a: *Arena) {
+pub fn arena_free(a: *Arena) {
     free_mem(a.base)
     a.base = null
     a.cap  = 0
     a.used = 0
 }
 
-fn (a: *Arena) init(capacity: usize) {
+pub fn (a: *Arena) init(capacity: usize) {
     arena_init(a, capacity)
 }
 
-fn (a: *Arena) alloc(size: usize, align: usize): *u8 {
+pub fn (a: *Arena) alloc(size: usize, align: usize): *u8 {
     return arena_alloc(a, size, align)
 }
 
-fn (a: *Arena) reset() {
+pub fn (a: Arena) remaining(): usize {
+    return a.cap - a.used
+}
+
+pub fn (a: *Arena) reset() {
     arena_reset(a)
 }
 
-fn (a: *Arena) free() {
+pub fn (a: *Arena) free() {
     arena_free(a)
 }
-

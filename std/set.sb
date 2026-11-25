@@ -1,0 +1,51 @@
+// =============================================================================
+// Antimony Standard Library: std/set.sb
+// Generic hash set `HashSet[T]` built on `HashMap[T, u8]`.
+// =============================================================================
+
+import "std/map.sb"
+
+pub struct HashSet[T] {
+    map: HashMap[T, u8]
+    len: i64
+}
+
+pub fn (s: *HashSet[T]) init(initial_cap: i64) {
+    s.map.init(initial_cap)
+    s.len = 0
+}
+
+pub fn (s: HashSet[T]) is_empty(): bool {
+    return s.len == 0
+}
+
+// Inserts `val` into the set. Returns `true` if `val` was newly inserted,
+// or `false` if it was already present.
+pub fn (s: *HashSet[T]) insert(val: T): bool {
+    if s.map.contains(val) {
+        return false
+    }
+    s.map.put(val, 1)
+    s.len = s.map.len
+    return true
+}
+
+pub fn (s: HashSet[T]) contains(val: T): bool {
+    return s.map.contains(val)
+}
+
+pub fn (s: *HashSet[T]) remove(val: T): bool {
+    var ok = s.map.remove(val)
+    s.len = s.map.len
+    return ok
+}
+
+pub fn (s: *HashSet[T]) clear() {
+    s.map.clear()
+    s.len = 0
+}
+
+pub fn (s: *HashSet[T]) free() {
+    s.map.free()
+    s.len = 0
+}

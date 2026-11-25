@@ -1034,17 +1034,23 @@ fn main() {
 ```
 
 ### 15.3 Standard Library Modules (`std/`)
-Antimony ships with native standard library modules in `std/` that you can import from any directory:
-- `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `realloc_mem`, `free_mem`, `copy_mem`, `set_mem`, `cmp_mem`) and fast bump-pointer `Arena` (`arena_init`, `arena_alloc`, `arena_reset`, `arena_free`).
-- `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `pop`, `get`, `set`, `as_slice`, `clear`, `free`).
-- `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `put`, `get`, `get_or`, `contains`, `remove`, `clear`, `free`) and `Option[T]` (`.Some(T)` / `.None`).
-- `import "std/sort.sb"` — Generic sorting and slice algorithms (`sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, `reverse[T]`).
+Antimony ships with 16 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
+- `import "std/core.sb"` — Canonical `Option[T]`, `Result[T, E]`, `Ordering`, `panic`, `assert`, and `swap[T]`.
+- `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `alloc_typed`, `realloc_mem`, `free_mem`, `copy_mem`, `move_mem`, `set_mem`, `cmp_mem`, `eq_mem`) and fast bump-pointer `Arena`.
+- `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `extend_slice`, `pop`, `try_pop`, `get`, `try_get`, `get_ptr`, `set`, `first`, `last`, `insert`, `remove`, `swap_remove`, `shrink_to_fit`, `as_slice`, `as_const_slice`, `clear`, `free`).
+- `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `reserve`, `put`, `get`, `get_ptr`, `get_or`, `contains`, `remove`, `take`, `clear`, `free`).
+- `import "std/set.sb"` — Generic hash set `HashSet[T]` (`init`, `insert`, `contains`, `remove`, `clear`, `free`).
+- `import "std/deque.sb"` — Generic ring-buffer double-ended queue `Deque[T]` (`init`, `push_front`, `push_back`, `pop_front`, `pop_back`, `front`, `back`, `get`, `clear`, `free`).
+- `import "std/sort.sb"` — Generic sorting and slice algorithms (`sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, `lower_bound[T]`, `upper_bound[T]`, `reverse[T]`).
 - `import "std/math.sb"` — Math constants (`PI`, `TAU`, `E`, `SQRT2`, `INF`, `NAN`, `EPSILON_F64`), `f64`/`f32` CRT transcendental/rounding functions (`sqrt`, `sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow`, `floor`, `ceil`, `round`, `trunc`, `cbrt`, `hypot`, `is_nan`, `is_inf`), generic `min`/`max`/`clamp`, interpolation (`lerp`, `smoothstep`), and integer/bit utilities (`gcd`, `lcm`, `pow_i64`, `is_pow2`, `next_pow2`, `ilog2`, `div_ceil_u64`).
-- `import "std/thread.sb"` — Native Win32 OS threads (`Thread`, `spawn`, `join`, `detach`, `current_thread_id`), fast user-mode `SRWLOCK` locks (`Mutex`, `RwLock`, `CondVar`), and hardware atomic wrapper `AtomicI64` (`init`, `load`, `store`, `fetch_add`, `fetch_sub`, `cas`).
-- `import "std/io.sb"` — Native Win32 file I/O (`write_file_str`, `write_file_bytes`, `write_file_ptr`, `file_size`, `read_file_into`, `delete_file`).
-- `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `ticks_ms`, `sleep_ms`).
-- `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification (`is_digit`, `is_alpha`, `is_space`), `str` helpers (`str_starts_with`, `str_ends_with`, `str_trim`, `str_find_byte`, `str_parse_i64`, `parse_i64`), and the growable `StringBuilder` (`init`, `append`, `append_byte`, `append_i64`, `as_str`, `cstr`, `clear`, `free`).
-- `import "std/os.sb"` — Console streams and process environment: `print_raw`, `eprint_raw`, `eprint`, `cmd_line`, `arg_count`, `arg_at`, `parse_arg_count`, `parse_arg_at`, `getenv_into`.
+- `import "std/thread.sb"` — Native Win32 OS threads (`Thread`, `spawn`, `join`, `detach`, `current_thread_id`), fast user-mode `SRWLOCK` locks (`Mutex`, `RwLock`, `CondVar` with `wait_timeout`), and hardware atomic wrapper `AtomicI64` (`init`, `load`, `store`, `fetch_add`, `fetch_sub`, `cas`).
+- `import "std/io.sb"` — Native Win32 `File` handle (`file_open`, `file_create`, `file_open_append`, `file_open_rw`, `read`, `write`, `write_all`, `write_str`, `seek`, `size`, `flush`, `close`), `IoError`, `SeekFrom`, `read_file_all`, `write_file_all`, and low-level helpers.
+- `import "std/fs.sb"` — Native Win32 filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`) returning `Result[bool, IoError]`.
+- `import "std/path.sb"` — Zero-allocation path utilities (`path_is_sep`, `path_is_abs`, `path_basename`, `path_dirname`, `path_extension`, `path_stem`) and `path_join`.
+- `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `elapsed_ms`, `ticks_ms`, `sleep_ms`) and `Stopwatch`.
+- `import "std/rand.sb"` — Deterministic xoshiro256++ PRNG (`Rng`, `rng_from_seed`, `rng_from_os`, `next_u64`, `next_u32`, `next_f64`, `range_i64`, `next_bool`, `rng_shuffle[T]`) and OS CSPRNG (`os_random_bytes`, `os_random_u64` via `bcrypt.dll`).
+- `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification & case helpers, `str` search & slicing (`str_cmp`, `str_eq_ignore_ascii_case`, `str_starts_with`, `str_ends_with`, `str_strip_prefix`, `str_strip_suffix`, `str_trim`, `str_find`, `str_contains`, `str_count`, `str_split_once`), strict `Result` parsers (`try_parse_i64`, `try_parse_u64`, `try_parse_f64`), and `StringBuilder` (`append`, `append_bytes`, `append_i64`, `append_u64`, `append_hex`, `append_replace`, `append_lower`, `append_upper`, `as_str`, `cstr`).
+- `import "std/os.sb"` — Console streams (`print_raw`, `eprint_raw`, `eprint`, `read_stdin`), command-line arguments (`cmd_line`, `arg_count`, `arg_at`), environment (`getenv_into`, `getenv_str`), and `cwd_into`.
 
 ### 15.4 Multi-Threading, `Mutex`, and Hardware Atomics (`std/thread.sb`)
 Import `"std/thread.sb"` to spawn native Win32 OS threads (`spawn(worker_fn, arg)`), synchronize shared state with 8-byte user-mode `SRWLOCK` mutexes (`Mutex`, `RwLock`, `CondVar`), or perform lock-free hardware atomic operations (`AtomicI64` / `atomic_add`, `atomic_cas`, `atomic_load`, `atomic_store` compiling directly to `LOCK XADD` and `LOCK CMPXCHG`):
@@ -1107,7 +1113,7 @@ fn main() {
 
 ## 17. Complete Example Programs
 
-See [demo.sb](file:///c:/Users/soroosh/sb/examples/demo.sb) for a runnable tour of Antimony language features, and [sbwc.sb](file:///c:/Users/soroosh/sb/examples/sbwc.sb) for a complete real-world CLI word/line/byte counter and substring search utility built using `std/mem`, `std/str`, `std/io`, `std/os`, and `std/time`:
+See [demo.sb](../examples/demo.sb) for a runnable tour of Antimony language features, and [sbwc.sb](../examples/sbwc.sb) for a complete real-world CLI word/line/byte counter and substring search utility built using `std/mem`, `std/str`, `std/io`, `std/os`, and `std/time`:
 
 ```powershell
 # Self-test mode (scans benchmarks/README.md and benchmarks/bench.sb for "fn")

@@ -1,16 +1,38 @@
-// std/io.sb - Native Win32 file I/O utilities (zero CRT dependency).
+// =============================================================================
+// Antimony Standard Library: std/io.sb
+// Native Win32 file I/O (`File`, `IoError`, `SeekFrom`, `Result`-based APIs,
+// plus zero-overhead low-level helpers).
+// =============================================================================
+
+import "std/core.sb"
+import "std/mem.sb"
+import "std/str.sb"
 
 const GENERIC_READ: u32          = 0x80000000
 const GENERIC_WRITE: u32         = 0x40000000
+const FILE_APPEND_DATA: u32      = 0x00000004
 const FILE_SHARE_READ: u32       = 1
+const FILE_SHARE_WRITE: u32      = 2
 const CREATE_ALWAYS: u32         = 2
 const OPEN_EXISTING: u32         = 3
+const OPEN_ALWAYS: u32           = 4
 const FILE_ATTRIBUTE_NORMAL: u32 = 0x80
 const INVALID_HANDLE_VALUE: isize = -1
 
-extern "kernel32.dll" {
+const FILE_BEGIN: u32   = 0
+const FILE_CURRENT: u32 = 1
+const FILE_END: u32     = 2
+
+const WIN32_ERR_FILE_NOT_FOUND: u32  = 2
+const WIN32_ERR_PATH_NOT_FOUND: u32  = 3
+const WIN32_ERR_ACCESS_DENIED: u32   = 5
+const WIN32_ERR_FILE_EXISTS: u32     = 80
+const WIN32_ERR_BROKEN_PIPE: u32     = 109
+const WIN32_ERR_ALREADY_EXISTS: u32  = 183
+
+priv extern "kernel32.dll" {
     fn CreateFileA(
-        lpFileName: *u8,
+        lpFileName: *const u8,
         dwDesiredAccess: u32,
         dwShareMode: u32,
         lpSecurityAttributes: usize,
@@ -19,14 +41,256 @@ extern "kernel32.dll" {
         hTemplateFile: usize
     ): isize
     fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
-    fn WriteFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
+    fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
     fn GetFileSizeEx(hFile: isize, lpFileSize: *i64): i32
+    fn SetFilePointerEx(hFile: isize, liDistanceToMove: i64, lpNewFilePointer: *i64, dwMoveMethod: u32): i32
+    fn FlushFileBuffers(hFile: isize): i32
     fn CloseHandle(hObject: isize): i32
-    fn DeleteFileA(lpFileName: *u8): i32
+    fn DeleteFileA(lpFileName: *const u8): i32
+    fn GetLastError(): u32
 }
 
+// -----------------------------------------------------------------------------
+// Structured I/O Error & Seek Types
+// -----------------------------------------------------------------------------
+
+pub enum IoError {
+    NotFound
+    PermissionDenied
+    AlreadyExists
+    InvalidInput
+    BrokenPipe
+    UnexpectedEof
+    OsError(u32)
+}
+
+pub fn io_error_from_win32(code: u32): IoError {
+    match code {
+        WIN32_ERR_FILE_NOT_FOUND, WIN32_ERR_PATH_NOT_FOUND { return .NotFound }
+        WIN32_ERR_ACCESS_DENIED                            { return .PermissionDenied }
+        WIN32_ERR_FILE_EXISTS, WIN32_ERR_ALREADY_EXISTS    { return .AlreadyExists }
+        WIN32_ERR_BROKEN_PIPE                              { return .BrokenPipe }
+        else                                               { return .OsError(code) }
+    }
+}
+
+pub fn (e: IoError) message(): str {
+    match e {
+        .NotFound         { return "file or path not found" }
+        .PermissionDenied { return "permission denied" }
+        .AlreadyExists    { return "already exists" }
+        .InvalidInput     { return "invalid input" }
+        .BrokenPipe       { return "broken pipe" }
+        .UnexpectedEof    { return "unexpected end of file" }
+        .OsError(_)       { return "OS I/O error" }
+    }
+}
+
+pub enum SeekFrom {
+    Start(i64)
+    Current(i64)
+    End(i64)
+}
+
+// -----------------------------------------------------------------------------
+// Rust/Go-Style `File` Handle
+// -----------------------------------------------------------------------------
+
+pub struct File {
+    handle: isize
+}
+
+priv fn open_win32_file(path: str, access: u32, share: u32, disposition: u32): Result[File, IoError] {
+    if len(path) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    var h = CreateFileA(pb.cstr(), access, share, 0, disposition, FILE_ATTRIBUTE_NORMAL, 0)
+    if h == INVALID_HANDLE_VALUE {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(File { handle: h })
+}
+
+// Opens an existing file for reading.
+pub fn file_open(path: str): Result[File, IoError] {
+    return open_win32_file(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING)
+}
+
+// Creates a new file (or truncates an existing one) for writing.
+pub fn file_create(path: str): Result[File, IoError] {
+    return open_win32_file(path, GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS)
+}
+
+// Opens a file for appending (creating it if it does not exist).
+pub fn file_open_append(path: str): Result[File, IoError] {
+    return open_win32_file(path, FILE_APPEND_DATA, FILE_SHARE_READ, OPEN_ALWAYS)
+}
+
+// Opens a file for reading and writing (creating it if it does not exist).
+pub fn file_open_rw(path: str): Result[File, IoError] {
+    return open_win32_file(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, OPEN_ALWAYS)
+}
+
+pub fn (f: *File) is_open(): bool {
+    return f.handle != INVALID_HANDLE_VALUE && f.handle != 0
+}
+
+pub fn (f: *File) read(buf[]: u8): Result[i64, IoError] {
+    if !f.is_open() {
+        return .Err(.InvalidInput)
+    }
+    if len(buf) == 0 {
+        return .Ok(0)
+    }
+    var chunk = len(buf)
+    if chunk > 0x7FFF_FFFF {
+        chunk = 0x7FFF_FFFF
+    }
+    var nread: u32 = 0
+    if ReadFile(f.handle, &buf[0], u32(chunk), &nread, 0) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(i64(nread))
+}
+
+pub fn (f: *File) write(data[]: const u8): Result[i64, IoError] {
+    if !f.is_open() {
+        return .Err(.InvalidInput)
+    }
+    if len(data) == 0 {
+        return .Ok(0)
+    }
+    var chunk = len(data)
+    if chunk > 0x7FFF_FFFF {
+        chunk = 0x7FFF_FFFF
+    }
+    var written: u32 = 0
+    if WriteFile(f.handle, &data[0], u32(chunk), &written, 0) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(i64(written))
+}
+
+pub fn (f: *File) write_all(data[]: const u8): Result[i64, IoError] {
+    var total = len(data)
+    var off: i64 = 0
+    loop off < total {
+        var n = f.write(data[off..total])?
+        if n <= 0 {
+            return .Err(.UnexpectedEof)
+        }
+        off += n
+    }
+    return .Ok(off)
+}
+
+pub fn (f: *File) write_str(s: str): Result[i64, IoError] {
+    if len(s) == 0 {
+        return .Ok(0)
+    }
+    var p = ptr_cast(*const u8, s)
+    return f.write_all(p[0..len(s)])
+}
+
+pub fn (f: *File) seek(pos: SeekFrom): Result[i64, IoError] {
+    if !f.is_open() {
+        return .Err(.InvalidInput)
+    }
+    var dist: i64 = 0
+    var method: u32 = FILE_BEGIN
+    match pos {
+        .Start(o) {
+            dist = o
+            method = FILE_BEGIN
+        }
+        .Current(o) {
+            dist = o
+            method = FILE_CURRENT
+        }
+        .End(o) {
+            dist = o
+            method = FILE_END
+        }
+    }
+    var new_pos: i64 = 0
+    if SetFilePointerEx(f.handle, dist, &new_pos, method) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(new_pos)
+}
+
+pub fn (f: *File) size(): Result[i64, IoError] {
+    if !f.is_open() {
+        return .Err(.InvalidInput)
+    }
+    var sz: i64 = 0
+    if GetFileSizeEx(f.handle, &sz) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(sz)
+}
+
+pub fn (f: *File) flush(): Result[bool, IoError] {
+    if !f.is_open() {
+        return .Err(.InvalidInput)
+    }
+    if FlushFileBuffers(f.handle) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(true)
+}
+
+pub fn (f: *File) close() {
+    if f.is_open() {
+        CloseHandle(f.handle)
+        f.handle = INVALID_HANDLE_VALUE
+    }
+}
+
+// -----------------------------------------------------------------------------
+// High-Level Whole-File Helpers (`str` paths, `Result`-based)
+// -----------------------------------------------------------------------------
+
+// Reads the entire contents of `path` and appends them to `out`, returning bytes read.
+pub fn read_file_all(path: str, out: *StringBuilder): Result[i64, IoError] {
+    var f = file_open(path)?
+    defer f.close()
+
+    var sz = f.size()?
+    if sz > 0 {
+        out.ensure(usize(sz))
+    }
+
+    var chunk[4096]: u8
+    var total: i64 = 0
+    loop {
+        var n = f.read(chunk)?
+        if n == 0 {
+            break
+        }
+        out.append_bytes(chunk[0..n])
+        total += n
+    }
+    return .Ok(total)
+}
+
+// Writes `content` to `path` (creating or overwriting the file), returning bytes written.
+pub fn write_file_all(path: str, content: str): Result[i64, IoError] {
+    var f = file_create(path)?
+    defer f.close()
+    return f.write_str(content)
+}
+
+// -----------------------------------------------------------------------------
+// Legacy Low-Level Helpers (preserved for zero-allocation C-string callers)
+// -----------------------------------------------------------------------------
+
 // Writes `n` bytes from `data` to `path` (creating or overwriting the file).
-fn write_file_ptr(path: *u8, data: *u8, n: u32): bool {
+pub fn write_file_ptr(path: *const u8, data: *const u8, n: u32): bool {
     var h = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
     if h == INVALID_HANDLE_VALUE {
         return false
@@ -38,7 +302,7 @@ fn write_file_ptr(path: *u8, data: *u8, n: u32): bool {
 }
 
 // Writes a byte slice `data[]` to `path`.
-fn write_file_bytes(path: *u8, data[]: u8): bool {
+pub fn write_file_bytes(path: *const u8, data[]: const u8): bool {
     if len(data) == 0 {
         return write_file_ptr(path, null, 0)
     }
@@ -46,15 +310,15 @@ fn write_file_bytes(path: *u8, data[]: u8): bool {
 }
 
 // Writes a `str` directly to `path`.
-fn write_file_str(path: *u8, content: str): bool {
+pub fn write_file_str(path: *const u8, content: str): bool {
     if len(content) == 0 {
         return write_file_ptr(path, null, 0)
     }
-    return write_file_ptr(path, ptr_cast(*u8, content), u32(len(content)))
+    return write_file_ptr(path, ptr_cast(*const u8, content), u32(len(content)))
 }
 
 // Returns the size in bytes of `path`, or -1 if the file cannot be opened.
-fn file_size(path: *u8): i64 {
+pub fn file_size(path: *const u8): i64 {
     var h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
     if h == INVALID_HANDLE_VALUE {
         return -1
@@ -68,7 +332,7 @@ fn file_size(path: *u8): i64 {
 }
 
 // Reads up to `len(buf)` bytes from `path` into `buf[]`. Returns bytes read, or -1 on error.
-fn read_file_into(path: *u8, buf[]: u8): i64 {
+pub fn read_file_into(path: *const u8, buf[]: u8): i64 {
     if len(buf) == 0 {
         return 0
     }
@@ -85,6 +349,6 @@ fn read_file_into(path: *u8, buf[]: u8): i64 {
 }
 
 // Deletes the file at `path`; returns true on success.
-fn delete_file(path: *u8): bool {
+pub fn delete_file(path: *const u8): bool {
     return DeleteFileA(path) != 0
 }

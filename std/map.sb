@@ -1,15 +1,17 @@
-// std/map.sb - Generic open-addressing hash table HashMap[K, V] and Option[T].
+// =============================================================================
+// Antimony Standard Library: std/map.sb
+// Generic open-addressing hash table `HashMap[K, V]` with tombstone tracking.
+// =============================================================================
 
+import "std/core.sb"
 import "std/mem.sb"
 
-enum Option[T] {
-    Some(T)
-    None
-}
-
 // 64-bit FNV-1a byte hash.
-fn hash_bytes_fnv1a(p: *u8, n: i64): u64 {
+pub fn hash_bytes_fnv1a(p: *const u8, n: i64): u64 {
     var h: u64 = 14695981039346656037
+    if p == null || n <= 0 {
+        return h
+    }
     var i: i64 = 0
     loop i < n {
         h = (h ^ u64(p[i])) *% 1099511628211
@@ -18,29 +20,33 @@ fn hash_bytes_fnv1a(p: *u8, n: i64): u64 {
     return h
 }
 
-// Generic key hash: hashes string content when K is `str` (16-byte {ptr, len}),
-// or hashes the raw value bytes of K for scalar/enum/pointer keys.
-fn hash_key[K](k: K): u64 {
+// Generic key hash.
+// Note: In Antimony, `==` is only defined for scalars/enums/pointers (<= 8 bytes)
+// and `str` (16 bytes `{ptr, len}`), so any `K` accepted by `HashMap` with
+// `sizeof(K) == 16` is guaranteed to be `str`.
+pub fn hash_key[K](k: K): u64 {
     var kv = k
     if sizeof(K) == 16 {
-        var sp = ptr_cast(**u8, &kv)
-        var sl = ptr_cast(*i64, ptr_cast(*u8, &kv) + 8)
+        var sp = ptr_cast(*const *const u8, &kv)
+        var sl = ptr_cast(*const i64, ptr_cast(*const u8, &kv) + 8)
         return hash_bytes_fnv1a(*sp, *sl)
     }
-    return hash_bytes_fnv1a(ptr_cast(*u8, &kv), i64(sizeof(K)))
+    return hash_bytes_fnv1a(ptr_cast(*const u8, &kv), i64(sizeof(K)))
 }
 
 // Entry states in `HashMap.states`: 0 = empty, 1 = occupied, 2 = tombstone.
-struct HashMap[K, V] {
+pub struct HashMap[K, V] {
     keys: *K
     vals: *V
     states: *u8
     len: i64
     cap: i64
+    tombstones: i64
 }
 
-fn (m: *HashMap[K, V]) init(initial_cap: i64) {
+pub fn (m: *HashMap[K, V]) init(initial_cap: i64) {
     m.len = 0
+    m.tombstones = 0
     var c: i64 = 16
     loop c < initial_cap {
         c *= 2
@@ -51,21 +57,26 @@ fn (m: *HashMap[K, V]) init(initial_cap: i64) {
     m.states = alloc(usize(c))
 }
 
-fn (m: *HashMap[K, V]) grow() {
+pub fn (m: HashMap[K, V]) is_empty(): bool {
+    return m.len == 0
+}
+
+priv fn (m: *HashMap[K, V]) rehash(new_cap: i64) {
     var old_cap = m.cap
     var old_keys = m.keys
     var old_vals = m.vals
     var old_states = m.states
 
-    var new_cap: i64 = 16
-    if old_cap >= 16 {
-        new_cap = old_cap * 2
+    var c = new_cap
+    if c < 16 {
+        c = 16
     }
-    m.cap = new_cap
+    m.cap = c
     m.len = 0
-    m.keys   = ptr_cast(*K, alloc(usize(new_cap) * usize(sizeof(K))))
-    m.vals   = ptr_cast(*V, alloc(usize(new_cap) * usize(sizeof(V))))
-    m.states = alloc(usize(new_cap))
+    m.tombstones = 0
+    m.keys   = ptr_cast(*K, alloc(usize(c) * usize(sizeof(K))))
+    m.vals   = ptr_cast(*V, alloc(usize(c) * usize(sizeof(V))))
+    m.states = alloc(usize(c))
 
     if old_states != null {
         var i: i64 = 0
@@ -81,8 +92,39 @@ fn (m: *HashMap[K, V]) grow() {
     }
 }
 
-fn (m: *HashMap[K, V]) put(key: K, val: V) {
-    if m.cap == 0 || (m.len + 1) * 10 >= m.cap * 7 {
+priv fn (m: *HashMap[K, V]) grow() {
+    var new_cap: i64 = 16
+    if m.cap >= 16 {
+        // Double only if live entries fill at least half the table; otherwise rehash in place to clear tombstones.
+        if m.len * 2 >= m.cap {
+            new_cap = m.cap * 2
+        } else {
+            new_cap = m.cap
+        }
+    }
+    m.rehash(new_cap)
+}
+
+pub fn (m: *HashMap[K, V]) reserve(min_entries: i64) {
+    if min_entries <= 0 {
+        return
+    }
+    var needed = (min_entries * 10) / 7 + 1
+    if needed <= m.cap {
+        return
+    }
+    var c: i64 = 16
+    if m.cap > c {
+        c = m.cap
+    }
+    loop c < needed {
+        c *= 2
+    }
+    m.rehash(c)
+}
+
+pub fn (m: *HashMap[K, V]) put(key: K, val: V) {
+    if m.cap == 0 || (m.len + m.tombstones + 1) * 10 >= m.cap * 7 {
         m.grow()
     }
     var mask = u64(m.cap - 1)
@@ -94,6 +136,7 @@ fn (m: *HashMap[K, V]) put(key: K, val: V) {
             var target = idx
             if first_tomb >= 0 {
                 target = first_tomb
+                m.tombstones -= 1
             }
             m.keys[target] = key
             m.vals[target] = val
@@ -113,7 +156,7 @@ fn (m: *HashMap[K, V]) put(key: K, val: V) {
     }
 }
 
-fn (m: HashMap[K, V]) find_slot(key: K): i64 {
+priv fn (m: HashMap[K, V]) find_slot(key: K): i64 {
     if m.cap == 0 || m.len == 0 {
         return -1
     }
@@ -135,7 +178,7 @@ fn (m: HashMap[K, V]) find_slot(key: K): i64 {
     }
 }
 
-fn (m: HashMap[K, V]) get(key: K): Option[V] {
+pub fn (m: HashMap[K, V]) get(key: K): Option[V] {
     var idx = m.find_slot(key)
     if idx < 0 {
         return .None
@@ -143,7 +186,16 @@ fn (m: HashMap[K, V]) get(key: K): Option[V] {
     return .Some(m.vals[idx])
 }
 
-fn (m: HashMap[K, V]) get_or(key: K, default_val: V): V {
+// Returns a mutable pointer to the value associated with `key`, or `null` if absent.
+pub fn (m: *HashMap[K, V]) get_ptr(key: K): *V {
+    var idx = m.find_slot(key)
+    if idx < 0 {
+        return null
+    }
+    return &m.vals[idx]
+}
+
+pub fn (m: HashMap[K, V]) get_or(key: K, default_val: V): V {
     var idx = m.find_slot(key)
     if idx < 0 {
         return default_val
@@ -151,28 +203,43 @@ fn (m: HashMap[K, V]) get_or(key: K, default_val: V): V {
     return m.vals[idx]
 }
 
-fn (m: HashMap[K, V]) contains(key: K): bool {
+pub fn (m: HashMap[K, V]) contains(key: K): bool {
     return m.find_slot(key) >= 0
 }
 
-fn (m: *HashMap[K, V]) remove(key: K): bool {
+pub fn (m: *HashMap[K, V]) remove(key: K): bool {
     var idx = m.find_slot(key)
     if idx < 0 {
         return false
     }
     m.states[idx] = 2
     m.len -= 1
+    m.tombstones += 1
     return true
 }
 
-fn (m: *HashMap[K, V]) clear() {
+// Removes `key` from the map and returns its previous value, if present.
+pub fn (m: *HashMap[K, V]) take(key: K): Option[V] {
+    var idx = m.find_slot(key)
+    if idx < 0 {
+        return .None
+    }
+    var val = m.vals[idx]
+    m.states[idx] = 2
+    m.len -= 1
+    m.tombstones += 1
+    return .Some(val)
+}
+
+pub fn (m: *HashMap[K, V]) clear() {
     if m.states != null && m.cap > 0 {
         set_mem(m.states, 0, usize(m.cap))
     }
     m.len = 0
+    m.tombstones = 0
 }
 
-fn (m: *HashMap[K, V]) free() {
+pub fn (m: *HashMap[K, V]) free() {
     if m.keys != null {
         free_mem(ptr_cast(*u8, m.keys))
     }
@@ -187,4 +254,5 @@ fn (m: *HashMap[K, V]) free() {
     m.states = null
     m.len = 0
     m.cap = 0
+    m.tombstones = 0
 }

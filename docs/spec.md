@@ -1,10 +1,10 @@
-# Antimony Language Specification — Draft v0.2
+# Antimony Language Specification — v1.0
 
 > Language: **Antimony**. Source file extension: **`.sb`**.
 >
 > First compiler target: **Windows x64**, emitting PE executables directly (no external assembler or linker).
 >
-> Status: draft. Sections marked **[Proposed]** were not explicitly decided yet and are open for review.
+> Status: **core language complete.** Every rule in this document is implemented by the reference compiler `sbc` and exercised by the test suite (`tests/run_tests.ps1`). Planned work and known implementation limits are listed in §13.
 
 ---
 
@@ -13,7 +13,7 @@
 1. **Simple, consistent, readable syntax.**
 2. **One way** to express each operation.
 3. **Runtime performance on par with C/C++.**
-4. **Very fast compilation.** The grammar is parseable with one token of lookahead and no symbol table; function signatures are fully known without reading bodies, so bodies can be checked in parallel.
+4. **Very fast compilation.** The grammar is parseable without a symbol table, using a small fixed lookahead (plus a bracket scan to distinguish generic arguments `f[T](x)` from indexing, §10); function signatures are fully known without reading bodies, so bodies can be checked in parallel.
 5. **Static typing**, with local, forward-only type inference.
 6. **Few keystrokes.**
 
@@ -24,8 +24,8 @@
 ### 1.1 Source text
 Source files are UTF-8. Identifiers are ASCII: `[A-Za-z_][A-Za-z0-9_]*`.
 
-### 1.2 Comments **[Proposed]**
-Line comments only: `// ...` to end of line. (One way; no block comments.)
+### 1.2 Comments
+Line comments only: `// ...` to end of line. There are no block comments (one way to do it); `/* ... */` is a syntax error.
 
 ### 1.3 Statement termination
 A **newline ends a statement**. Formally (same rule as Go), the lexer inserts a statement terminator at a newline if the last token on the line is one of:
@@ -89,6 +89,22 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
 | `f32 f64` | IEEE-754 floats |
 | `bool` | `true` / `false` |
 | `str` | immutable string (minimal, see §1.8) |
+
+### 2.2 No implicit conversions
+Values of different types never mix implicitly. `i32 + i64` is a compile error. Conversions are explicit and use the target type name as a function:
+```
+var a: i32 = 5
+var b: i64 = i64(a) + 1
+```
+
+### 2.3 Conversion semantics
+| From → To | Behavior |
+|---|---|
+| integer → wider integer of same signedness | exact |
+| integer → integer that cannot hold all values | **checked like overflow** (§8): trap in debug, truncate in release |
+| integer → float | rounds to nearest |
+| float → integer | truncates toward zero; out-of-range is checked like overflow |
+| `bool` ↔ integer | not allowed |
 
 ### 2.4 Arrays and Slices
 - **Fixed-size array:** declared with `[N]` after the variable or parameter name (where `N` is a positive compile-time constant expression):
@@ -170,22 +186,6 @@ Built-in type names (`i32`, `bool`, …) and built-in functions (`print`, `rev`,
   ```
 - Type aliases are transparent (not distinct nominal types): `Alias` and `TargetType` are interchangeable anywhere a type is expected, including struct literals, methods, and pointer/slice types. Recursive alias cycles are compile-time errors.
 
-### 2.2 No implicit conversions
-Values of different types never mix implicitly. `i32 + i64` is a compile error. Conversions are explicit and use the target type name as a function:
-```
-var a: i32 = 5
-var b: i64 = i64(a) + 1
-```
-
-### 2.3 Conversion semantics
-| From → To | Behavior |
-|---|---|
-| integer → wider integer of same signedness | exact |
-| integer → integer that cannot hold all values | **checked like overflow** (§8): trap in debug, truncate in release |
-| integer → float | rounds to nearest |
-| float → integer | truncates toward zero; out-of-range is checked like overflow |
-| `bool` ↔ integer | not allowed |
-
 ---
 
 ## 3. Constants and Literal Typing
@@ -251,12 +251,13 @@ There is no `++` / `--`.
 ### 4.4 Mutability
 All variables declared with `var` are mutable. There is no `let`. Compile-time values use `const`.
 
-### 4.5 Scope and shadowing **[Proposed]**
-- A variable is visible from its declaration to the end of the enclosing block.
-- **Shadowing is not allowed**: declaring a name that is already visible in an enclosing scope (inside the same function) is a compile error.
+### 4.5 Scope and shadowing
+- A variable is visible from its declaration to the end of the enclosing block. Sibling blocks may reuse a name.
+- **Shadowing is not allowed inside a function**: declaring a local (variable, constant, parameter, or loop variable) whose name is already visible in an enclosing scope of the same function is a compile error.
+- A local may reuse the name of a top-level function or variable, but never the name of a type or built-in (`var i32 = 1` and `var print = 1` are compile errors).
 
-### 4.6 Top-level variables **[Proposed]**
-`var` at top level is allowed; its initializer must be a constant expression (no hidden start-up code, no initialization-order problems).
+### 4.6 Top-level variables
+`var` at top level is allowed; its initializer must be a constant expression (no hidden start-up code, no initialization-order problems). A non-constant initializer is a compile error.
 
 ---
 
@@ -274,7 +275,7 @@ fn log(msg: str) {
 ```
 - Every parameter has an explicit type.
 - **If the return type is omitted, the function returns no value.** Return types are never inferred.
-- Parameters are read-only inside the function body **[Proposed]**.
+- Parameters are **read-only** inside the function body: assigning to a parameter or taking its address is a compile error. To let a callee modify a value, pass a pointer (`p: *T`).
 
 ### 5.2 Return
 - In a function with a return type, every control path must end in `return expr`; otherwise it is a compile error.
@@ -287,7 +288,7 @@ Functions may be called before they are declared in the file.
 ```
 fn main() { ... }
 ```
-`main` takes no parameters and returns no value. The process exit code is set with the built-in `exit(code: i32)`; returning normally exits with `0`.
+`main` takes no parameters and returns no value; any other signature is a compile error. The process exit code is set with the built-in `exit(code: i32)`; returning normally exits with `0`. Command-line arguments are available through `std/os.sb` (`arg_count`, `arg_at`).
 
 ### 5.5 Module visibility (`pub` / `priv`)
 Top-level declarations (`fn`, `struct`, `enum`, `type`, `var`, `const`, `extern`) support optional `pub` or `priv` modifiers:
@@ -385,13 +386,13 @@ Restrictions:
 
 Semantics: run the declaration once; before each iteration evaluate the condition (must be `bool`); after each iteration (including after `continue`) run the step.
 
-The loop variable is mutable in the body. **[Proposed]** The compiler emits a hint when a C-style loop is a plain counting loop (`var i = a; i < b; i += 1`, `i` not modified in the body) suggesting the range form.
+The loop variable is mutable in the body. The compiler emits a non-fatal **hint** when a C-style loop is a plain counting loop (`var i = a; i < b; i += 1`, `i` not modified in the body), suggesting the range form.
 
 ### 6.8 `break` and `continue`
 - `break` exits the innermost loop.
 - `continue` skips to the next iteration of the innermost loop (running the step of a C-style loop, or advancing a range loop).
 
-**[Proposed] Labels** for nested loops:
+**Labels** target an enclosing loop from a nested one. A label is written `name:` immediately before `loop` and may be used by `break name` or `continue name`. A label on anything other than `loop`, or an unknown label, is a compile error.
 ```
 outer: loop y in 0..h {
     loop x in 0..w {
@@ -468,70 +469,123 @@ IEEE-754 semantics. Floating-point arithmetic is never checked (infinities and N
 ---
 
 ## 9. Built-ins
+Built-ins are predeclared identifiers (not keywords); they cannot be shadowed (§4.5).
+
 | Built-in | Description |
 |---|---|
-| `print(x)` | prints an integer, float, `bool`, pointer, or `str`, followed by a newline |
+| `print(x)` | prints an integer, float, `bool`, enum, pointer, or `str`, followed by a newline |
 | `print(fmt, args...)` | formatted output: `fmt` is a string literal using `{}` placeholders for each argument (`{{` and `}}` escape literal braces), followed by a newline |
+| `len(x)` | element count of an array (untyped constant), slice, or `str` (`i64`) |
+| `sizeof(T_or_expr)` / `alignof(T_or_expr)` | compile-time size / alignment in bytes of a type or expression (untyped constant) |
+| `ptr_cast(*T, x)` | reinterprets a pointer, `str`, or 64-bit integer address `x` as pointer type `*T` (zero cost) |
+| `str(bytes)` | zero-copy `str` view of a `[]u8` or `[N]u8` |
+| `atomic_load(p: *i64): i64` | sequentially consistent 64-bit atomic load |
+| `atomic_store(p: *i64, v: i64)` | sequentially consistent 64-bit atomic store |
+| `atomic_add(p: *i64, d: i64): i64` | atomic fetch-and-add; returns the previous value |
+| `atomic_cas(p: *i64, expected: i64, desired: i64): i64` | atomic compare-and-swap; returns the previous value |
 | `exit(code: i32)` | terminates the process with `code` |
-| `rev(range)` | reverse range; only valid in a `loop` header |
-| `T(x)` | conversion to scalar type `T` (§2.3) |
+| `rev(range)` | reverse range; only valid in a `loop` header (§6.6) |
+| `T(x)` | conversion to scalar or enum type `T` (§2.3) |
+
+The atomic built-ins reject `*const i64` arguments (§2.5).
 
 ---
 
 ## 10. Grammar (EBNF)
 
-`TERM` is a statement terminator (inserted newline, §1.3).
+`TERM` is a statement terminator (inserted newline, §1.3). `IntLit` includes character literals (§1.9); `StrLit` includes raw strings (§1.8).
 
 ```ebnf
+(* ---- Declarations ---- *)
 File        = { TopDecl TERM } ;
-TopDecl     = [ "pub" | "priv" ] ( FnDecl | StructDecl | EnumDecl | TypeDecl | VarDecl | ConstDecl ) ;
+TopDecl     = ImportDecl
+            | [ "pub" | "priv" ] ( FnDecl | StructDecl | EnumDecl | TypeDecl
+                                 | VarDecl | ConstDecl | ExternDecl ) ;
+ImportDecl  = "import" StrLit ;
+ExternDecl  = "extern" StrLit ( FnHeader | "{" { FnHeader TERM } "}" ) ;
 
-TypeDecl    = "type" Ident [ "[" Ident { "," Ident } "]" ] "=" Type ;
-FnDecl      = "fn" Ident "(" [ Params ] ")" [ ":" Type ] Block ;
+TypeParams  = "[" Ident { "," Ident } "]" ;
+TypeDecl    = "type" Ident [ TypeParams ] "=" Type ;
+StructDecl  = "struct" Ident [ TypeParams ] "{" { Field ( TERM | "," ) } "}" ;
+Field       = Ident [ Dims ] ":" Type ;
+EnumDecl    = "enum" Ident [ TypeParams ] "{" { Variant ( TERM | "," ) } "}" ;
+Variant     = Ident [ "(" Type ")" ] [ "=" Expr ] ;
+
+FnDecl      = FnHeader Block ;
+FnHeader    = "fn" [ TypeParams ] [ Receiver ] Ident [ TypeParams ]
+              "(" [ Params ] ")" [ ":" Type ] ;
+Receiver    = "(" Ident ":" Type ")" ;          (* T or *T, T a struct or enum *)
 Params      = Param { "," Param } [ "," ] ;
-Param       = Ident ":" Type ;
+Param       = Ident [ Dims ] ":" Type ;
+Dims        = "[" [ Expr ] "]" ;                 (* [N] array, [] slice *)
 
-VarDecl     = "var" Ident ( ":" Type [ "=" Expr ] | "=" Expr ) ;
+VarDecl     = "var" Ident [ Dims ] ( ":" Type [ "=" Expr ] | "=" Expr ) ;
 ConstDecl   = "const" Ident [ ":" Type ] "=" Expr ;
 
-Type        = Ident ;                          (* scalar types for now *)
+(* ---- Types ---- *)
+Type        = [ "[" Expr "]" | "[" "]" [ "const" ] ] PtrType ;
+PtrType     = { "*" [ "const" ] } BaseType ;
+BaseType    = Ident [ TypeArgs ] | FnType ;
+TypeArgs    = "[" Type { "," Type } "]" ;
+FnType      = "fn" "(" [ FnTypeParam { "," FnTypeParam } ] ")" [ ":" Type ] ;
+FnTypeParam = [ Ident ":" ] Type ;
 
+(* ---- Statements ---- *)
 Block       = "{" { Stmt TERM } "}" ;
-Stmt        = VarDecl | ConstDecl | Assign | ExprStmt
-            | IfStmt | LoopStmt | ReturnStmt
-            | "break" [ Ident ] | "continue" [ Ident ]
-            | Ident ":" LoopStmt ;             (* labeled loop *)
+Stmt        = VarDecl | ConstDecl | TypeDecl | Assign | CallStmt
+            | IfStmt | MatchStmt | [ Ident ":" ] LoopStmt
+            | DeferStmt | ReturnStmt | Block
+            | "break" [ Ident ] | "continue" [ Ident ] ;
 
-Assign      = Ident AssignOp Expr ;
+Assign      = LValue AssignOp Expr ;
+LValue      = Ident | Postfix | "*" Unary ;      (* Postfix ending in .field or [index] *)
 AssignOp    = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^="
             | "<<=" | ">>=" | "+%=" | "-%=" | "*%=" ;
-ExprStmt    = CallExpr ;                       (* only calls may be statements *)
+CallStmt    = Postfix ;                          (* must end in a call or `?` *)
+DeferStmt   = "defer" ( Block | Stmt ) ;
 ReturnStmt  = "return" [ Expr ] ;
 
 IfStmt      = "if" Expr Block [ "else" ( IfStmt | Block ) ] ;
+MatchStmt   = "match" Expr "{" { MatchArm TERM } [ "else" Block TERM ] "}" ;
+MatchArm    = Expr { "," Expr } Block ;
 
-LoopStmt    = "loop" ( Block                                   (* infinite    *)
-                     | Ident "in" RangeExpr Block              (* range       *)
-                     | VarDecl ";" Expr ";" Assign Block       (* C-style     *)
-                     | Expr Block ) ;                          (* conditional *)
+LoopStmt    = "loop" ( Block                                       (* infinite    *)
+                     | Ident "in" RangeExpr Block                  (* range       *)
+                     | Ident [ "," Ident ] "in" Expr Block         (* collection  *)
+                     | VarDecl ";" Expr ";" Ident AssignOp Expr Block  (* C-style *)
+                     | Expr Block ) ;                              (* conditional *)
 RangeExpr   = Range | "rev" "(" Range ")" ;
 Range       = Expr ".." Expr [ "by" Expr ] ;
 
+(* ---- Expressions ---- *)
 Expr        = OrExpr ;
 OrExpr      = AndExpr { "||" AndExpr } ;
 AndExpr     = CmpExpr { "&&" CmpExpr } ;
 CmpExpr     = AddExpr [ CmpOp AddExpr ] ;
+CmpOp       = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 AddExpr     = MulExpr { ( "+" | "-" | "+%" | "-%" | "|" | "^" ) MulExpr } ;
 MulExpr     = Unary { ( "*" | "/" | "%" | "*%" | "<<" | ">>" | "&" ) Unary } ;
-Unary       = ( "-" | "!" | "~" ) Unary | Primary ;
-Primary     = IntLit | FloatLit | StrLit | "true" | "false"
-            | Ident | CallExpr | "(" Expr ")" ;
-CallExpr    = Ident "(" [ Expr { "," Expr } [ "," ] ] ")" ;
+Unary       = ( "-" | "!" | "~" | "&" | "*" ) Unary | Postfix ;
+Postfix     = Primary { "." Ident | Args | "[" Index "]" | "?" } ;
+Index       = Expr | [ Expr ] ".." [ Expr ] ;
+Args        = "(" [ Expr { "," Expr } [ "," ] ] ")" ;
+Primary     = IntLit | FloatLit | StrLit | "true" | "false" | "null"
+            | Ident [ TypeArgs ] [ StructLit ]
+            | "." Ident                          (* inferred enum variant *)
+            | ArrayLit | FnLit | "(" Expr ")" ;
+StructLit   = "{" [ FieldInit { ( "," | TERM ) FieldInit } [ "," ] ] "}" ;
+FieldInit   = Ident ":" Expr ;
+ArrayLit    = "[" [ Expr { "," Expr } [ "," ] ] "]" ;
+FnLit       = "fn" "(" [ Params ] ")" [ ":" Type ] Block ;
 ```
 
 Notes:
-- Every `loop` form is chosen by at most two tokens of lookahead (`{`, `Ident "in"`, `var`, otherwise expression).
+- The `loop` form is chosen by at most four tokens of lookahead (`{`, `Ident "in"`, `Ident "," Ident "in"`, `var`, otherwise expression). A range header is recognized by the `..` after its first expression.
 - `..` and `by` bind looser than all expression operators: `0..n+1` means `0..(n+1)`.
+- After an identifier in an expression, `[` opens a type-argument list (`max[i64](a, b)`, `Pair[i32, str] { ... }`) only if the bracket contents are syntactically types and are followed by `(`, `.`, or `{`, or contain a top-level `,`; otherwise it is indexing or slicing.
+- A `StructLit` may not appear at the top level of an `if`, `loop`, or `match` header unless enclosed in `( ... )` (§2.6).
+- A postfix `[]` on a declared name may be followed by `const` in the type: `var s[]: const u8`.
+- `,` and newlines may be used interchangeably between struct fields, enum variants, and struct-literal field initializers.
 
 ---
 
@@ -606,12 +660,24 @@ fn main() {
 | D10 | Ranges | `..` half-open only; `by` step; `rev()` reverse |
 | D11 | Conversions | no implicit conversions; `T(x)` |
 | D12 | Assignment | statement, not expression |
+| D13 | Comments | `//` line comments only; no block comments |
+| D14 | Shadowing | not allowed within a function; types and built-ins can never be shadowed |
+| D15 | Top-level `var` | allowed, constant initializer only (no start-up code) |
+| D16 | Parameters | read-only; mutate through a pointer parameter |
+| D17 | Entry point | `fn main()` with no parameters or result; `exit(code)` sets the exit code |
+| D18 | Nested loop control | `label: loop`, `break label`, `continue label` |
+| D19 | Visibility | per-file `pub` / `priv`; any `pub` makes the file's other declarations private |
+| D20 | Generics | `[T]` type parameters, monomorphized at compile time; type arguments inferred from value arguments |
+| D21 | Error handling | tagged unions (`Result`/`Option` shape) plus postfix `?`; no exceptions |
 
 ## 13. Open Items
 
-1. Sections marked **[Proposed]**: comments, shadowing, top-level `var`, read-only parameters, `main`/`exit`, labels, built-ins.
-2. Arrays and slices (and `loop x in arr`).
-3. Structs, and the brace-ambiguity rule for struct literals in conditions.
-4. Strings (full ownership/allocation design beyond `str` views and `std/str.sb`).
-5. Generic type inference for nested generic type arguments.
-6. Self-hosting / cross-platform backends (Linux/macOS ELF/Mach-O).
+Planned work:
+1. Strings: an ownership/allocation design beyond `str` views and `std/str.sb`'s `StringBuilder`.
+2. Generic type-argument inference through nested generic types.
+3. Ranges as first-class values (currently valid only in `loop` headers, §6.6).
+4. A `fast` build mode in which overflow is undefined behavior (§8.3).
+5. Additional targets (Linux ELF, macOS Mach-O) and self-hosting.
+
+Known implementation limits of `sbc`:
+- A function may declare at most 63 local variables **without an initializer** (`var x: T`); definite-assignment analysis (§4.2) tracks them in a 64-bit set. Variables declared with an initializer, and array/struct locals, do not count toward this limit. Exceeding it is a compile error.

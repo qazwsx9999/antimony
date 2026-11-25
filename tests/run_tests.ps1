@@ -2454,4 +2454,186 @@ Test-RunLlvm "phase21_std_math_llvm" $math_test_code $math_test_expected
 
 Test-CompileError "math_priv_crt_hidden" "import `"std/math.sb`"`nfn main() { print(_isnan(1.0)) }" "cannot access private"
 
+# 31. Phase 22: Hardened & Expanded Standard Library (core, vec, map, set, deque, sort, str, io, fs, path, os, time, rand, thread, mem, math)
+$stdlib_v2_code = @'
+import "std/core.sb"
+import "std/mem.sb"
+import "std/vec.sb"
+import "std/map.sb"
+import "std/set.sb"
+import "std/deque.sb"
+import "std/sort.sb"
+import "std/str.sb"
+import "std/io.sb"
+import "std/fs.sb"
+import "std/path.sb"
+import "std/os.sb"
+import "std/time.sb"
+import "std/thread.sb"
+import "std/rand.sb"
+import "std/math.sb"
+
+fn test_file_io(path: str): Result[i64, IoError] {
+    var f = file_create(path)?
+    var n1 = f.write_str("hello ")?
+    var n2 = f.write_str("antimony")?
+    f.flush()?
+    f.close()
+
+    var sb: StringBuilder
+    sb.init(32)
+    defer sb.free()
+    var got = read_file_all(path, &sb)?
+    assert(sb.as_str() == "hello antimony", "read_file_all content")
+    assert(got == n1 + n2, "read_file_all len")
+
+    var f2 = file_open(path)?
+    defer f2.close()
+    var pos = f2.seek(.Start(6))?
+    assert(pos == 6, "seek pos")
+    var tail[8]: u8 = []
+    var nr = f2.read(tail)?
+    assert(nr == 8 && str(tail) == "antimony", "seek read")
+    return .Ok(got)
+}
+
+fn main() {
+    // core: Option, Result, swap
+    var a = 10
+    var b = 20
+    swap(&a, &b)
+    print("core={} {}", a, b)
+
+    // Vec: extend_slice, insert, remove, swap_remove, try_get, first/last
+    var v: Vec[i32]
+    v.init(2)
+    defer v.free()
+    var seed[3]: i32 = [10, 20, 30]
+    v.extend_slice(seed)
+    v.insert(1, 15)
+    var rm = v.remove(1)
+    var sr = v.swap_remove(0)
+    print("vec={} {} {} {} {}", rm, sr, v.get(0), v.try_get(99).is_none(), v.last().unwrap_or(-1))
+
+    // HashMap: tombstone churn + get_ptr + take
+    var m: HashMap[i64, i64]
+    m.init(16)
+    defer m.free()
+    loop i in 0..i64(40) {
+        m.put(i, i * 10)
+        if i >= 10 {
+            m.remove(i - 10)
+        }
+    }
+    var vp = m.get_ptr(35)
+    *vp = 999
+    print("map={} {} {}", m.len, m.take(35).unwrap_or(0), m.contains(35))
+
+    // HashSet + Deque
+    var hs: HashSet[str]
+    hs.init(8)
+    defer hs.free()
+    var ins1 = hs.insert("rust")
+    var ins2 = hs.insert("rust")
+    hs.insert("go")
+    var rem1 = hs.remove("rust")
+    print("set={} {} {} {} {}", ins1, ins2, rem1, hs.len, hs.contains("go"))
+
+    var dq: Deque[i32]
+    dq.init(4)
+    defer dq.free()
+    dq.push_back(2)
+    dq.push_front(1)
+    dq.push_back(3)
+    dq.push_front(0)
+    loop i in 4..12 {
+        dq.push_back(i)
+    }
+    print("deque={} {} {} {}", dq.len, dq.pop_front().unwrap_or(-1), dq.pop_back().unwrap_or(-1), dq.get(0).unwrap_or(-1))
+
+    // sort: lower_bound, upper_bound, O(N log N) sort_desc
+    var arr[6]: i32 = [5, 2, 2, 8, 1, 2]
+    sort(arr)
+    var lb = lower_bound(arr, 2)
+    var ub = upper_bound(arr, 2)
+    sort_desc(arr)
+    print("sort={} {} {} {}", lb, ub, arr[0], arr[5])
+
+    // str: search, split_once, strict Result parsers, StringBuilder formatting
+    var split_ok = false
+    match str_split_once("key=val=extra", "=") {
+        .Some(sp) { split_ok = sp.before == "key" && sp.after == "val=extra" }
+        .None     { split_ok = false }
+    }
+    var sb: StringBuilder
+    sb.init(32)
+    defer sb.free()
+    sb.append_replace("a-b-c", "-", "::")
+    sb.append(" 0x")
+    sb.append_hex(255)
+    print("str={} {} {} {} {} {}",
+          str_contains("antimony", "mony"),
+          str_count("ababa", "ab"),
+          split_ok,
+          try_parse_i64(" -42 ").unwrap_or(0),
+          try_parse_u64("18446744073709551616").is_err(),
+          sb.as_str())
+
+    // path + io + fs
+    var pj: StringBuilder
+    pj.init(32)
+    defer pj.free()
+    var joined = path_join(`C:\src`, `std\io.sb`, &pj)
+    print("path={} {} {} {}",
+          path_basename(`C:\src\main.sb`),
+          path_dirname(`C:\src\main.sb`),
+          path_extension(`C:\src\main.sb`),
+          joined)
+
+    var dir = `tests\tmp\phase22_fs_test`
+    var f1  = `tests\tmp\phase22_fs_test\a.txt`
+    var f2  = `tests\tmp\phase22_fs_test\b.txt`
+    if !fs_exists(dir) {
+        assert(fs_mkdir(dir).is_ok(), "mkdir")
+    }
+    var io_n = test_file_io(f1).unwrap_or(-1)
+    assert(fs_copy(f1, f2).is_ok(), "copy")
+    assert(fs_remove_file(f1).is_ok(), "rm f1")
+    assert(fs_rename(f2, f1).is_ok(), "rename")
+    assert(fs_remove_file(f1).is_ok(), "rm f1 final")
+    assert(fs_rmdir(dir).is_ok(), "rmdir")
+    print("fs={} {} {}", io_n, !fs_exists(dir), file_open(`tests\tmp\phase22_no_such_file.txt`).is_err())
+
+    // rand + os + time
+    var r1 = rng_from_seed(12345)
+    var r2 = rng_from_seed(12345)
+    var det = r1.next_u64() == r2.next_u64()
+    var ri = r1.range_i64(10, 20)
+    var shuf[4]: i32 = [1, 2, 3, 4]
+    rng_shuffle(&r1, shuf)
+    var rbytes[16]: u8 = []
+    var cwdbuf[512]: u8 = []
+    var sw = stopwatch_start()
+    print("rand={} {} {} {} {}", det, ri >= 10 && ri < 20, os_random_bytes(rbytes), cwd_into(cwdbuf).is_some(), sw.elapsed_us() >= 0)
+}
+'@
+$stdlib_v2_expected = @(
+    "core=20 10"
+    "vec=15 10 30 true 20"
+    "map=10 999 false"
+    "set=true false true 1 true"
+    "deque=12 0 11 1"
+    "sort=1 4 8 1"
+    "str=true 2 true -42 true a::b::c 0xff"
+    "path=main.sb C:\src .sb C:\src\std\io.sb"
+    "fs=14 true true"
+    "rand=true true true true true"
+) -join "`n"
+Test-RunOk   "phase22_stdlib_v2"      $stdlib_v2_code $stdlib_v2_expected
+Test-RunLlvm "phase22_stdlib_v2_llvm" $stdlib_v2_code $stdlib_v2_expected
+
+Test-CompileError "std_mem_priv_hidden"  "import `"std/mem.sb`"`nfn main() { print(GetProcessHeap()) }" "cannot access private"
+Test-CompileError "std_io_priv_hidden"   "import `"std/io.sb`"`nfn main() { print(GetLastError()) }"    "cannot access private"
+Test-CompileError "std_rand_priv_hidden" "import `"std/rand.sb`"`nfn main() { var x: u8 = 0`n print(BCryptGenRandom(0, &x, 1, 2)) }" "cannot access private"
+
 Write-Host "`nAll tests passed."

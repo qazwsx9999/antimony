@@ -1,22 +1,33 @@
-// std/str.sb - Null-terminated C string, ASCII byte slice, and StringBuilder utilities.
+// =============================================================================
+// Antimony Standard Library: std/str.sb
+// Zero-copy `str` utilities, ASCII classification, safe `Result` parsers,
+// C-string interop, and growable `StringBuilder` with formatting helpers.
+// =============================================================================
 
+import "std/core.sb"
 import "std/mem.sb"
 
-extern "msvcrt.dll" {
-    fn strlen(s: *u8): usize
-    fn strcmp(a: *u8, b: *u8): i32
+priv extern "msvcrt.dll" {
+    fn strlen(s: *const u8): usize
+    fn strcmp(a: *const u8, b: *const u8): i32
+}
+
+pub enum ParseError {
+    Empty
+    InvalidDigit
+    Overflow
 }
 
 // Wraps `n` bytes at `p` as a zero-copy `str`.
-fn str_from_ptr(p: *u8, n: usize): str {
+pub fn str_from_ptr(p: *const u8, n: usize): str {
     if p == null || n == 0 {
         return ""
     }
     return str(p[0..i64(n)])
 }
 
-// Wraps a null-terminated C string `*u8` as a zero-copy `str`.
-fn cstr_to_str(s: *u8): str {
+// Wraps a null-terminated C string `*const u8` as a zero-copy `str`.
+pub fn cstr_to_str(s: *const u8): str {
     if s == null {
         return ""
     }
@@ -27,14 +38,14 @@ fn cstr_to_str(s: *u8): str {
     return str(s[0..i64(n)])
 }
 
-fn cstr_len(s: *u8): usize {
+pub fn cstr_len(s: *const u8): usize {
     if s == null {
         return 0
     }
     return strlen(s)
 }
 
-fn cstr_eq(a: *u8, b: *u8): bool {
+pub fn cstr_eq(a: *const u8, b: *const u8): bool {
     if a == b {
         return true
     }
@@ -44,47 +55,94 @@ fn cstr_eq(a: *u8, b: *u8): bool {
     return strcmp(a, b) == 0
 }
 
-fn is_digit(c: u8): bool {
-    return c >= 48 && c <= 57
+// -----------------------------------------------------------------------------
+// ASCII Character Classification & Case Conversion
+// -----------------------------------------------------------------------------
+
+pub fn is_digit(c: u8): bool {
+    return c >= '0' && c <= '9'
 }
 
-fn is_alpha(c: u8): bool {
-    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+pub fn is_hex_digit(c: u8): bool {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
-fn is_space(c: u8): bool {
-    return c == 32 || c == 9 || c == 10 || c == 13
+pub fn is_alpha(c: u8): bool {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_'
 }
 
-// Parses a signed decimal integer from a byte slice `s[]`.
-fn parse_i64(s[]: u8): i64 {
-    var n = len(s)
-    var i: i64 = 0
-    loop i < n && is_space(s[i]) {
-        i += 1
+pub fn is_alnum(c: u8): bool {
+    return is_alpha(c) || is_digit(c)
+}
+
+pub fn is_upper(c: u8): bool {
+    return c >= 'A' && c <= 'Z'
+}
+
+pub fn is_lower(c: u8): bool {
+    return c >= 'a' && c <= 'z'
+}
+
+pub fn is_space(c: u8): bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 11 || c == 12
+}
+
+pub fn to_lower_byte(c: u8): u8 {
+    if c >= 'A' && c <= 'Z' {
+        return c + 32
     }
-    var neg = false
-    if i < n {
-        if s[i] == 45 {
-            neg = true
-            i += 1
-        } else if s[i] == 43 {
-            i += 1
+    return c
+}
+
+pub fn to_upper_byte(c: u8): u8 {
+    if c >= 'a' && c <= 'z' {
+        return c - 32
+    }
+    return c
+}
+
+// -----------------------------------------------------------------------------
+// Zero-Copy `str` Inspection, Search, Slicing, and Comparison
+// -----------------------------------------------------------------------------
+
+// Lexicographical byte comparison: returns `< 0`, `0`, or `> 0`.
+pub fn str_cmp(a: str, b: str): i32 {
+    var na = len(a)
+    var nb = len(b)
+    var m = na
+    if nb < m {
+        m = nb
+    }
+    if m > 0 {
+        var c = cmp_mem(ptr_cast(*const u8, a), ptr_cast(*const u8, b), usize(m))
+        if c != 0 {
+            return c
         }
     }
-    var acc: i64 = 0
-    loop i < n && is_digit(s[i]) {
-        acc = acc * 10 + i64(s[i] - 48)
-        i += 1
+    if na < nb {
+        return -1
     }
-    if neg {
-        return -acc
+    if na > nb {
+        return 1
     }
-    return acc
+    return 0
 }
 
-// Returns true if `s` begins with `prefix`.
-fn str_starts_with(s: str, prefix: str): bool {
+// Case-insensitive ASCII string equality.
+pub fn str_eq_ignore_ascii_case(a: str, b: str): bool {
+    var n = len(a)
+    if n != len(b) {
+        return false
+    }
+    loop i in 0..n {
+        if to_lower_byte(a[i]) != to_lower_byte(b[i]) {
+            return false
+        }
+    }
+    return true
+}
+
+pub fn str_starts_with(s: str, prefix: str): bool {
     var plen = len(prefix)
     if len(s) < plen {
         return false
@@ -92,8 +150,7 @@ fn str_starts_with(s: str, prefix: str): bool {
     return s[0..plen] == prefix
 }
 
-// Returns true if `s` ends with `suffix`.
-fn str_ends_with(s: str, suffix: str): bool {
+pub fn str_ends_with(s: str, suffix: str): bool {
     var slen = len(s)
     var xlen = len(suffix)
     if slen < xlen {
@@ -102,8 +159,39 @@ fn str_ends_with(s: str, suffix: str): bool {
     return s[slen - xlen..slen] == suffix
 }
 
+pub fn str_strip_prefix(s: str, prefix: str): Option[str] {
+    if !str_starts_with(s, prefix) {
+        return .None
+    }
+    return .Some(s[len(prefix)..len(s)])
+}
+
+pub fn str_strip_suffix(s: str, suffix: str): Option[str] {
+    if !str_ends_with(s, suffix) {
+        return .None
+    }
+    return .Some(s[0..len(s) - len(suffix)])
+}
+
+pub fn str_trim_start(s: str): str {
+    var lo: i64 = 0
+    var hi: i64 = len(s)
+    loop lo < hi && is_space(s[lo]) {
+        lo += 1
+    }
+    return s[lo..hi]
+}
+
+pub fn str_trim_end(s: str): str {
+    var hi: i64 = len(s)
+    loop hi > 0 && is_space(s[hi - 1]) {
+        hi -= 1
+    }
+    return s[0..hi]
+}
+
 // Trims leading and trailing ASCII whitespace from `s`.
-fn str_trim(s: str): str {
+pub fn str_trim(s: str): str {
     var lo: i64 = 0
     var hi: i64 = len(s)
     loop lo < hi && is_space(s[lo]) {
@@ -116,7 +204,7 @@ fn str_trim(s: str): str {
 }
 
 // Returns the first index of byte `b` in `s`, or -1 if not found.
-fn str_find_byte(s: str, b: u8): i64 {
+pub fn str_find_byte(s: str, b: u8): i64 {
     loop i, ch in s {
         if ch == b {
             return i
@@ -125,23 +213,263 @@ fn str_find_byte(s: str, b: u8): i64 {
     return -1
 }
 
-// Parses a signed decimal integer directly from a `str` slice.
-fn str_parse_i64(s: str): i64 {
+// Returns the last index of byte `b` in `s`, or -1 if not found.
+pub fn str_rfind_byte(s: str, b: u8): i64 {
+    var i = len(s) - 1
+    loop i >= 0 {
+        if s[i] == b {
+            return i
+        }
+        i -= 1
+    }
+    return -1
+}
+
+// Returns the first index of substring `needle` in `haystack`, or -1 if not found.
+pub fn str_find(haystack: str, needle: str): i64 {
+    var n = len(haystack)
+    var m = len(needle)
+    if m == 0 {
+        return 0
+    }
+    if m > n {
+        return -1
+    }
+    var first = needle[0]
+    var limit = n - m
+    var i: i64 = 0
+    loop i <= limit {
+        if haystack[i] == first {
+            if haystack[i..i + m] == needle {
+                return i
+            }
+        }
+        i += 1
+    }
+    return -1
+}
+
+// Returns true if `haystack` contains substring `needle`.
+pub fn str_contains(haystack: str, needle: str): bool {
+    return str_find(haystack, needle) >= 0
+}
+
+// Counts non-overlapping occurrences of `needle` in `haystack`.
+pub fn str_count(haystack: str, needle: str): i64 {
+    var n = len(haystack)
+    var m = len(needle)
+    if m == 0 || m > n {
+        return 0
+    }
+    var count: i64 = 0
+    var i: i64 = 0
+    var limit = n - m
+    var first = needle[0]
+    loop i <= limit {
+        if haystack[i] == first && haystack[i..i + m] == needle {
+            count += 1
+            i += m
+        } else {
+            i += 1
+        }
+    }
+    return count
+}
+
+pub struct SplitPair {
+    before: str
+    after: str
+}
+
+// Splits `s` at the first occurrence of `sep` (like Rust's `str::split_once`).
+pub fn str_split_once(s: str, sep: str): Option[SplitPair] {
+    var idx = str_find(s, sep)
+    if idx < 0 {
+        return .None
+    }
+    return .Some(SplitPair {
+        before: s[0..idx],
+        after: s[idx + len(sep)..len(s)]
+    })
+}
+
+// -----------------------------------------------------------------------------
+// Integer Parsing (Safe `Result` Parsers + Legacy Convenience Helpers)
+// -----------------------------------------------------------------------------
+
+// Strictly parses an unsigned 64-bit decimal integer with overflow checking.
+pub fn try_parse_u64(s: str): Result[u64, ParseError] {
     var t = str_trim(s)
     var n = len(t)
+    if n == 0 {
+        return .Err(.Empty)
+    }
+    var i: i64 = 0
+    if t[0] == '+' {
+        i = 1
+        if i >= n {
+            return .Err(.InvalidDigit)
+        }
+    }
+    var acc: u64 = 0
+    var max_div10: u64 = 1844674407370955161
+    loop i < n {
+        var c = t[i]
+        if !is_digit(c) {
+            return .Err(.InvalidDigit)
+        }
+        var d = u64(c - '0')
+        if acc > max_div10 || (acc == max_div10 && d > 5) {
+            return .Err(.Overflow)
+        }
+        acc = acc * 10 + d
+        i += 1
+    }
+    return .Ok(acc)
+}
+
+// Strictly parses a signed 64-bit decimal integer with overflow checking (including i64 MIN).
+pub fn try_parse_i64(s: str): Result[i64, ParseError] {
+    var t = str_trim(s)
+    var n = len(t)
+    if n == 0 {
+        return .Err(.Empty)
+    }
     var i: i64 = 0
     var neg = false
+    if t[0] == '-' {
+        neg = true
+        i = 1
+    } else if t[0] == '+' {
+        i = 1
+    }
+    if i >= n {
+        return .Err(.InvalidDigit)
+    }
+    var limit: u64 = 9223372036854775807
+    if neg {
+        limit = 9223372036854775808
+    }
+    var acc: u64 = 0
+    loop i < n {
+        var c = t[i]
+        if !is_digit(c) {
+            return .Err(.InvalidDigit)
+        }
+        var d = u64(c - '0')
+        if acc > limit / 10 || (acc == limit / 10 && d > limit % 10) {
+            return .Err(.Overflow)
+        }
+        acc = acc * 10 + d
+        i += 1
+    }
+    if neg {
+        if acc == 9223372036854775808 {
+            return .Ok(-9223372036854775808)
+        }
+        return .Ok(-i64(acc))
+    }
+    return .Ok(i64(acc))
+}
+
+// Strictly parses a 64-bit floating-point number (optional sign, integer/fraction, optional e/E exponent).
+pub fn try_parse_f64(s: str): Result[f64, ParseError] {
+    var t = str_trim(s)
+    var n = len(t)
+    if n == 0 {
+        return .Err(.Empty)
+    }
+    var i: i64 = 0
+    var neg = false
+    if t[0] == '-' {
+        neg = true
+        i = 1
+    } else if t[0] == '+' {
+        i = 1
+    }
+    var has_digits = false
+    var val: f64 = 0.0
+    loop i < n && is_digit(t[i]) {
+        val = val * 10.0 + f64(t[i] - '0')
+        has_digits = true
+        i += 1
+    }
+    if i < n && t[i] == '.' {
+        i += 1
+        var frac_scale: f64 = 0.1
+        loop i < n && is_digit(t[i]) {
+            val = val + f64(t[i] - '0') * frac_scale
+            frac_scale = frac_scale * 0.1
+            has_digits = true
+            i += 1
+        }
+    }
+    if !has_digits {
+        return .Err(.InvalidDigit)
+    }
+    if i < n && (t[i] == 'e' || t[i] == 'E') {
+        i += 1
+        var exp_neg = false
+        if i < n && t[i] == '-' {
+            exp_neg = true
+            i += 1
+        } else if i < n && t[i] == '+' {
+            i += 1
+        }
+        if i >= n || !is_digit(t[i]) {
+            return .Err(.InvalidDigit)
+        }
+        var exp: i32 = 0
+        loop i < n && is_digit(t[i]) {
+            if exp < 400 {
+                exp = exp * 10 + i32(t[i] - '0')
+            }
+            i += 1
+        }
+        var p: f64 = 1.0
+        var base: f64 = 10.0
+        var e = exp
+        loop e > 0 {
+            if (e & 1) != 0 {
+                p = p * base
+            }
+            base = base * base
+            e >>= 1
+        }
+        if exp_neg {
+            val = val / p
+        } else {
+            val = val * p
+        }
+    }
+    if i != n {
+        return .Err(.InvalidDigit)
+    }
+    if neg {
+        val = -val
+    }
+    return .Ok(val)
+}
+
+// Parses a signed decimal integer from a byte slice `s[]` (lenient).
+pub fn parse_i64(s[]: const u8): i64 {
+    var n = len(s)
+    var i: i64 = 0
+    loop i < n && is_space(s[i]) {
+        i += 1
+    }
+    var neg = false
     if i < n {
-        if t[i] == 45 {
+        if s[i] == '-' {
             neg = true
             i += 1
-        } else if t[i] == 43 {
+        } else if s[i] == '+' {
             i += 1
         }
     }
     var acc: i64 = 0
-    loop i < n && is_digit(t[i]) {
-        acc = acc * 10 + i64(t[i] - 48)
+    loop i < n && is_digit(s[i]) {
+        acc = acc * 10 + i64(s[i] - '0')
         i += 1
     }
     if neg {
@@ -150,14 +478,42 @@ fn str_parse_i64(s: str): i64 {
     return acc
 }
 
-// Dynamic heap-backed string builder (always keeps a trailing '\0' byte).
-struct StringBuilder {
+// Parses a signed decimal integer directly from a `str` slice (lenient).
+pub fn str_parse_i64(s: str): i64 {
+    var t = str_trim(s)
+    var n = len(t)
+    var i: i64 = 0
+    var neg = false
+    if i < n {
+        if t[i] == '-' {
+            neg = true
+            i += 1
+        } else if t[i] == '+' {
+            i += 1
+        }
+    }
+    var acc: i64 = 0
+    loop i < n && is_digit(t[i]) {
+        acc = acc * 10 + i64(t[i] - '0')
+        i += 1
+    }
+    if neg {
+        return -acc
+    }
+    return acc
+}
+
+// -----------------------------------------------------------------------------
+// Growable StringBuilder (always keeps a trailing '\0' byte for C/Win32 interop)
+// -----------------------------------------------------------------------------
+
+pub struct StringBuilder {
     buf: *u8
     len: usize
     cap: usize
 }
 
-fn (sb: *StringBuilder) init(initial_cap: usize) {
+pub fn (sb: *StringBuilder) init(initial_cap: usize) {
     var c = initial_cap
     if c < 16 {
         c = 16
@@ -167,8 +523,8 @@ fn (sb: *StringBuilder) init(initial_cap: usize) {
     sb.cap = c
 }
 
-fn (sb: *StringBuilder) ensure(extra: usize) {
-    if sb.len + extra <= sb.cap {
+pub fn (sb: *StringBuilder) ensure(extra: usize) {
+    if sb.buf != null && sb.len + extra <= sb.cap {
         return
     }
     var new_cap = sb.cap * 2
@@ -182,41 +538,63 @@ fn (sb: *StringBuilder) ensure(extra: usize) {
     sb.cap = new_cap
 }
 
-fn (sb: *StringBuilder) append_byte(b: u8) {
+pub fn (sb: *StringBuilder) append_byte(b: u8) {
     sb.ensure(1)
     sb.buf[sb.len] = b
     sb.len += 1
     sb.buf[sb.len] = 0
 }
 
-fn (sb: *StringBuilder) append(s: str) {
+pub fn (sb: *StringBuilder) append_bytes(data[]: const u8) {
+    var n = usize(len(data))
+    if n == 0 {
+        return
+    }
+    sb.ensure(n)
+    copy_mem(sb.buf + sb.len, &data[0], n)
+    sb.len += n
+    sb.buf[sb.len] = 0
+}
+
+pub fn (sb: *StringBuilder) append(s: str) {
     var n = usize(len(s))
     if n == 0 {
         return
     }
     sb.ensure(n)
-    copy_mem(sb.buf + sb.len, ptr_cast(*u8, s), n)
+    copy_mem(sb.buf + sb.len, ptr_cast(*const u8, s), n)
     sb.len += n
     sb.buf[sb.len] = 0
 }
 
-fn (sb: *StringBuilder) append_i64(val: i64) {
+pub fn (sb: *StringBuilder) append_repeat(s: str, count: i64) {
+    if count <= 0 || len(s) == 0 {
+        return
+    }
+    sb.ensure(usize(len(s)) * usize(count))
+    loop i in 0..count {
+        sb.append(s)
+    }
+}
+
+pub fn (sb: *StringBuilder) append_bool(b: bool) {
+    if b {
+        sb.append("true")
+    } else {
+        sb.append("false")
+    }
+}
+
+pub fn (sb: *StringBuilder) append_u64(val: u64) {
     if val == 0 {
-        sb.append_byte(48)
+        sb.append_byte('0')
         return
     }
     var tmp[24]: u8
     var k: i64 = 0
-    var u: u64 = 0
-    if val < 0 {
-        sb.append_byte(45)
-        // -(val + 1) never overflows (even for i64 MIN); add 1 back in unsigned space.
-        u = u64(-(val + 1)) + 1
-    } else {
-        u = u64(val)
-    }
+    var u = val
     loop u > 0 {
-        tmp[k] = u8(48 + (u % 10))
+        tmp[k] = u8('0' + (u % 10))
         u /= 10
         k += 1
     }
@@ -226,27 +604,108 @@ fn (sb: *StringBuilder) append_i64(val: i64) {
     }
 }
 
-fn (sb: *StringBuilder) clear() {
+pub fn (sb: *StringBuilder) append_i64(val: i64) {
+    if val == 0 {
+        sb.append_byte('0')
+        return
+    }
+    var u: u64 = 0
+    if val < 0 {
+        sb.append_byte('-')
+        // -(val + 1) never overflows (even for i64 MIN); add 1 back in unsigned space.
+        u = u64(-(val + 1)) + 1
+    } else {
+        u = u64(val)
+    }
+    sb.append_u64(u)
+}
+
+// Appends `val` formatted in lowercase hexadecimal (without `0x` prefix).
+pub fn (sb: *StringBuilder) append_hex(val: u64) {
+    if val == 0 {
+        sb.append_byte('0')
+        return
+    }
+    var digits = "0123456789abcdef"
+    var tmp[20]: u8
+    var k: i64 = 0
+    var u = val
+    loop u > 0 {
+        tmp[k] = digits[i64(u & 15)]
+        u >>= 4
+        k += 1
+    }
+    loop k > 0 {
+        k -= 1
+        sb.append_byte(tmp[k])
+    }
+}
+
+// Appends `s` with all occurrences of `old_sub` replaced by `new_sub`.
+pub fn (sb: *StringBuilder) append_replace(s: str, old_sub: str, new_sub: str) {
+    var m = len(old_sub)
+    if m == 0 {
+        sb.append(s)
+        return
+    }
+    var cur = s
+    loop {
+        var idx = str_find(cur, old_sub)
+        if idx < 0 {
+            sb.append(cur)
+            return
+        }
+        sb.append(cur[0..idx])
+        sb.append(new_sub)
+        cur = cur[idx + m..len(cur)]
+    }
+}
+
+pub fn (sb: *StringBuilder) append_lower(s: str) {
+    var n = len(s)
+    sb.ensure(usize(n))
+    loop i in 0..n {
+        sb.append_byte(to_lower_byte(s[i]))
+    }
+}
+
+pub fn (sb: *StringBuilder) append_upper(s: str) {
+    var n = len(s)
+    sb.ensure(usize(n))
+    loop i in 0..n {
+        sb.append_byte(to_upper_byte(s[i]))
+    }
+}
+
+pub fn (sb: *StringBuilder) clear() {
     sb.len = 0
     if sb.buf != null {
         sb.buf[0] = 0
     }
 }
 
-fn (sb: *StringBuilder) free() {
+pub fn (sb: *StringBuilder) free() {
     free_mem(sb.buf)
     sb.buf = null
     sb.len = 0
     sb.cap = 0
 }
 
-fn (sb: StringBuilder) as_str(): str {
+pub fn (sb: StringBuilder) as_str(): str {
     if sb.buf == null || sb.len == 0 {
         return ""
     }
     return str(sb.buf[0..i64(sb.len)])
 }
 
-fn (sb: StringBuilder) cstr(): *u8 {
+pub fn (sb: StringBuilder) as_bytes(): []const u8 {
+    if sb.buf == null || sb.len == 0 {
+        var empty: *const u8 = sb.buf
+        return empty[0..0]
+    }
+    return sb.buf[0..i64(sb.len)]
+}
+
+pub fn (sb: StringBuilder) cstr(): *u8 {
     return sb.buf
 }

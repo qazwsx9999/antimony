@@ -1,0 +1,83 @@
+// =============================================================================
+// Antimony Standard Library: std/core.sb
+// Core algebraic types (`Option[T]`, `Result[T, E]`, `Ordering`), assertions,
+// panics, and generic value utilities.
+// =============================================================================
+
+pub enum Option[T] {
+    Some(T)
+    None
+}
+
+pub fn (o: Option[T]) is_some(): bool {
+    match o {
+        .Some(_) { return true }
+        .None    { return false }
+    }
+}
+
+pub fn (o: Option[T]) is_none(): bool {
+    match o {
+        .Some(_) { return false }
+        .None    { return true }
+    }
+}
+
+pub fn (o: Option[T]) unwrap_or(default_val: T): T {
+    match o {
+        .Some(v) { return v }
+        .None    { return default_val }
+    }
+}
+
+pub enum Result[T, E] {
+    Ok(T)
+    Err(E)
+}
+
+pub fn (r: Result[T, E]) is_ok(): bool {
+    match r {
+        .Ok(_)  { return true }
+        .Err(_) { return false }
+    }
+}
+
+pub fn (r: Result[T, E]) is_err(): bool {
+    match r {
+        .Ok(_)  { return false }
+        .Err(_) { return true }
+    }
+}
+
+pub fn (r: Result[T, E]) unwrap_or(default_val: T): T {
+    match r {
+        .Ok(v)  { return v }
+        .Err(_) { return default_val }
+    }
+}
+
+pub enum Ordering {
+    Less = -1
+    Equal = 0
+    Greater = 1
+}
+
+// Prints a fatal panic message and terminates the process with exit code 1.
+pub fn panic(msg: str) {
+    print("panic: {}", msg)
+    exit(1)
+}
+
+// Panics with `msg` if `cond` is false.
+pub fn assert(cond: bool, msg: str) {
+    if !cond {
+        panic(msg)
+    }
+}
+
+// Swaps the values pointed to by `a` and `b`.
+pub fn swap[T](a: *T, b: *T) {
+    var tmp = *a
+    *a = *b
+    *b = tmp
+}

@@ -1,0 +1,130 @@
+// =============================================================================
+// Antimony Standard Library: std/rand.sb
+// Fast deterministic PRNG (`Rng` using xoshiro256++ seeded via SplitMix64) and
+// OS cryptographic random bytes (`os_random_bytes` via Win32 `bcrypt.dll`).
+// =============================================================================
+
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002
+
+priv extern "bcrypt.dll" {
+    fn BCryptGenRandom(hAlgorithm: usize, pbBuffer: *u8, cbBuffer: u32, dwFlags: u32): i32
+}
+
+// Fills `buf[]` with cryptographically secure random bytes from the OS CSPRNG.
+// Returns `true` on success.
+pub fn os_random_bytes(buf[]: u8): bool {
+    if len(buf) == 0 {
+        return true
+    }
+    var status = BCryptGenRandom(0, &buf[0], u32(len(buf)), BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    return status == 0
+}
+
+// Returns a cryptographically secure random `u64` from the OS CSPRNG.
+pub fn os_random_u64(): u64 {
+    var bytes[8]: u8 = []
+    os_random_bytes(bytes)
+    var p = ptr_cast(*const u64, &bytes[0])
+    return *p
+}
+
+priv fn splitmix64(state: *u64): u64 {
+    *state +%= 0x9E3779B97F4A7C15
+    var z = *state
+    z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) *% 0x94D049BB133111EB
+    return z ^ (z >> 31)
+}
+
+priv fn rotl64(x: u64, k: u64): u64 {
+    return (x << k) | (x >> (64 - k))
+}
+
+// Fast, high-quality 256-bit PRNG (xoshiro256++).
+pub struct Rng {
+    s[4]: u64
+}
+
+// Initializes an `Rng` deterministically from a 64-bit `seed`.
+pub fn rng_from_seed(seed: u64): Rng {
+    var sm = seed
+    var r = Rng {}
+    r.s[0] = splitmix64(&sm)
+    r.s[1] = splitmix64(&sm)
+    r.s[2] = splitmix64(&sm)
+    r.s[3] = splitmix64(&sm)
+    return r
+}
+
+// Initializes an `Rng` seeded directly from the OS cryptographic RNG.
+pub fn rng_from_os(): Rng {
+    var r = Rng {}
+    r.s[0] = os_random_u64()
+    r.s[1] = os_random_u64()
+    r.s[2] = os_random_u64()
+    r.s[3] = os_random_u64()
+    if (r.s[0] | r.s[1] | r.s[2] | r.s[3]) == 0 {
+        return rng_from_seed(0x853C49E6748FEA9B)
+    }
+    return r
+}
+
+// Generates the next uniform 64-bit unsigned integer.
+pub fn (r: *Rng) next_u64(): u64 {
+    var result = rotl64(r.s[0] +% r.s[3], 23) +% r.s[0]
+    var t = r.s[1] << 17
+
+    r.s[2] ^= r.s[0]
+    r.s[3] ^= r.s[1]
+    r.s[1] ^= r.s[2]
+    r.s[0] ^= r.s[3]
+
+    r.s[2] ^= t
+    r.s[3] = rotl64(r.s[3], 45)
+    return result
+}
+
+pub fn (r: *Rng) next_u32(): u32 {
+    return u32(r.next_u64() >> 32)
+}
+
+pub fn (r: *Rng) next_bool(): bool {
+    return (r.next_u64() >> 63) != 0
+}
+
+// Generates a uniform `f64` in `[0.0, 1.0)` with 53 bits of precision.
+pub fn (r: *Rng) next_f64(): f64 {
+    var bits = r.next_u64() >> 11
+    return f64(bits) * (1.0 / 9007199254740992.0)
+}
+
+// Generates an unbiased uniform integer in `[lo, hi)`. Returns `lo` if `hi <= lo`.
+pub fn (r: *Rng) range_i64(lo: i64, hi: i64): i64 {
+    if hi <= lo {
+        return lo
+    }
+    var span = u64(hi - lo)
+    var limit = 0xFFFFFFFFFFFFFFFF - (0xFFFFFFFFFFFFFFFF % span)
+    loop {
+        var v = r.next_u64()
+        if v < limit {
+            return lo + i64(v % span)
+        }
+    }
+}
+
+// Shuffles `s` in-place using the Fisher-Yates algorithm.
+pub fn rng_shuffle[T](r: *Rng, s: []T) {
+    var n = len(s)
+    if n <= 1 {
+        return
+    }
+    var i = n - 1
+    loop i > 0 {
+        var j = r.range_i64(0, i + 1)
+        var tmp = s[i]
+        s[i] = s[j]
+        s[j] = tmp
+        i -= 1
+    }
+}

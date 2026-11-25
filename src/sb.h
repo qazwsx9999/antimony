@@ -185,6 +185,7 @@ typedef struct Symbol {
     int iat_slot;        // extern fn: slot index in PE32+ Import Address Table
     bool is_pub;         // explicitly marked `pub`
     bool is_priv;        // private to declaring file (`priv` or non-`pub` in a `pub` module)
+    VEC(int) priv_files; // additional file_ids that also declared this `priv extern`
 } Symbol;
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,127 @@
+// =============================================================================
+// Antimony Standard Library: std/deque.sb
+// Generic growable ring-buffer double-ended queue `Deque[T]` (O(1) push/pop
+// at both ends, power-of-two capacity).
+// =============================================================================
+
+import "std/core.sb"
+import "std/mem.sb"
+
+pub struct Deque[T] {
+    data: *T
+    head: i64
+    len: i64
+    cap: i64
+}
+
+pub fn (d: *Deque[T]) init(initial_cap: i64) {
+    d.head = 0
+    d.len = 0
+    if initial_cap <= 0 {
+        d.data = null
+        d.cap = 0
+        return
+    }
+    var c: i64 = 8
+    loop c < initial_cap {
+        c *= 2
+    }
+    d.cap = c
+    d.data = ptr_cast(*T, alloc(usize(c) * usize(sizeof(T))))
+}
+
+pub fn (d: Deque[T]) is_empty(): bool {
+    return d.len == 0
+}
+
+priv fn (d: *Deque[T]) grow() {
+    var new_cap: i64 = 8
+    if d.cap >= 8 {
+        new_cap = d.cap * 2
+    }
+    var new_data = ptr_cast(*T, alloc(usize(new_cap) * usize(sizeof(T))))
+    if d.data != null {
+        var mask = d.cap - 1
+        loop i in 0..d.len {
+            new_data[i] = d.data[(d.head + i) & mask]
+        }
+        free_mem(ptr_cast(*u8, d.data))
+    }
+    d.data = new_data
+    d.head = 0
+    d.cap = new_cap
+}
+
+pub fn (d: *Deque[T]) push_back(val: T) {
+    if d.len >= d.cap {
+        d.grow()
+    }
+    var idx = (d.head + d.len) & (d.cap - 1)
+    d.data[idx] = val
+    d.len += 1
+}
+
+pub fn (d: *Deque[T]) push_front(val: T) {
+    if d.len >= d.cap {
+        d.grow()
+    }
+    d.head = (d.head - 1) & (d.cap - 1)
+    d.data[d.head] = val
+    d.len += 1
+}
+
+pub fn (d: *Deque[T]) pop_front(): Option[T] {
+    if d.len == 0 {
+        return .None
+    }
+    var out = d.data[d.head]
+    d.head = (d.head + 1) & (d.cap - 1)
+    d.len -= 1
+    return .Some(out)
+}
+
+pub fn (d: *Deque[T]) pop_back(): Option[T] {
+    if d.len == 0 {
+        return .None
+    }
+    d.len -= 1
+    var idx = (d.head + d.len) & (d.cap - 1)
+    return .Some(d.data[idx])
+}
+
+pub fn (d: Deque[T]) front(): Option[T] {
+    if d.len == 0 {
+        return .None
+    }
+    return .Some(d.data[d.head])
+}
+
+pub fn (d: Deque[T]) back(): Option[T] {
+    if d.len == 0 {
+        return .None
+    }
+    var idx = (d.head + d.len - 1) & (d.cap - 1)
+    return .Some(d.data[idx])
+}
+
+pub fn (d: Deque[T]) get(idx: i64): Option[T] {
+    if idx < 0 || idx >= d.len {
+        return .None
+    }
+    return .Some(d.data[(d.head + idx) & (d.cap - 1)])
+}
+
+pub fn (d: *Deque[T]) clear() {
+    d.head = 0
+    d.len = 0
+}
+
+pub fn (d: *Deque[T]) free() {
+    if d.data != null {
+        free_mem(ptr_cast(*u8, d.data))
+    }
+    d.data = null
+    d.head = 0
+    d.len = 0
+    d.cap = 0
+}

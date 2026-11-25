@@ -1,14 +1,18 @@
-// std/vec.sb - Generic heap-backed dynamic array Vec[T].
+// =============================================================================
+// Antimony Standard Library: std/vec.sb
+// Generic heap-backed dynamic array `Vec[T]`.
+// =============================================================================
 
+import "std/core.sb"
 import "std/mem.sb"
 
-struct Vec[T] {
+pub struct Vec[T] {
     data: *T
     len: i64
     cap: i64
 }
 
-fn (v: *Vec[T]) init(initial_cap: i64) {
+pub fn (v: *Vec[T]) init(initial_cap: i64) {
     v.len = 0
     if initial_cap <= 0 {
         v.data = null
@@ -19,7 +23,11 @@ fn (v: *Vec[T]) init(initial_cap: i64) {
     v.data = ptr_cast(*T, alloc(usize(initial_cap) * usize(sizeof(T))))
 }
 
-fn (v: *Vec[T]) reserve(min_cap: i64) {
+pub fn (v: Vec[T]) is_empty(): bool {
+    return v.len == 0
+}
+
+pub fn (v: *Vec[T]) reserve(min_cap: i64) {
     if min_cap <= v.cap {
         return
     }
@@ -34,7 +42,7 @@ fn (v: *Vec[T]) reserve(min_cap: i64) {
     v.cap = new_cap
 }
 
-fn (v: *Vec[T]) push(val: T) {
+pub fn (v: *Vec[T]) push(val: T) {
     if v.len >= v.cap {
         v.reserve(v.len + 1)
     }
@@ -42,20 +50,121 @@ fn (v: *Vec[T]) push(val: T) {
     v.len += 1
 }
 
-fn (v: *Vec[T]) pop(): T {
+pub fn (v: *Vec[T]) extend_slice(s[]: const T) {
+    var n = len(s)
+    if n == 0 {
+        return
+    }
+    v.reserve(v.len + n)
+    loop i in 0..n {
+        v.data[v.len + i] = s[i]
+    }
+    v.len += n
+}
+
+pub fn (v: *Vec[T]) pop(): T {
+    assert(v.len > 0, "Vec.pop: empty Vec")
     v.len -= 1
     return v.data[v.len]
 }
 
-fn (v: Vec[T]) get(idx: i64): T {
+pub fn (v: *Vec[T]) try_pop(): Option[T] {
+    if v.len <= 0 {
+        return .None
+    }
+    v.len -= 1
+    return .Some(v.data[v.len])
+}
+
+pub fn (v: Vec[T]) get(idx: i64): T {
+    assert(idx >= 0 && idx < v.len, "Vec.get: index out of bounds")
     return v.data[idx]
 }
 
-fn (v: *Vec[T]) set(idx: i64, val: T) {
+pub fn (v: Vec[T]) try_get(idx: i64): Option[T] {
+    if idx < 0 || idx >= v.len {
+        return .None
+    }
+    return .Some(v.data[idx])
+}
+
+pub fn (v: *Vec[T]) get_ptr(idx: i64): *T {
+    assert(idx >= 0 && idx < v.len, "Vec.get_ptr: index out of bounds")
+    return &v.data[idx]
+}
+
+pub fn (v: *Vec[T]) set(idx: i64, val: T) {
+    assert(idx >= 0 && idx < v.len, "Vec.set: index out of bounds")
     v.data[idx] = val
 }
 
-fn (v: Vec[T]) as_slice(): []T {
+pub fn (v: Vec[T]) first(): Option[T] {
+    if v.len <= 0 {
+        return .None
+    }
+    return .Some(v.data[0])
+}
+
+pub fn (v: Vec[T]) last(): Option[T] {
+    if v.len <= 0 {
+        return .None
+    }
+    return .Some(v.data[v.len - 1])
+}
+
+// Removes and returns the element at `idx` in O(1) by swapping with the last element.
+pub fn (v: *Vec[T]) swap_remove(idx: i64): T {
+    assert(idx >= 0 && idx < v.len, "Vec.swap_remove: index out of bounds")
+    var out = v.data[idx]
+    v.len -= 1
+    if idx < v.len {
+        v.data[idx] = v.data[v.len]
+    }
+    return out
+}
+
+// Removes and returns the element at `idx`, preserving the order of remaining elements.
+pub fn (v: *Vec[T]) remove(idx: i64): T {
+    assert(idx >= 0 && idx < v.len, "Vec.remove: index out of bounds")
+    var out = v.data[idx]
+    var i = idx
+    var last_idx = v.len - 1
+    loop i < last_idx {
+        v.data[i] = v.data[i + 1]
+        i += 1
+    }
+    v.len -= 1
+    return out
+}
+
+// Inserts `val` at `idx` (`0 <= idx <= v.len`), shifting subsequent elements right.
+pub fn (v: *Vec[T]) insert(idx: i64, val: T) {
+    assert(idx >= 0 && idx <= v.len, "Vec.insert: index out of bounds")
+    if v.len >= v.cap {
+        v.reserve(v.len + 1)
+    }
+    var i = v.len
+    loop i > idx {
+        v.data[i] = v.data[i - 1]
+        i -= 1
+    }
+    v.data[idx] = val
+    v.len += 1
+}
+
+pub fn (v: *Vec[T]) shrink_to_fit() {
+    if v.len == v.cap {
+        return
+    }
+    if v.len == 0 {
+        v.free()
+        return
+    }
+    v.data = ptr_cast(*T, realloc_mem(ptr_cast(*u8, v.data), usize(v.len) * usize(sizeof(T))))
+    v.cap = v.len
+}
+
+pub fn (v: Vec[T]) as_slice(): []T {
     if v.data == null || v.len == 0 {
         var empty: *T = v.data
         return empty[0..0]
@@ -63,11 +172,15 @@ fn (v: Vec[T]) as_slice(): []T {
     return v.data[0..v.len]
 }
 
-fn (v: *Vec[T]) clear() {
+pub fn (v: Vec[T]) as_const_slice(): []const T {
+    return v.as_slice()
+}
+
+pub fn (v: *Vec[T]) clear() {
     v.len = 0
 }
 
-fn (v: *Vec[T]) free() {
+pub fn (v: *Vec[T]) free() {
     if v.data != null {
         free_mem(ptr_cast(*u8, v.data))
     }

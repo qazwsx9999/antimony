@@ -1,0 +1,139 @@
+// =============================================================================
+// Antimony Standard Library: std/fs.sb
+// Native Win32 filesystem operations (`exists`, `is_file`, `is_dir`, `mkdir`,
+// `rmdir`, `remove_file`, `rename`, `copy`) returning `Result[bool, IoError]`.
+// =============================================================================
+
+import "std/core.sb"
+import "std/io.sb"
+import "std/str.sb"
+
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10
+
+priv extern "kernel32.dll" {
+    fn GetFileAttributesA(lpFileName: *const u8): u32
+    fn CreateDirectoryA(lpPathName: *const u8, lpSecurityAttributes: usize): i32
+    fn RemoveDirectoryA(lpPathName: *const u8): i32
+    fn DeleteFileA(lpFileName: *const u8): i32
+    fn MoveFileExA(lpExistingFileName: *const u8, lpNewFileName: *const u8, dwFlags: u32): i32
+    fn CopyFileA(lpExistingFileName: *const u8, lpNewFileName: *const u8, bFailIfExists: i32): i32
+    fn GetLastError(): u32
+}
+
+const MOVEFILE_REPLACE_EXISTING: u32 = 1
+
+priv fn get_attrs(path: str): u32 {
+    if len(path) == 0 {
+        return INVALID_FILE_ATTRIBUTES
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    return GetFileAttributesA(pb.cstr())
+}
+
+// Returns true if a file or directory exists at `path`.
+pub fn fs_exists(path: str): bool {
+    return get_attrs(path) != INVALID_FILE_ATTRIBUTES
+}
+
+// Returns true if `path` exists and is a directory.
+pub fn fs_is_dir(path: str): bool {
+    var attrs = get_attrs(path)
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+}
+
+// Returns true if `path` exists and is a regular (non-directory) file.
+pub fn fs_is_file(path: str): bool {
+    var attrs = get_attrs(path)
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0
+}
+
+// Creates a single directory at `path`.
+pub fn fs_mkdir(path: str): Result[bool, IoError] {
+    if len(path) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    if CreateDirectoryA(pb.cstr(), 0) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(true)
+}
+
+// Removes an empty directory at `path`.
+pub fn fs_rmdir(path: str): Result[bool, IoError] {
+    if len(path) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    if RemoveDirectoryA(pb.cstr()) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(true)
+}
+
+// Deletes the file at `path`.
+pub fn fs_remove_file(path: str): Result[bool, IoError] {
+    if len(path) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    if DeleteFileA(pb.cstr()) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(true)
+}
+
+// Renames or moves `src` to `dst` (replacing `dst` if it already exists).
+pub fn fs_rename(src: str, dst: str): Result[bool, IoError] {
+    if len(src) == 0 || len(dst) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var sb1: StringBuilder
+    sb1.init(usize(len(src)) + 1)
+    defer sb1.free()
+    sb1.append(src)
+
+    var sb2: StringBuilder
+    sb2.init(usize(len(dst)) + 1)
+    defer sb2.free()
+    sb2.append(dst)
+
+    if MoveFileExA(sb1.cstr(), sb2.cstr(), MOVEFILE_REPLACE_EXISTING) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(true)
+}
+
+// Copies `src` to `dst` (overwriting `dst` if it exists).
+pub fn fs_copy(src: str, dst: str): Result[bool, IoError] {
+    if len(src) == 0 || len(dst) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var sb1: StringBuilder
+    sb1.init(usize(len(src)) + 1)
+    defer sb1.free()
+    sb1.append(src)
+
+    var sb2: StringBuilder
+    sb2.init(usize(len(dst)) + 1)
+    defer sb2.free()
+    sb2.append(dst)
+
+    if CopyFileA(sb1.cstr(), sb2.cstr(), 0) == 0 {
+        return .Err(io_error_from_win32(GetLastError()))
+    }
+    return .Ok(true)
+}

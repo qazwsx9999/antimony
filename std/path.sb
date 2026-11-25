@@ -1,0 +1,134 @@
+// =============================================================================
+// Antimony Standard Library: std/path.sb
+// Zero-allocation filesystem path inspection (`basename`, `dirname`, `extension`,
+// `stem`, `is_abs`) and `StringBuilder`-backed `path_join`.
+// =============================================================================
+
+import "std/str.sb"
+
+pub fn path_is_sep(b: u8): bool {
+    return b == '/' || b == '\\'
+}
+
+// Returns true if `p` is an absolute path (Windows drive root, UNC, or POSIX root).
+pub fn path_is_abs(p: str): bool {
+    var n = len(p)
+    if n == 0 {
+        return false
+    }
+    if path_is_sep(p[0]) {
+        return true
+    }
+    if n >= 3 && is_alpha(p[0]) && p[1] == ':' && path_is_sep(p[2]) {
+        return true
+    }
+    return false
+}
+
+// Strips trailing path separators (preserving a bare root like `"/"` or `"C:\\"`).
+priv fn strip_trailing_seps(p: str): str {
+    var end = len(p)
+    loop end > 1 && path_is_sep(p[end - 1]) {
+        // Keep `C:\` intact.
+        if end == 3 && is_alpha(p[0]) && p[1] == ':' {
+            break
+        }
+        end -= 1
+    }
+    return p[0..end]
+}
+
+// Returns the last path component (file or directory name), or `""` for empty/root paths.
+pub fn path_basename(p: str): str {
+    var s = strip_trailing_seps(p)
+    var n = len(s)
+    if n == 0 {
+        return ""
+    }
+    if n == 1 && path_is_sep(s[0]) {
+        return ""
+    }
+    if n == 3 && is_alpha(s[0]) && s[1] == ':' && path_is_sep(s[2]) {
+        return ""
+    }
+    var i = n - 1
+    loop i >= 0 {
+        if path_is_sep(s[i]) {
+            return s[i + 1..n]
+        }
+        i -= 1
+    }
+    return s
+}
+
+// Returns the parent directory of `p`, or `"."` if `p` has no directory component.
+pub fn path_dirname(p: str): str {
+    var s = strip_trailing_seps(p)
+    var n = len(s)
+    if n == 0 {
+        return "."
+    }
+    var i = n - 1
+    loop i >= 0 {
+        if path_is_sep(s[i]) {
+            if i == 0 {
+                return s[0..1]
+            }
+            if i == 2 && is_alpha(s[0]) && s[1] == ':' {
+                return s[0..3]
+            }
+            return s[0..i]
+        }
+        i -= 1
+    }
+    return "."
+}
+
+// Returns the file extension including the leading `.` (e.g. `".sb"`), or `""` if none.
+// Leading dotfiles like `".gitignore"` have no extension.
+pub fn path_extension(p: str): str {
+    var base = path_basename(p)
+    var n = len(base)
+    if n <= 1 {
+        return ""
+    }
+    var i = n - 1
+    loop i > 0 {
+        if base[i] == '.' {
+            return base[i..n]
+        }
+        i -= 1
+    }
+    return ""
+}
+
+// Returns the file name without its final extension.
+pub fn path_stem(p: str): str {
+    var base = path_basename(p)
+    var ext = path_extension(p)
+    return base[0..len(base) - len(ext)]
+}
+
+// Joins two path segments into `out` and returns the resulting `str` view.
+// If `b` is absolute, `b` replaces `a`.
+pub fn path_join(a: str, b: str, out: *StringBuilder): str {
+    out.clear()
+    if len(a) == 0 || path_is_abs(b) {
+        out.append(b)
+        return out.as_str()
+    }
+    if len(b) == 0 {
+        out.append(a)
+        return out.as_str()
+    }
+    out.append(a)
+    if !path_is_sep(a[len(a) - 1]) {
+        out.append_byte('\\')
+    }
+    var b_start: i64 = 0
+    loop b_start < len(b) && path_is_sep(b[b_start]) {
+        b_start += 1
+    }
+    out.append(b[b_start..len(b)])
+    return out.as_str()
+}
