@@ -1034,7 +1034,7 @@ fn main() {
 ```
 
 ### 15.3 Standard Library Modules (`std/`)
-Antimony ships with 20 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
+Antimony ships with 23 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
 - `import "std/core.sb"` — Canonical `Option[T]`, `Result[T, E]`, `Ordering`, `panic`, `assert`, and `swap[T]`.
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `alloc_typed`, `realloc_mem`, `free_mem`, `copy_mem`, `move_mem`, `set_mem`, `cmp_mem`, `eq_mem`) and fast bump-pointer `Arena`.
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `extend_slice`, `pop`, `try_pop`, `get`, `try_get`, `get_ptr`, `set`, `first`, `last`, `insert`, `remove`, `swap_remove`, `shrink_to_fit`, `as_slice`, `as_const_slice`, `clear`, `free`).
@@ -1047,12 +1047,15 @@ Antimony ships with 20 native, encapsulated (`pub`/`priv`) standard library modu
 - `import "std/thread.sb"` — Native Win32 OS threads (`Thread`, `spawn`, `join`, `detach`, `current_thread_id`), fast user-mode `SRWLOCK` locks (`Mutex`, `RwLock`, `CondVar` with `wait_timeout`), and hardware atomic wrapper `AtomicI64` (`init`, `load`, `store`, `fetch_add`, `fetch_sub`, `cas`).
 - `import "std/io.sb"` — Native Win32 `File` handle (`file_open`, `file_create`, `file_open_append`, `file_open_rw`, `read`, `write`, `write_all`, `write_str`, `seek`, `size`, `flush`, `close`), `IoError`, `SeekFrom`, `read_file_all`, `write_file_all`, and low-level helpers.
 - `import "std/bufio.sb"` — Buffered file I/O: `BufReader` (`read_byte`, `read`, `read_line`) and `BufWriter` (`write_byte`, `write`, `write_str`, `flush`).
-- `import "std/fs.sb"` — Native Win32 filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`) returning `Result[bool, IoError]`.
+- `import "std/fs.sb"` — Native Win32 filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`) and directory iteration (`fs_read_dir`, `DirIter`, `DirEntry`) returning `Result[..., IoError]`.
 - `import "std/path.sb"` — Zero-allocation path utilities (`path_is_sep`, `path_is_abs`, `path_basename`, `path_dirname`, `path_extension`, `path_stem`) and `path_join`.
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `elapsed_ms`, `ticks_ms`, `sleep_ms`) and `Stopwatch`.
 - `import "std/rand.sb"` — Deterministic xoshiro256++ PRNG (`Rng`, `rng_from_seed`, `rng_from_os`, `next_u64`, `next_u32`, `next_f64`, `range_i64`, `next_bool`, `rng_shuffle[T]`) and OS CSPRNG (`os_random_bytes`, `os_random_u64` via `bcrypt.dll`).
 - `import "std/process.sb"` — Native Win32 child process management (`Child`, `process_spawn`, `process_run`, `process_capture`, `wait`, `try_wait`, `kill`, `current_pid`).
-- `import "std/net.sb"` — Native Winsock2 (`ws2_32.dll`) IPv4 networking (`Ipv4Addr`, `SocketAddr`, `TcpListener`, `TcpStream`, `UdpSocket`, `NetError`, `tcp_bind`, `tcp_connect`, `udp_bind`).
+- `import "std/net.sb"` — Native Winsock2 (`ws2_32.dll`) IPv4 networking (`Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `TcpListener`, `TcpStream`, `UdpSocket`, `NetError`, `tcp_bind`, `tcp_connect`, `udp_bind`).
+- `import "std/encoding.sb"` — RFC 4648 Hexadecimal (`hex_encode`, `hex_decode`) and Base64 (`base64_encode`, `base64_url_encode`, `base64_decode`).
+- `import "std/hash.sb"` — FNV-1a 32/64, incremental IEEE CRC32 (`crc32`, `crc32_update`), and FIPS 180-4 SHA-256 (`Sha256`, `Sha256Digest`, `sha256`, `sha256_str`).
+- `import "std/json.sb"` — RFC 8259 arena-backed JSON parser, DOM builder, and compact/pretty serializer (`JsonDoc`, `json_parse`, `stringify`, `stringify_pretty`, `JsonError`).
 - `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification & case helpers, `str` search & slicing (`str_cmp`, `str_eq_ignore_ascii_case`, `str_starts_with`, `str_ends_with`, `str_strip_prefix`, `str_strip_suffix`, `str_trim`, `str_find`, `str_contains`, `str_count`, `str_split_once`), strict `Result` parsers (`try_parse_i64`, `try_parse_u64`, `try_parse_f64`), and `StringBuilder` (`append`, `append_bytes`, `append_i64`, `append_u64`, `append_hex`, `append_replace`, `append_lower`, `append_upper`, `as_str`, `cstr`).
 - `import "std/os.sb"` — Console streams (`print_raw`, `eprint_raw`, `eprint`, `read_stdin`), command-line arguments (`cmd_line`, `arg_count`, `arg_at`), environment (`getenv_into`, `getenv_str`), and `cwd_into`.
 

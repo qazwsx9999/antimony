@@ -118,13 +118,16 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/math.sb` | Constants, transcendental and rounding functions, integer and bit utilities |
 | `std/io.sb` | `File` handle (`file_open`, `file_create`, `read`, `write_all`, `seek`, `flush`), `IoError`, `read_file_all`, `write_file_all` |
 | `std/bufio.sb` | Buffered file I/O (`BufReader` with `read_line`/`read_byte`, `BufWriter` with batched `write`/`flush`) |
-| `std/fs.sb` | Filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`) |
+| `std/fs.sb` | Filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`, `fs_read_dir`) |
 | `std/path.sb` | Path utilities (`path_basename`, `path_dirname`, `path_extension`, `path_stem`, `path_is_abs`, `path_join`) |
 | `std/os.sb` | Console streams (`stdin`/`stdout`/`stderr`), command-line arguments, environment variables, `cwd_into` |
 | `std/time.sb` | High-resolution timers, `Stopwatch`, `sleep_ms` |
 | `std/rand.sb` | Deterministic PRNG (`Rng`, xoshiro256++), `rng_shuffle`, OS CSPRNG (`os_random_bytes` via `bcrypt.dll`) |
 | `std/process.sb` | Child process spawning, `wait`/`try_wait`/`kill`, stdout/stderr pipe capture (`process_capture`), `current_pid` |
-| `std/net.sb` | Winsock2 IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `NetError`) |
+| `std/net.sb` | Winsock2 IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `NetError`) |
+| `std/encoding.sb` | RFC 4648 Hexadecimal and Base64 (standard & URL-safe) encoding and decoding |
+| `std/hash.sb` | FNV-1a 32/64, IEEE CRC32, and FIPS 180-4 SHA-256 (streaming & one-shot) |
+| `std/json.sb` | RFC 8259 arena-backed JSON parser, DOM builder, and compact/pretty serializer (`JsonDoc`) |
 | `std/thread.sb` | Threads, `Mutex`, `RwLock`, `CondVar`, `AtomicI64` |
 
 ## Documentation
@@ -136,7 +139,12 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 ## Testing
 
 ```powershell
+# Full suite (native x64 + LLVM -O3 + compile-error + runtime-trap)
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
+
+# Fast native-only run (~10 seconds) or filtered subset
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Quick
+powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1 -Filter phase25
 ```
 
 The suite compiles and runs test programs with both backends and checks their output, verifies that runtime errors (overflow, bounds, null) trap with the expected message, and verifies that invalid programs are rejected with the expected compile error. The `--llvm` tests require Clang.

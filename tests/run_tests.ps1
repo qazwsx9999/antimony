@@ -1,9 +1,31 @@
+param(
+    [switch]$Quick,
+    [string]$Filter = ""
+)
+
 $ErrorActionPreference = "Continue"
-$sbc = "c:\Users\soroosh\sb\sbc.exe"
-$tmp = "c:\Users\soroosh\sb\tests\tmp"
+$root = Split-Path -Parent $PSScriptRoot
+$sbc = Join-Path $root "sbc.exe"
+$tmp = Join-Path $PSScriptRoot "tmp"
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
+$script:PassedCount = 0
+$script:SkippedCount = 0
+
+function Should-RunTest([string]$name, [bool]$isLlvm = $false) {
+    if ($isLlvm -and $Quick) {
+        $script:SkippedCount++
+        return $false
+    }
+    if ($Filter -ne "" -and $name -notlike "*$Filter*") {
+        $script:SkippedCount++
+        return $false
+    }
+    return $true
+}
+
 function Test-CompileError([string]$name, [string]$code, [string]$expectSubstr) {
+    if (!(Should-RunTest $name)) { return }
     $sb = Join-Path $tmp "$name.sb"
     $exe = Join-Path $tmp "$name.exe"
     Set-Content -Path $sb -Value $code -Encoding UTF8
@@ -14,16 +36,18 @@ function Test-CompileError([string]$name, [string]$code, [string]$expectSubstr) 
     if (!$out.Contains($expectSubstr)) {
         throw "FAIL [$name]: expected '$expectSubstr' in error output, got:`n$out"
     }
+    $script:PassedCount++
     Write-Host "PASS [compile-error] $name"
 }
 
 function Test-RunTrap([string]$name, [string]$code, [string]$expectSubstr, [switch]$Release) {
+    if (!(Should-RunTest $name)) { return }
     $sb = Join-Path $tmp "$name.sb"
     $exe = Join-Path $tmp "$name.exe"
     Set-Content -Path $sb -Value $code -Encoding UTF8
-    if ($Release) { $null = & $sbc $sb -o $exe --release 2>&1 }
-    else          { $null = & $sbc $sb -o $exe 2>&1 }
-    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile" }
+    if ($Release) { $compOut = (& $sbc $sb -o $exe --release 2>&1) -join "`n" }
+    else          { $compOut = (& $sbc $sb -o $exe 2>&1) -join "`n" }
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile:`n$compOut" }
     $out = (& $exe 2>&1) -join "`n"
     if ($LASTEXITCODE -eq 0) {
         throw "FAIL [$name]: expected runtime trap, but exited with 0"
@@ -31,21 +55,24 @@ function Test-RunTrap([string]$name, [string]$code, [string]$expectSubstr, [swit
     if (!$out.Contains($expectSubstr)) {
         throw "FAIL [$name]: expected '$expectSubstr' in panic output, got:`n$out"
     }
+    $script:PassedCount++
     Write-Host "PASS [runtime-trap]  $name"
 }
 
 function Test-RunOk([string]$name, [string]$code, [string]$expected, [switch]$Release) {
+    if (!(Should-RunTest $name)) { return }
     $sb = Join-Path $tmp "$name.sb"
     $exe = Join-Path $tmp "$name.exe"
     Set-Content -Path $sb -Value $code -Encoding UTF8
-    if ($Release) { $null = & $sbc $sb -o $exe --release 2>&1 }
-    else          { $null = & $sbc $sb -o $exe 2>&1 }
-    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile" }
+    if ($Release) { $compOut = (& $sbc $sb -o $exe --release 2>&1) -join "`n" }
+    else          { $compOut = (& $sbc $sb -o $exe 2>&1) -join "`n" }
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: failed to compile:`n$compOut" }
     $out = ((& $exe) -join "`n").Replace("`r`n", "`n").Trim()
     if ($LASTEXITCODE -ne 0) { throw "FAIL [$name]: exited with code $LASTEXITCODE" }
     if ($out -ne $expected) {
         throw "FAIL [$name]: expected '$expected', got '$out'"
     }
+    $script:PassedCount++
     Write-Host "PASS [run-ok]        $name"
 }
 
@@ -1058,6 +1085,7 @@ fn main() {
 
 # 19. Phase 11: Optimizing / LLVM backend (--llvm / -O3 and --emit-llvm)
 function Test-RunLlvm([string]$name, [string]$code, [string]$expected) {
+    if (!(Should-RunTest $name $true)) { return }
     $sb = Join-Path $tmp "$name.sb"
     $exe = Join-Path $tmp "$name.exe"
     $ll = Join-Path $tmp "$name.ll"
@@ -1078,6 +1106,7 @@ function Test-RunLlvm([string]$name, [string]$code, [string]$expected) {
     if ($out -ne $expected) {
         throw "FAIL [$name]: expected '$expected', got '$out'"
     }
+    $script:PassedCount++
     Write-Host "PASS [llvm-O3]       $name"
 }
 
@@ -2076,27 +2105,41 @@ fn main() {
 }
 "@
 Test-RunLlvm "phase19_direct_llvm_ir_features" $phase19_ir_code "24`n19"
-$phase19_ll = Get-Content -Path (Join-Path $tmp "phase19_direct_llvm_ir_features.ll") -Raw
-if ($phase19_ll -notmatch 'getelementptr ' -or $phase19_ll -notmatch 'target datalayout' -or $phase19_ll -notmatch 'atomicrmw add') {
-    throw "FAIL [phase19_direct_llvm_ir_features]: missing expected direct LLVM IR ops (getelementptr/target datalayout/atomicrmw)"
+if (Should-RunTest "phase19_direct_llvm_ir_syntax" $true) {
+    $phase19_ll = Get-Content -Path (Join-Path $tmp "phase19_direct_llvm_ir_features.ll") -Raw
+    if ($phase19_ll -notmatch 'getelementptr ' -or $phase19_ll -notmatch 'target datalayout' -or $phase19_ll -notmatch 'atomicrmw add') {
+        throw "FAIL [phase19_direct_llvm_ir_features]: missing expected direct LLVM IR ops (getelementptr/target datalayout/atomicrmw)"
+    }
+    $script:PassedCount++
+    Write-Host "PASS [llvm-IR-check] phase19_direct_llvm_ir_syntax"
 }
-Write-Host "PASS [llvm-IR-check] phase19_direct_llvm_ir_syntax"
 
 # 28. End-to-end test for examples/sbwc.sb (native x64 and --llvm)
-$sbwcSrc = "c:\Users\soroosh\sb\examples\sbwc.sb"
+$sbwcSrc = Join-Path $root "examples\sbwc.sb"
 $sbwcNative = Join-Path $tmp "sbwc_native.exe"
 $sbwcLlvm   = Join-Path $tmp "sbwc_llvm.exe"
 $sbwcF1     = Join-Path $tmp "sbwc_sample1.txt"
 $sbwcF2     = Join-Path $tmp "sbwc_sample2.txt"
-[System.IO.File]::WriteAllBytes($sbwcF1, [System.Text.Encoding]::ASCII.GetBytes("alpha beta foo`ngamma foo`n"))
-[System.IO.File]::WriteAllBytes($sbwcF2, [System.Text.Encoding]::ASCII.GetBytes("one two`nfoo bar foo foo`n"))
+$runSbwcNative = Should-RunTest "sbwc_native"
+$runSbwcLlvm   = Should-RunTest "sbwc_llvm" $true
+if ($runSbwcNative -or $runSbwcLlvm) {
+    [System.IO.File]::WriteAllBytes($sbwcF1, [System.Text.Encoding]::ASCII.GetBytes("alpha beta foo`ngamma foo`n"))
+    [System.IO.File]::WriteAllBytes($sbwcF2, [System.Text.Encoding]::ASCII.GetBytes("one two`nfoo bar foo foo`n"))
+}
 
-$null = & $sbc $sbwcSrc -o $sbwcNative 2>&1
-if ($LASTEXITCODE -ne 0) { throw "FAIL [sbwc_native]: compile failed" }
-$null = & $sbc $sbwcSrc --llvm -o $sbwcLlvm 2>&1
-if ($LASTEXITCODE -ne 0) { throw "FAIL [sbwc_llvm]: compile failed" }
+$sbwcPairs = @()
+if ($runSbwcNative) {
+    $null = & $sbc $sbwcSrc -o $sbwcNative 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [sbwc_native]: compile failed" }
+    $sbwcPairs += ,@("sbwc_native", $sbwcNative)
+}
+if ($runSbwcLlvm) {
+    $null = & $sbc $sbwcSrc --llvm -o $sbwcLlvm 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [sbwc_llvm]: compile failed" }
+    $sbwcPairs += ,@("sbwc_llvm", $sbwcLlvm)
+}
 
-foreach ($pair in @(@("sbwc_native", $sbwcNative), @("sbwc_llvm", $sbwcLlvm))) {
+foreach ($pair in $sbwcPairs) {
     $tname = $pair[0]
     $texe  = $pair[1]
     $lines = @(& $texe -p foo $sbwcF1 $sbwcF2)
@@ -2115,6 +2158,7 @@ foreach ($pair in @(@("sbwc_native", $sbwcNative), @("sbwc_llvm", $sbwcLlvm))) {
     # Missing file returns non-zero
     $null = & $texe (Join-Path $tmp "does_not_exist_999.txt") 2>&1
     if ($LASTEXITCODE -eq 0) { throw "FAIL [$tname-missing]: expected non-zero exit code for missing file" }
+    $script:PassedCount++
     Write-Host "PASS [e2e]           $tname"
 }
 
@@ -2833,4 +2877,183 @@ Test-RunLlvm "phase24_bufio_heap_llvm" $phase24_code $phase24_expected
 
 Test-CompileError "std_bufio_priv_hidden" "import `"std/bufio.sb`"`nfn main() { print(DEFAULT_BUF_CAP) }" "cannot access private"
 
-Write-Host "`nAll tests passed."
+# 34. Phase 25: fs_read_dir, DNS resolve, std/encoding.sb, std/hash.sb, std/json.sb
+$phase25_code = @'
+import "std/core.sb"
+import "std/str.sb"
+import "std/vec.sb"
+import "std/io.sb"
+import "std/fs.sb"
+import "std/net.sb"
+import "std/encoding.sb"
+import "std/hash.sb"
+import "std/json.sb"
+
+fn test_read_dir(): Result[i64, IoError] {
+    var root = `tests\tmp\phase25_dir`
+    var sub  = `tests\tmp\phase25_dir\sub`
+    var f1   = `tests\tmp\phase25_dir\a.txt`
+    var f2   = `tests\tmp\phase25_dir\b.txt`
+    if !fs_exists(root) { fs_mkdir(root)? }
+    if !fs_exists(sub)  { fs_mkdir(sub)? }
+    write_file_all(f1, "hello")?
+    write_file_all(f2, "world!")?
+
+    var it = fs_read_dir(root)?
+    defer it.close()
+    var entry = DirEntry {}
+    var files: i64 = 0
+    var dirs: i64 = 0
+    var bytes_sum: i64 = 0
+    loop it.next(&entry)? {
+        if entry.is_dir {
+            assert(entry.name() == "sub", "subdir name")
+            dirs += 1
+        } else {
+            assert(entry.name() == "a.txt" || entry.name() == "b.txt", "file name")
+            files += 1
+            bytes_sum += entry.size
+        }
+    }
+    it.close()
+    fs_remove_file(f1)?
+    fs_remove_file(f2)?
+    fs_rmdir(sub)?
+    fs_rmdir(root)?
+    assert(files == 2 && dirs == 1 && bytes_sum == 11, "dir counts")
+    return .Ok(files + dirs)
+}
+
+fn main() {
+    // 1. fs_read_dir
+    var dcount = test_read_dir().unwrap_or(-1)
+    print("dir={}", dcount)
+
+    // 2. DNS resolve ("localhost" -> 127.0.0.1)
+    var lh = dns_resolve("localhost").unwrap_or(ipv4_any())
+    var lit = dns_resolve("127.0.0.1").unwrap_or(ipv4_any())
+    print("dns={} {} {}", lh.eq(ipv4_localhost()), lit.eq(ipv4_localhost()), dns_resolve("").is_err())
+
+    // 3. std/encoding.sb: Hex & Base64 RFC 4648 vectors
+    var hb: StringBuilder
+    hb.init(32)
+    defer hb.free()
+    hex_encode_str("Hi!", &hb)
+    var hdec: Vec[u8]
+    hdec.init(8)
+    defer hdec.free()
+    var hn = hex_decode("486921", &hdec).unwrap_or(-1)
+    var hbad = hex_decode("abc", &hdec).is_err()
+
+    var b64: StringBuilder
+    b64.init(32)
+    defer b64.free()
+    base64_encode_str("foobar", &b64)
+    var b64_f: StringBuilder
+    b64_f.init(16)
+    defer b64_f.free()
+    base64_encode_str("f", &b64_f)
+    var bdec: Vec[u8]
+    bdec.init(16)
+    defer bdec.free()
+    var bn = base64_decode("Zm9vYmFy", &bdec).unwrap_or(-1)
+    print("enc={} {} {} {} {} {} {}",
+          hb.as_str(), hn, str(hdec.as_slice()), hbad,
+          b64.as_str(), b64_f.as_str(), str(bdec.as_slice()))
+
+    // 4. std/hash.sb: CRC32 + SHA-256 official NIST vectors
+    var c32 = crc32_str("123456789")
+    var d_empty = sha256_str("")
+    var d_abc   = sha256_str("abc")
+    var stream  = sha256_init()
+    stream.update_str("abcdbcdecdefdefgefghfghighijhi")
+    stream.update_str("jkijkljklmklmnlmnomnopnopq")
+    var d_448   = stream.finalize()
+
+    var s1: StringBuilder
+    s1.init(64)
+    defer s1.free()
+    d_empty.to_hex(&s1)
+
+    var s2: StringBuilder
+    s2.init(64)
+    defer s2.free()
+    d_abc.to_hex(&s2)
+
+    var s3: StringBuilder
+    s3.init(64)
+    defer s3.free()
+    d_448.to_hex(&s3)
+
+    print("hash={} {} {} {}",
+          c32 == 0xCBF43926,
+          s1.as_str() == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          s2.as_str() == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          s3.as_str() == "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+
+    // 5. std/json.sb: parse, query, escapes, build, stringify, error handling
+    var doc: JsonDoc
+    doc.init()
+    defer doc.free()
+    var input = `{"name":"Antimony","ver":25,"pi":3.5,"ok":true,"nil":null,"esc":"a\nb\"\u0041","arr":[10,20,30]}`
+    var root = json_parse(input, &doc).unwrap_or(-1)
+    assert(root >= 0, "json root")
+
+    var name_id = doc.get(root, "name").unwrap_or(-1)
+    var ver_id  = doc.get(root, "ver").unwrap_or(-1)
+    var pi_id   = doc.get(root, "pi").unwrap_or(-1)
+    var ok_id   = doc.get(root, "ok").unwrap_or(-1)
+    var nil_id  = doc.get(root, "nil").unwrap_or(-1)
+    var esc_id  = doc.get(root, "esc").unwrap_or(-1)
+    var arr_id  = doc.get(root, "arr").unwrap_or(-1)
+    var elem1   = doc.at(arr_id, 1).unwrap_or(-1)
+
+    print("json={} {} {} {} {} {} {}",
+          doc.as_str(name_id).unwrap_or(""),
+          doc.as_i64(ver_id).unwrap_or(0),
+          doc.as_f64(pi_id).unwrap_or(0.0),
+          doc.as_bool(ok_id).unwrap_or(false),
+          doc.is_null(nil_id),
+          doc.as_str(esc_id).unwrap_or("") == "a\nb\"A",
+          doc.as_i64(elem1).unwrap_or(0))
+
+    // Programmatic build + stringify + re-parse round-trip
+    var bdoc: JsonDoc
+    bdoc.init()
+    defer bdoc.free()
+    var obj = bdoc.new_object()
+    bdoc.object_set(obj, "lang", bdoc.new_str("sb"))
+    var nums = bdoc.new_array()
+    bdoc.array_push(nums, bdoc.new_i64(1))
+    bdoc.array_push(nums, bdoc.new_i64(2))
+    bdoc.object_set(obj, "nums", nums)
+
+    var jout: StringBuilder
+    jout.init(64)
+    defer jout.free()
+    bdoc.stringify(obj, &jout)
+    var bad_json1 = json_parse(`{"a": 1,} `, &doc).is_err()
+    var bad_json2 = json_parse(`[1, 2] trailing`, &doc).is_err()
+    print("jser={} {} {}", jout.as_str(), bad_json1, bad_json2)
+}
+'@
+$phase25_expected = @(
+    "dir=3"
+    "dns=true true true"
+    "enc=486921 3 Hi! true Zm9vYmFy Zg== foobar"
+    "hash=true true true true"
+    "json=Antimony 25 3.5 true true true 20"
+    'jser={"lang":"sb","nums":[1,2]} true true'
+) -join "`n"
+Test-RunOk   "phase25_std_power"      $phase25_code $phase25_expected
+Test-RunLlvm "phase25_std_power_llvm" $phase25_code $phase25_expected
+
+Test-CompileError "phase25_fs_priv_hidden"   "import `"std/fs.sb`"`nfn main() { print(WIN32_ERR_NO_MORE_FILES) }" "cannot access private"
+Test-CompileError "phase25_hash_priv_hidden" "import `"std/hash.sb`"`nfn main() { print(rotr32(1, 1)) }"           "cannot access private"
+Test-CompileError "phase25_json_priv_hidden" "import `"std/json.sb`"`nfn main() { print(JSON_MAX_DEPTH) }"         "cannot access private"
+
+if ($script:SkippedCount -gt 0) {
+    Write-Host "`nAll $($script:PassedCount) selected tests passed ($($script:SkippedCount) skipped)."
+} else {
+    Write-Host "`nAll $($script:PassedCount) tests passed."
+}

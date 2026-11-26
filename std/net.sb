@@ -35,9 +35,22 @@ priv struct SockAddrIn {
     sin_zero[8]: u8
 }
 
+priv struct AddrInfoA {
+    ai_flags: i32
+    ai_family: i32
+    ai_socktype: i32
+    ai_protocol: i32
+    ai_addrlen: usize
+    ai_canonname: *u8
+    ai_addr: *u8
+    ai_next: *u8
+}
+
 priv extern "ws2_32.dll" {
     fn WSAStartup(wVersionRequested: u16, lpWSAData: *u8): i32
     fn WSAGetLastError(): i32
+    fn getaddrinfo(pNodeName: *const u8, pServiceName: *const u8, pHints: *const u8, ppResult: *usize): i32
+    fn freeaddrinfo(pAddrInfo: usize)
     fn socket(af: i32, sock_type: i32, protocol: i32): usize
     fn bind(s: usize, name: *const u8, namelen: i32): i32
     fn listen(s: usize, backlog: i32): i32
@@ -273,6 +286,47 @@ pub fn tcp_connect(addr: SocketAddr): Result[TcpStream, NetError] {
         return .Err(net_error_from_wsa(err))
     }
     return .Ok(TcpStream { sock: s })
+}
+
+// Resolves a hostname (or IPv4 literal) to an `Ipv4Addr` via Winsock `getaddrinfo`.
+pub fn dns_resolve(host: str): Result[Ipv4Addr, NetError] {
+    if len(host) == 0 {
+        return .Err(.InvalidAddress)
+    }
+    match ipv4_parse(host) {
+        .Ok(ip) { return .Ok(ip) }
+        .Err(_) { }
+    }
+    ensure_wsa()?
+    var hb: StringBuilder
+    hb.init(usize(len(host)) + 1)
+    defer hb.free()
+    hb.append(host)
+
+    var hints = AddrInfoA { ai_family: AF_INET, ai_socktype: SOCK_STREAM }
+    var res_ptr: usize = 0
+    var rc = getaddrinfo(hb.cstr(), null, ptr_cast(*const u8, &hints), &res_ptr)
+    if rc != 0 || res_ptr == 0 {
+        return .Err(.InvalidAddress)
+    }
+    defer freeaddrinfo(res_ptr)
+
+    var cur = res_ptr
+    loop cur != 0 {
+        var ai = ptr_cast(*const AddrInfoA, cur)
+        if ai.ai_family == AF_INET && ai.ai_addr != null {
+            var sa = ptr_cast(*const SockAddrIn, ai.ai_addr)
+            return .Ok(from_sockaddr_in(*sa).ip)
+        }
+        cur = usize(ai.ai_next)
+    }
+    return .Err(.InvalidAddress)
+}
+
+// Resolves `host` via DNS and opens a TCP connection to `host:port`.
+pub fn tcp_connect_host(host: str, port: u16): Result[TcpStream, NetError] {
+    var ip = dns_resolve(host)?
+    return tcp_connect(socket_addr(ip, port))
 }
 
 pub fn (s: *TcpStream) is_open(): bool {

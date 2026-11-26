@@ -1,0 +1,266 @@
+// =============================================================================
+// Antimony Standard Library: std/hash.sb
+// Non-cryptographic hashes (FNV-1a 32/64, IEEE CRC32) and FIPS 180-4 SHA-256
+// streaming and one-shot cryptographic hashing.
+// =============================================================================
+
+import "std/mem.sb"
+import "std/str.sb"
+import "std/encoding.sb"
+
+// -----------------------------------------------------------------------------
+// FNV-1a (32-bit & 64-bit)
+// -----------------------------------------------------------------------------
+
+pub fn fnv1a_32(data[]: const u8): u32 {
+    var h: u32 = 2166136261
+    loop b in data {
+        h = (h ^ u32(b)) *% 16777619
+    }
+    return h
+}
+
+pub fn fnv1a_64(data[]: const u8): u64 {
+    var h: u64 = 14695981039346656037
+    loop b in data {
+        h = (h ^ u64(b)) *% 1099511628211
+    }
+    return h
+}
+
+pub fn fnv1a_64_str(s: str): u64 {
+    if len(s) == 0 {
+        return 14695981039346656037
+    }
+    var p = ptr_cast(*const u8, s)
+    return fnv1a_64(p[0..len(s)])
+}
+
+// -----------------------------------------------------------------------------
+// CRC32 (IEEE 802.3, polynomial 0xEDB88320)
+// -----------------------------------------------------------------------------
+
+// Continues an incremental IEEE CRC32 checksum (pass `0` for initial `prev_crc`).
+pub fn crc32_update(prev_crc: u32, data[]: const u8): u32 {
+    var crc = ~prev_crc
+    loop b in data {
+        crc ^= u32(b)
+        loop bit in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc >>= 1
+            }
+        }
+    }
+    return ~crc
+}
+
+pub fn crc32(data[]: const u8): u32 {
+    return crc32_update(0, data)
+}
+
+pub fn crc32_str(s: str): u32 {
+    if len(s) == 0 {
+        return 0
+    }
+    var p = ptr_cast(*const u8, s)
+    return crc32(p[0..len(s)])
+}
+
+// -----------------------------------------------------------------------------
+// SHA-256 (FIPS 180-4)
+// -----------------------------------------------------------------------------
+
+pub struct Sha256Digest {
+    bytes[32]: u8
+}
+
+pub fn (d: *const Sha256Digest) to_hex(out: *StringBuilder) {
+    hex_encode(d.bytes, out)
+}
+
+pub fn (d: *const Sha256Digest) eq(other: *const Sha256Digest): bool {
+    return eq_mem(&d.bytes[0], &other.bytes[0], 32)
+}
+
+pub struct Sha256 {
+    h[8]: u32
+    buf[64]: u8
+    buf_len: i64
+    total_len: u64
+}
+
+priv fn rotr32(x: u32, n: u32): u32 {
+    return (x >> n) | (x << (32 - n))
+}
+
+priv fn sha256_compress(ctx: *Sha256, block: *const u8) {
+    var k[64]: u32 = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+    ]
+
+    var w[64]: u32 = []
+    loop i in 0..16 {
+        var j = i * 4
+        w[i] = (u32(block[j]) << 24) |
+               (u32(block[j + 1]) << 16) |
+               (u32(block[j + 2]) << 8) |
+               u32(block[j + 3])
+    }
+    loop i in 16..64 {
+        var s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >> 3)
+        var s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >> 10)
+        w[i] = w[i - 16] +% s0 +% w[i - 7] +% s1
+    }
+
+    var a = ctx.h[0]
+    var b = ctx.h[1]
+    var c = ctx.h[2]
+    var d = ctx.h[3]
+    var e = ctx.h[4]
+    var f = ctx.h[5]
+    var g = ctx.h[6]
+    var hh = ctx.h[7]
+
+    loop i in 0..64 {
+        var S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25)
+        var ch = (e & f) ^ ((~e) & g)
+        var temp1 = hh +% S1 +% ch +% k[i] +% w[i]
+        var S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22)
+        var maj = (a & b) ^ (a & c) ^ (b & c)
+        var temp2 = S0 +% maj
+
+        hh = g
+        g = f
+        f = e
+        e = d +% temp1
+        d = c
+        c = b
+        b = a
+        a = temp1 +% temp2
+    }
+
+    ctx.h[0] +%= a
+    ctx.h[1] +%= b
+    ctx.h[2] +%= c
+    ctx.h[3] +%= d
+    ctx.h[4] +%= e
+    ctx.h[5] +%= f
+    ctx.h[6] +%= g
+    ctx.h[7] +%= hh
+}
+
+pub fn sha256_init(): Sha256 {
+    var ctx = Sha256 {}
+    ctx.h[0] = 0x6a09e667
+    ctx.h[1] = 0xbb67ae85
+    ctx.h[2] = 0x3c6ef372
+    ctx.h[3] = 0xa54ff53a
+    ctx.h[4] = 0x510e527f
+    ctx.h[5] = 0x9b05688c
+    ctx.h[6] = 0x1f83d9ab
+    ctx.h[7] = 0x5be0cd19
+    return ctx
+}
+
+pub fn (ctx: *Sha256) update(data[]: const u8) {
+    var n = len(data)
+    if n == 0 {
+        return
+    }
+    ctx.total_len +%= u64(n)
+    var off: i64 = 0
+
+    if ctx.buf_len > 0 {
+        var space = 64 - ctx.buf_len
+        var take = n
+        if space < take {
+            take = space
+        }
+        copy_mem(&ctx.buf[ctx.buf_len], &data[0], usize(take))
+        ctx.buf_len += take
+        off += take
+        if ctx.buf_len == 64 {
+            sha256_compress(ctx, &ctx.buf[0])
+            ctx.buf_len = 0
+        }
+    }
+
+    loop off + 64 <= n {
+        sha256_compress(ctx, &data[off])
+        off += 64
+    }
+
+    var rem = n - off
+    if rem > 0 {
+        copy_mem(&ctx.buf[0], &data[off], usize(rem))
+        ctx.buf_len = rem
+    }
+}
+
+pub fn (ctx: *Sha256) update_str(s: str) {
+    if len(s) == 0 {
+        return
+    }
+    var p = ptr_cast(*const u8, s)
+    ctx.update(p[0..len(s)])
+}
+
+pub fn (ctx: *Sha256) finalize(): Sha256Digest {
+    var bit_len = ctx.total_len *% 8
+    var pad_byte[1]: u8 = [0x80]
+    ctx.update(pad_byte)
+
+    if ctx.buf_len > 56 {
+        loop ctx.buf_len < 64 {
+            ctx.buf[ctx.buf_len] = 0
+            ctx.buf_len += 1
+        }
+        sha256_compress(ctx, &ctx.buf[0])
+        ctx.buf_len = 0
+    }
+    loop ctx.buf_len < 56 {
+        ctx.buf[ctx.buf_len] = 0
+        ctx.buf_len += 1
+    }
+    ctx.buf[56] = u8((bit_len >> 56) & 0xFF)
+    ctx.buf[57] = u8((bit_len >> 48) & 0xFF)
+    ctx.buf[58] = u8((bit_len >> 40) & 0xFF)
+    ctx.buf[59] = u8((bit_len >> 32) & 0xFF)
+    ctx.buf[60] = u8((bit_len >> 24) & 0xFF)
+    ctx.buf[61] = u8((bit_len >> 16) & 0xFF)
+    ctx.buf[62] = u8((bit_len >> 8) & 0xFF)
+    ctx.buf[63] = u8(bit_len & 0xFF)
+    sha256_compress(ctx, &ctx.buf[0])
+
+    var out = Sha256Digest {}
+    loop i in 0..8 {
+        var j = i * 4
+        var v = ctx.h[i]
+        out.bytes[j]     = u8((v >> 24) & 0xFF)
+        out.bytes[j + 1] = u8((v >> 16) & 0xFF)
+        out.bytes[j + 2] = u8((v >> 8) & 0xFF)
+        out.bytes[j + 3] = u8(v & 0xFF)
+    }
+    return out
+}
+
+pub fn sha256(data[]: const u8): Sha256Digest {
+    var ctx = sha256_init()
+    ctx.update(data)
+    return ctx.finalize()
+}
+
+pub fn sha256_str(s: str): Sha256Digest {
+    var ctx = sha256_init()
+    ctx.update_str(s)
+    return ctx.finalize()
+}

@@ -1,0 +1,222 @@
+// =============================================================================
+// Antimony Standard Library: std/encoding.sb
+// RFC 4648 Hexadecimal and Base64 (standard & URL-safe) encoding and decoding.
+// =============================================================================
+
+import "std/core.sb"
+import "std/str.sb"
+import "std/vec.sb"
+
+pub enum DecodeError {
+    InvalidLength
+    InvalidChar
+    InvalidPadding
+}
+
+// -----------------------------------------------------------------------------
+// Hexadecimal (Base16)
+// -----------------------------------------------------------------------------
+
+// Appends lowercase hex representation of `data[]` to `out`.
+pub fn hex_encode(data[]: const u8, out: *StringBuilder) {
+    var digits = "0123456789abcdef"
+    var n = len(data)
+    if n == 0 {
+        return
+    }
+    out.ensure(usize(n) * 2)
+    loop i in 0..n {
+        var b = data[i]
+        out.append_byte(digits[i64(b >> 4)])
+        out.append_byte(digits[i64(b & 0x0F)])
+    }
+}
+
+pub fn hex_encode_str(s: str, out: *StringBuilder) {
+    if len(s) == 0 {
+        return
+    }
+    var p = ptr_cast(*const u8, s)
+    hex_encode(p[0..len(s)], out)
+}
+
+priv fn hex_val(c: u8): i32 {
+    if c >= '0' && c <= '9' {
+        return i32(c - '0')
+    }
+    if c >= 'a' && c <= 'f' {
+        return i32(c - 'a') + 10
+    }
+    if c >= 'A' && c <= 'F' {
+        return i32(c - 'A') + 10
+    }
+    return -1
+}
+
+// Decodes hex string `src` and appends raw bytes to `out`, returning bytes written.
+pub fn hex_decode(src: str, out: *Vec[u8]): Result[i64, DecodeError] {
+    var n = len(src)
+    if (n & 1) != 0 {
+        return .Err(.InvalidLength)
+    }
+    if n == 0 {
+        return .Ok(0)
+    }
+    var count = n / 2
+    out.reserve(out.len + count)
+    var i: i64 = 0
+    loop i < n {
+        var hi = hex_val(src[i])
+        var lo = hex_val(src[i + 1])
+        if hi < 0 || lo < 0 {
+            return .Err(.InvalidChar)
+        }
+        out.push(u8((hi << 4) | lo))
+        i += 2
+    }
+    return .Ok(count)
+}
+
+// -----------------------------------------------------------------------------
+// Base64 (RFC 4648 Standard & URL-Safe)
+// -----------------------------------------------------------------------------
+
+priv fn base64_encode_with(data[]: const u8, alphabet: str, pad: bool, out: *StringBuilder) {
+    var n = len(data)
+    if n == 0 {
+        return
+    }
+    out.ensure(usize(((n + 2) / 3) * 4))
+    var i: i64 = 0
+    loop i + 3 <= n {
+        var v: u32 = (u32(data[i]) << 16) | (u32(data[i + 1]) << 8) | u32(data[i + 2])
+        out.append_byte(alphabet[i64((v >> 18) & 63)])
+        out.append_byte(alphabet[i64((v >> 12) & 63)])
+        out.append_byte(alphabet[i64((v >> 6) & 63)])
+        out.append_byte(alphabet[i64(v & 63)])
+        i += 3
+    }
+    var rem = n - i
+    if rem == 1 {
+        var v: u32 = u32(data[i]) << 16
+        out.append_byte(alphabet[i64((v >> 18) & 63)])
+        out.append_byte(alphabet[i64((v >> 12) & 63)])
+        if pad {
+            out.append_byte('=')
+            out.append_byte('=')
+        }
+    } else if rem == 2 {
+        var v: u32 = (u32(data[i]) << 16) | (u32(data[i + 1]) << 8)
+        out.append_byte(alphabet[i64((v >> 18) & 63)])
+        out.append_byte(alphabet[i64((v >> 12) & 63)])
+        out.append_byte(alphabet[i64((v >> 6) & 63)])
+        if pad {
+            out.append_byte('=')
+        }
+    }
+}
+
+// Encodes `data[]` using standard RFC 4648 Base64 (`+/` with `=` padding).
+pub fn base64_encode(data[]: const u8, out: *StringBuilder) {
+    base64_encode_with(data, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/", true, out)
+}
+
+pub fn base64_encode_str(s: str, out: *StringBuilder) {
+    if len(s) == 0 {
+        return
+    }
+    var p = ptr_cast(*const u8, s)
+    base64_encode(p[0..len(s)], out)
+}
+
+// Encodes `data[]` using URL-safe Base64 (`-_`, no padding).
+pub fn base64_url_encode(data[]: const u8, out: *StringBuilder) {
+    base64_encode_with(data, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_", false, out)
+}
+
+priv fn b64_val(c: u8): i32 {
+    if c >= 'A' && c <= 'Z' {
+        return i32(c - 'A')
+    }
+    if c >= 'a' && c <= 'z' {
+        return i32(c - 'a') + 26
+    }
+    if c >= '0' && c <= '9' {
+        return i32(c - '0') + 52
+    }
+    if c == '+' || c == '-' {
+        return 62
+    }
+    if c == '/' || c == '_' {
+        return 63
+    }
+    return -1
+}
+
+// Decodes standard or URL-safe Base64 (padded or unpadded) and appends bytes to `out`.
+pub fn base64_decode(src: str, out: *Vec[u8]): Result[i64, DecodeError] {
+    var n = len(src)
+    if n == 0 {
+        return .Ok(0)
+    }
+    // Strip up to 2 trailing '=' padding chars (validating length if padded).
+    var pad_count: i64 = 0
+    if src[n - 1] == '=' {
+        if (n & 3) != 0 {
+            return .Err(.InvalidPadding)
+        }
+        pad_count = 1
+        if n >= 2 && src[n - 2] == '=' {
+            pad_count = 2
+        }
+    }
+    var eff = n - pad_count
+    if (eff & 3) == 1 {
+        return .Err(.InvalidLength)
+    }
+
+    var start_len = out.len
+    out.reserve(start_len + (eff * 3) / 4 + 1)
+
+    var i: i64 = 0
+    loop i + 4 <= eff {
+        var v0 = b64_val(src[i])
+        var v1 = b64_val(src[i + 1])
+        var v2 = b64_val(src[i + 2])
+        var v3 = b64_val(src[i + 3])
+        if v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0 {
+            out.len = start_len
+            return .Err(.InvalidChar)
+        }
+        var triple: u32 = (u32(v0) << 18) | (u32(v1) << 12) | (u32(v2) << 6) | u32(v3)
+        out.push(u8((triple >> 16) & 0xFF))
+        out.push(u8((triple >> 8) & 0xFF))
+        out.push(u8(triple & 0xFF))
+        i += 4
+    }
+
+    var rem = eff - i
+    if rem == 2 {
+        var v0 = b64_val(src[i])
+        var v1 = b64_val(src[i + 1])
+        if v0 < 0 || v1 < 0 {
+            out.len = start_len
+            return .Err(.InvalidChar)
+        }
+        var v: u32 = (u32(v0) << 18) | (u32(v1) << 12)
+        out.push(u8((v >> 16) & 0xFF))
+    } else if rem == 3 {
+        var v0 = b64_val(src[i])
+        var v1 = b64_val(src[i + 1])
+        var v2 = b64_val(src[i + 2])
+        if v0 < 0 || v1 < 0 || v2 < 0 {
+            out.len = start_len
+            return .Err(.InvalidChar)
+        }
+        var v: u32 = (u32(v0) << 18) | (u32(v1) << 12) | (u32(v2) << 6)
+        out.push(u8((v >> 16) & 0xFF))
+        out.push(u8((v >> 8) & 0xFF))
+    }
+
+    return .Ok(out.len - start_len)
+}

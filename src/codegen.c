@@ -1372,8 +1372,12 @@ static void gen_expr(CG *cg, Node *n) {
     case N_DEREF: {
         Type *elem_t = n->type;
         gen_lvalue_addr(cg, n);
-        if (elem_t->kind == TY_ARRAY || is_aggregate_type(elem_t)) {
-            // Address of array/struct/tagged-enum is already in RAX.
+        if (elem_t->kind == TY_ARRAY) {
+            if (n->implicit_slice) x_mov_ri(RDX, (uint64_t)elem_t->array_len);
+            return;
+        }
+        if (is_aggregate_type(elem_t)) {
+            // Address of struct/tagged-enum is already in RAX.
             return;
         }
         if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {
@@ -1397,7 +1401,11 @@ static void gen_expr(CG *cg, Node *n) {
     case N_FIELD: {
         Type *ft = n->type;
         gen_lvalue_addr(cg, n);
-        if (ft->kind == TY_ARRAY || is_aggregate_type(ft)) {
+        if (ft->kind == TY_ARRAY) {
+            if (n->implicit_slice) x_mov_ri(RDX, (uint64_t)ft->array_len);
+            return;
+        }
+        if (is_aggregate_type(ft)) {
             return;
         }
         if (ft == &ty_str || ft->kind == TY_SLICE) {
@@ -1457,7 +1465,11 @@ static void gen_expr(CG *cg, Node *n) {
             }
         }
         gen_index_addr(cg, n);
-        if (elem_t->kind == TY_ARRAY || is_aggregate_type(elem_t)) {
+        if (elem_t->kind == TY_ARRAY) {
+            if (n->implicit_slice) x_mov_ri(RDX, (uint64_t)elem_t->array_len);
+            return;
+        }
+        if (is_aggregate_type(elem_t)) {
             return;
         }
         if (elem_t == &ty_str || elem_t->kind == TY_SLICE) {

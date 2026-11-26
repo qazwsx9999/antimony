@@ -981,7 +981,7 @@ static LlvmVal llvm_gen_collection_slice(LlvmGen *g, Node *base) {
 // Returns a `ptr` holding the storage address of `n`.
 static const char *llvm_gen_addr(LlvmGen *g, Node *n) {
     if (n->kind == N_IDENT || n->kind == N_DEREF || n->kind == N_FIELD || n->kind == N_INDEX) {
-        if (n->kind == N_IDENT && n->implicit_slice) {
+        if (n->implicit_slice) {
             LlvmVal sl = llvm_gen_expr(g, n);
             const char *p = llvm_alloca_ty(g, "%sb.slice", 8);
             llvm_store_val(g, sl, p, 8);
@@ -1314,6 +1314,9 @@ static LlvmVal llvm_gen_expr(LlvmGen *g, Node *n) {
     case N_FIELD:
     case N_INDEX: {
         const char *addr = llvm_gen_lvalue(g, n);
+        if (n->implicit_slice) {
+            return llvm_make_slice(g, addr, llvm_fmt(g, "%d", n->type->array_len));
+        }
         return llvm_load_ty(g, addr, llvm_type_str(g, n->type), llvm_type_align(n->type));
     }
 

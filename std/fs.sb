@@ -5,11 +5,31 @@
 // =============================================================================
 
 import "std/core.sb"
+import "std/mem.sb"
 import "std/io.sb"
 import "std/str.sb"
 
 const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10
+const INVALID_FIND_HANDLE: isize    = -1
+const WIN32_ERR_NO_MORE_FILES: u32  = 18
+
+priv struct Win32FindDataA {
+    file_attributes: u32
+    creation_lo: u32
+    creation_hi: u32
+    access_lo: u32
+    access_hi: u32
+    write_lo: u32
+    write_hi: u32
+    file_size_high: u32
+    file_size_low: u32
+    reserved0: u32
+    reserved1: u32
+    file_name[260]: u8
+    alt_name[14]: u8
+    _pad[2]: u8
+}
 
 priv extern "kernel32.dll" {
     fn GetFileAttributesA(lpFileName: *const u8): u32
@@ -18,6 +38,9 @@ priv extern "kernel32.dll" {
     fn DeleteFileA(lpFileName: *const u8): i32
     fn MoveFileExA(lpExistingFileName: *const u8, lpNewFileName: *const u8, dwFlags: u32): i32
     fn CopyFileA(lpExistingFileName: *const u8, lpNewFileName: *const u8, bFailIfExists: i32): i32
+    fn FindFirstFileA(lpFileName: *const u8, lpFindFileData: *u8): isize
+    fn FindNextFileA(hFindFile: isize, lpFindFileData: *u8): i32
+    fn FindClose(hFindFile: isize): i32
     fn GetLastError(): u32
 }
 
@@ -136,4 +159,108 @@ pub fn fs_copy(src: str, dst: str): Result[bool, IoError] {
         return .Err(io_error_from_win32(GetLastError()))
     }
     return .Ok(true)
+}
+
+// -----------------------------------------------------------------------------
+// Directory Iteration (`fs_read_dir`, `DirIter`, `DirEntry`)
+// -----------------------------------------------------------------------------
+
+pub struct DirEntry {
+    name_buf[260]: u8
+    name_len: i64
+    size: i64
+    is_dir: bool
+}
+
+// Returns a zero-copy `str` view of the entry's filename (valid while `e` lives).
+pub fn (e: *DirEntry) name(): str {
+    if e.name_len <= 0 {
+        return ""
+    }
+    return str(e.name_buf[0..e.name_len])
+}
+
+pub struct DirIter {
+    handle: isize
+    raw_find[320]: u8
+    has_pending: bool
+}
+
+priv fn fill_dir_entry(fd: *const Win32FindDataA, out: *DirEntry) {
+    var n = i64(cstr_len(&fd.file_name[0]))
+    if n > 259 {
+        n = 259
+    }
+    if n > 0 {
+        copy_mem(&out.name_buf[0], &fd.file_name[0], usize(n))
+    }
+    out.name_buf[n] = 0
+    out.name_len = n
+    out.size = i64((u64(fd.file_size_high) << 32) | u64(fd.file_size_low))
+    out.is_dir = (fd.file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+}
+
+// Opens a directory iterator over all entries in `path` (automatically skipping "." and "..").
+pub fn fs_read_dir(path: str): Result[DirIter, IoError] {
+    if len(path) == 0 {
+        return .Err(.InvalidInput)
+    }
+    var pat: StringBuilder
+    pat.init(usize(len(path)) + 4)
+    defer pat.free()
+    pat.append(path)
+    var last = path[len(path) - 1]
+    if last != '\\' && last != '/' {
+        pat.append_byte('\\')
+    }
+    pat.append_byte('*')
+
+    var it = DirIter { handle: INVALID_FIND_HANDLE, has_pending: false }
+    var h = FindFirstFileA(pat.cstr(), &it.raw_find[0])
+    if h == INVALID_FIND_HANDLE {
+        var err = GetLastError()
+        if err == WIN32_ERR_NO_MORE_FILES {
+            return .Ok(it)
+        }
+        return .Err(io_error_from_win32(err))
+    }
+    it.handle = h
+    it.has_pending = true
+    return .Ok(it)
+}
+
+// Advances the iterator, populating `out` with the next entry.
+// Returns `.Ok(true)` if an entry was produced, or `.Ok(false)` when finished.
+pub fn (it: *DirIter) next(out: *DirEntry): Result[bool, IoError] {
+    if it.handle == INVALID_FIND_HANDLE {
+        return .Ok(false)
+    }
+    loop {
+        if !it.has_pending {
+            if FindNextFileA(it.handle, &it.raw_find[0]) == 0 {
+                var err = GetLastError()
+                it.close()
+                if err == WIN32_ERR_NO_MORE_FILES {
+                    return .Ok(false)
+                }
+                return .Err(io_error_from_win32(err))
+            }
+        }
+        it.has_pending = false
+        var fd = ptr_cast(*const Win32FindDataA, &it.raw_find[0])
+        var nm = cstr_to_str(&fd.file_name[0])
+        if nm == "." || nm == ".." {
+            continue
+        }
+        fill_dir_entry(fd, out)
+        return .Ok(true)
+    }
+}
+
+pub fn (it: *DirIter) close() {
+    if it.handle != INVALID_FIND_HANDLE && it.handle != 0 {
+        FindClose(it.handle)
+        it.handle = INVALID_FIND_HANDLE
+    }
+    it.has_pending = false
 }

@@ -1,0 +1,826 @@
+// =============================================================================
+// Antimony Standard Library: std/json.sb
+// RFC 8259 compliant, arena-backed JSON parser, builder, and serializer
+// (`JsonDoc`, `JsonKind`, `JsonError`).
+//
+// Memory model: All nodes and unescaped strings live in flat pools owned by
+// `JsonDoc`. A single `defer doc.free()` releases everything in O(1).
+// =============================================================================
+
+import "std/core.sb"
+import "std/str.sb"
+import "std/vec.sb"
+
+const JSON_MAX_DEPTH: i32 = 128
+
+pub enum JsonKind {
+    Null
+    Bool
+    Int
+    Float
+    String
+    Array
+    Object
+}
+
+pub enum JsonError {
+    UnexpectedEof
+    UnexpectedToken(i64)
+    InvalidNumber(i64)
+    InvalidString(i64)
+    InvalidEscape(i64)
+    TrailingData(i64)
+    MaxDepthExceeded
+}
+
+pub struct JsonNode {
+    kind: JsonKind
+    bool_val: bool
+    int_val: i64
+    float_val: f64
+    str_off: i64
+    str_len: i64
+    key_off: i64    // object member key offset in `doc.strings` (-1 if not an object member)
+    key_len: i64
+    first_child: i64
+    last_child: i64
+    next_sibling: i64
+    child_count: i64
+}
+
+pub struct JsonDoc {
+    nodes: Vec[JsonNode]
+    strings: StringBuilder
+    root: i64
+}
+
+pub fn (doc: *JsonDoc) init() {
+    doc.nodes.init(32)
+    doc.strings.init(128)
+    doc.root = -1
+}
+
+pub fn (doc: *JsonDoc) clear() {
+    doc.nodes.clear()
+    doc.strings.clear()
+    doc.root = -1
+}
+
+pub fn (doc: *JsonDoc) free() {
+    doc.nodes.free()
+    doc.strings.free()
+    doc.root = -1
+}
+
+priv fn (doc: *JsonDoc) intern_slice(s: str): i64 {
+    var off = i64(doc.strings.len)
+    doc.strings.append(s)
+    return off
+}
+
+priv fn (doc: *JsonDoc) alloc_node(kind: JsonKind): i64 {
+    var id = doc.nodes.len
+    doc.nodes.push(JsonNode {
+        kind: kind,
+        key_off: -1,
+        key_len: 0,
+        first_child: -1,
+        last_child: -1,
+        next_sibling: -1,
+        child_count: 0
+    })
+    return id
+}
+
+// -----------------------------------------------------------------------------
+// Programmatic JSON Construction
+// -----------------------------------------------------------------------------
+
+pub fn (doc: *JsonDoc) new_null(): i64 {
+    return doc.alloc_node(.Null)
+}
+
+pub fn (doc: *JsonDoc) new_bool(v: bool): i64 {
+    var id = doc.alloc_node(.Bool)
+    var n = doc.nodes.get_ptr(id)
+    n.bool_val = v
+    return id
+}
+
+pub fn (doc: *JsonDoc) new_i64(v: i64): i64 {
+    var id = doc.alloc_node(.Int)
+    var n = doc.nodes.get_ptr(id)
+    n.int_val = v
+    n.float_val = f64(v)
+    return id
+}
+
+pub fn (doc: *JsonDoc) new_f64(v: f64): i64 {
+    var id = doc.alloc_node(.Float)
+    var n = doc.nodes.get_ptr(id)
+    n.float_val = v
+    return id
+}
+
+pub fn (doc: *JsonDoc) new_str(s: str): i64 {
+    var off = doc.intern_slice(s)
+    var id = doc.alloc_node(.String)
+    var n = doc.nodes.get_ptr(id)
+    n.str_off = off
+    n.str_len = len(s)
+    return id
+}
+
+pub fn (doc: *JsonDoc) new_array(): i64 {
+    return doc.alloc_node(.Array)
+}
+
+pub fn (doc: *JsonDoc) new_object(): i64 {
+    return doc.alloc_node(.Object)
+}
+
+priv fn (doc: *JsonDoc) link_child(parent_id: i64, child_id: i64) {
+    var p = doc.nodes.get_ptr(parent_id)
+    if p.first_child < 0 {
+        p.first_child = child_id
+        p.last_child = child_id
+    } else {
+        var prev = doc.nodes.get_ptr(p.last_child)
+        prev.next_sibling = child_id
+        p.last_child = child_id
+    }
+    p.child_count += 1
+}
+
+pub fn (doc: *JsonDoc) array_push(arr_id: i64, val_id: i64) {
+    assert(arr_id >= 0 && arr_id < doc.nodes.len, "JsonDoc.array_push: invalid array id")
+    doc.link_child(arr_id, val_id)
+}
+
+pub fn (doc: *JsonDoc) object_set(obj_id: i64, key: str, val_id: i64) {
+    assert(obj_id >= 0 && obj_id < doc.nodes.len, "JsonDoc.object_set: invalid object id")
+    var koff = doc.intern_slice(key)
+    var vn = doc.nodes.get_ptr(val_id)
+    vn.key_off = koff
+    vn.key_len = len(key)
+    doc.link_child(obj_id, val_id)
+}
+
+// -----------------------------------------------------------------------------
+// DOM Inspection & Queries
+// -----------------------------------------------------------------------------
+
+pub fn (doc: *const JsonDoc) kind(id: i64): JsonKind {
+    if id < 0 || id >= doc.nodes.len {
+        return .Null
+    }
+    return doc.nodes.get(id).kind
+}
+
+pub fn (doc: *const JsonDoc) is_null(id: i64): bool {
+    return doc.kind(id) == JsonKind.Null
+}
+
+pub fn (doc: *const JsonDoc) as_bool(id: i64): Option[bool] {
+    if id < 0 || id >= doc.nodes.len {
+        return .None
+    }
+    var n = doc.nodes.get(id)
+    if n.kind != JsonKind.Bool {
+        return .None
+    }
+    return .Some(n.bool_val)
+}
+
+pub fn (doc: *const JsonDoc) as_i64(id: i64): Option[i64] {
+    if id < 0 || id >= doc.nodes.len {
+        return .None
+    }
+    var n = doc.nodes.get(id)
+    if n.kind == JsonKind.Int {
+        return .Some(n.int_val)
+    }
+    return .None
+}
+
+pub fn (doc: *const JsonDoc) as_f64(id: i64): Option[f64] {
+    if id < 0 || id >= doc.nodes.len {
+        return .None
+    }
+    var n = doc.nodes.get(id)
+    if n.kind == JsonKind.Float || n.kind == JsonKind.Int {
+        return .Some(n.float_val)
+    }
+    return .None
+}
+
+pub fn (doc: *const JsonDoc) as_str(id: i64): Option[str] {
+    if id < 0 || id >= doc.nodes.len {
+        return .None
+    }
+    var n = doc.nodes.get(id)
+    if n.kind != JsonKind.String {
+        return .None
+    }
+    if n.str_len == 0 {
+        return .Some("")
+    }
+    var pool = doc.strings.as_str()
+    return .Some(pool[n.str_off..n.str_off + n.str_len])
+}
+
+// Returns element count for Array or member count for Object (0 otherwise).
+pub fn (doc: *const JsonDoc) len(id: i64): i64 {
+    if id < 0 || id >= doc.nodes.len {
+        return 0
+    }
+    var n = doc.nodes.get(id)
+    if n.kind == JsonKind.Array || n.kind == JsonKind.Object {
+        return n.child_count
+    }
+    return 0
+}
+
+// Returns the `index`-th child node ID of an Array or Object.
+pub fn (doc: *const JsonDoc) at(id: i64, index: i64): Option[i64] {
+    if id < 0 || id >= doc.nodes.len || index < 0 {
+        return .None
+    }
+    var n = doc.nodes.get(id)
+    if (n.kind != JsonKind.Array && n.kind != JsonKind.Object) || index >= n.child_count {
+        return .None
+    }
+    var cur = n.first_child
+    var i: i64 = 0
+    loop cur >= 0 && i < index {
+        cur = doc.nodes.get(cur).next_sibling
+        i += 1
+    }
+    if cur < 0 {
+        return .None
+    }
+    return .Some(cur)
+}
+
+// Returns the key name of an object member node ID.
+pub fn (doc: *const JsonDoc) member_key(child_id: i64): Option[str] {
+    if child_id < 0 || child_id >= doc.nodes.len {
+        return .None
+    }
+    var n = doc.nodes.get(child_id)
+    if n.key_off < 0 {
+        return .None
+    }
+    if n.key_len == 0 {
+        return .Some("")
+    }
+    var pool = doc.strings.as_str()
+    return .Some(pool[n.key_off..n.key_off + n.key_len])
+}
+
+// Looks up `key` in a JSON Object node (returns the last matching member if duplicate keys exist).
+pub fn (doc: *const JsonDoc) get(obj_id: i64, key: str): Option[i64] {
+    if obj_id < 0 || obj_id >= doc.nodes.len {
+        return .None
+    }
+    var obj = doc.nodes.get(obj_id)
+    if obj.kind != JsonKind.Object {
+        return .None
+    }
+    var pool = doc.strings.as_str()
+    var found: i64 = -1
+    var cur = obj.first_child
+    loop cur >= 0 {
+        var child = doc.nodes.get(cur)
+        if child.key_off >= 0 {
+            var k = ""
+            if child.key_len > 0 {
+                k = pool[child.key_off..child.key_off + child.key_len]
+            }
+            if k == key {
+                found = cur
+            }
+        }
+        cur = child.next_sibling
+    }
+    if found < 0 {
+        return .None
+    }
+    return .Some(found)
+}
+
+// -----------------------------------------------------------------------------
+// RFC 8259 Recursive-Descent Parser
+// -----------------------------------------------------------------------------
+
+priv struct JsonParser {
+    src: str
+    pos: i64
+    len: i64
+    depth: i32
+    doc: *JsonDoc
+}
+
+priv fn is_json_ws(c: u8): bool {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+priv fn (p: *JsonParser) skip_ws() {
+    loop p.pos < p.len && is_json_ws(p.src[p.pos]) {
+        p.pos += 1
+    }
+}
+
+priv fn hex4_digit(c: u8): i32 {
+    if c >= '0' && c <= '9' { return i32(c - '0') }
+    if c >= 'a' && c <= 'f' { return i32(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return i32(c - 'A') + 10 }
+    return -1
+}
+
+priv fn (p: *JsonParser) parse_hex4(): Result[u32, JsonError] {
+    if p.pos + 4 > p.len {
+        return .Err(.InvalidEscape(p.pos))
+    }
+    var v: u32 = 0
+    loop i in 0..i64(4) {
+        var d = hex4_digit(p.src[p.pos + i])
+        if d < 0 {
+            return .Err(.InvalidEscape(p.pos + i))
+        }
+        v = (v << 4) | u32(d)
+    }
+    p.pos += 4
+    return .Ok(v)
+}
+
+priv fn append_utf8_codepoint(sb: *StringBuilder, cp: u32) {
+    if cp <= 0x7F {
+        sb.append_byte(u8(cp))
+    } else if cp <= 0x7FF {
+        sb.append_byte(u8(0xC0 | (cp >> 6)))
+        sb.append_byte(u8(0x80 | (cp & 0x3F)))
+    } else if cp <= 0xFFFF {
+        sb.append_byte(u8(0xE0 | (cp >> 12)))
+        sb.append_byte(u8(0x80 | ((cp >> 6) & 0x3F)))
+        sb.append_byte(u8(0x80 | (cp & 0x3F)))
+    } else {
+        sb.append_byte(u8(0xF0 | (cp >> 18)))
+        sb.append_byte(u8(0x80 | ((cp >> 12) & 0x3F)))
+        sb.append_byte(u8(0x80 | ((cp >> 6) & 0x3F)))
+        sb.append_byte(u8(0x80 | (cp & 0x3F)))
+    }
+}
+
+priv fn (p: *JsonParser) parse_string_span(out_off: *i64, out_len: *i64): Result[bool, JsonError] {
+    if p.pos >= p.len || p.src[p.pos] != '"' {
+        return .Err(.InvalidString(p.pos))
+    }
+    p.pos += 1
+    var start_off = i64(p.doc.strings.len)
+    loop p.pos < p.len {
+        var c = p.src[p.pos]
+        if c == '"' {
+            p.pos += 1
+            *out_off = start_off
+            *out_len = i64(p.doc.strings.len) - start_off
+            return .Ok(true)
+        }
+        if c < 0x20 {
+            return .Err(.InvalidString(p.pos))
+        }
+        if c == '\\' {
+            p.pos += 1
+            if p.pos >= p.len {
+                return .Err(.InvalidEscape(p.pos))
+            }
+            var esc = p.src[p.pos]
+            p.pos += 1
+            if esc == '"' {
+                p.doc.strings.append_byte('"')
+            } else if esc == '\\' {
+                p.doc.strings.append_byte('\\')
+            } else if esc == '/' {
+                p.doc.strings.append_byte('/')
+            } else if esc == 'b' {
+                p.doc.strings.append_byte(8)
+            } else if esc == 'f' {
+                p.doc.strings.append_byte(12)
+            } else if esc == 'n' {
+                p.doc.strings.append_byte('\n')
+            } else if esc == 'r' {
+                p.doc.strings.append_byte('\r')
+            } else if esc == 't' {
+                p.doc.strings.append_byte('\t')
+            } else if esc == 'u' {
+                var cp = p.parse_hex4()?
+                // Decode UTF-16 surrogate pairs.
+                if cp >= 0xD800 && cp <= 0xDBFF {
+                    if p.pos + 2 > p.len || p.src[p.pos] != '\\' || p.src[p.pos + 1] != 'u' {
+                        return .Err(.InvalidEscape(p.pos))
+                    }
+                    p.pos += 2
+                    var low = p.parse_hex4()?
+                    if low < 0xDC00 || low > 0xDFFF {
+                        return .Err(.InvalidEscape(p.pos))
+                    }
+                    cp = 0x10000 + (((cp - 0xD800) << 10) | (low - 0xDC00))
+                } else if cp >= 0xDC00 && cp <= 0xDFFF {
+                    return .Err(.InvalidEscape(p.pos))
+                }
+                append_utf8_codepoint(&p.doc.strings, cp)
+            } else {
+                return .Err(.InvalidEscape(p.pos - 1))
+            }
+        } else {
+            p.doc.strings.append_byte(c)
+            p.pos += 1
+        }
+    }
+    return .Err(.UnexpectedEof)
+}
+
+priv fn (p: *JsonParser) parse_number(): Result[i64, JsonError] {
+    var start = p.pos
+    if p.pos < p.len && p.src[p.pos] == '-' {
+        p.pos += 1
+    }
+    if p.pos >= p.len || !is_digit(p.src[p.pos]) {
+        return .Err(.InvalidNumber(start))
+    }
+    if p.src[p.pos] == '0' {
+        p.pos += 1
+        if p.pos < p.len && is_digit(p.src[p.pos]) {
+            return .Err(.InvalidNumber(p.pos))
+        }
+    } else {
+        loop p.pos < p.len && is_digit(p.src[p.pos]) {
+            p.pos += 1
+        }
+    }
+    var is_float = false
+    if p.pos < p.len && p.src[p.pos] == '.' {
+        is_float = true
+        p.pos += 1
+        if p.pos >= p.len || !is_digit(p.src[p.pos]) {
+            return .Err(.InvalidNumber(p.pos))
+        }
+        loop p.pos < p.len && is_digit(p.src[p.pos]) {
+            p.pos += 1
+        }
+    }
+    if p.pos < p.len && (p.src[p.pos] == 'e' || p.src[p.pos] == 'E') {
+        is_float = true
+        p.pos += 1
+        if p.pos < p.len && (p.src[p.pos] == '+' || p.src[p.pos] == '-') {
+            p.pos += 1
+        }
+        if p.pos >= p.len || !is_digit(p.src[p.pos]) {
+            return .Err(.InvalidNumber(p.pos))
+        }
+        loop p.pos < p.len && is_digit(p.src[p.pos]) {
+            p.pos += 1
+        }
+    }
+    var slice = p.src[start..p.pos]
+    if !is_float {
+        match try_parse_i64(slice) {
+            .Ok(iv) {
+                return .Ok(p.doc.new_i64(iv))
+            }
+            .Err(_) { }
+        }
+    }
+    match try_parse_f64(slice) {
+        .Ok(fv) {
+            return .Ok(p.doc.new_f64(fv))
+        }
+        .Err(_) {
+            return .Err(.InvalidNumber(start))
+        }
+    }
+}
+
+priv fn (p: *JsonParser) parse_value(): Result[i64, JsonError] {
+    p.skip_ws()
+    if p.pos >= p.len {
+        return .Err(.UnexpectedEof)
+    }
+    var c = p.src[p.pos]
+    if c == 'n' {
+        if p.pos + 4 <= p.len && p.src[p.pos..p.pos + 4] == "null" {
+            p.pos += 4
+            return .Ok(p.doc.new_null())
+        }
+        return .Err(.UnexpectedToken(p.pos))
+    }
+    if c == 't' {
+        if p.pos + 4 <= p.len && p.src[p.pos..p.pos + 4] == "true" {
+            p.pos += 4
+            return .Ok(p.doc.new_bool(true))
+        }
+        return .Err(.UnexpectedToken(p.pos))
+    }
+    if c == 'f' {
+        if p.pos + 5 <= p.len && p.src[p.pos..p.pos + 5] == "false" {
+            p.pos += 5
+            return .Ok(p.doc.new_bool(false))
+        }
+        return .Err(.UnexpectedToken(p.pos))
+    }
+    if c == '"' {
+        var soff: i64 = 0
+        var slen: i64 = 0
+        p.parse_string_span(&soff, &slen)?
+        var id = p.doc.alloc_node(.String)
+        var n = p.doc.nodes.get_ptr(id)
+        n.str_off = soff
+        n.str_len = slen
+        return .Ok(id)
+    }
+    if c == '[' {
+        if p.depth >= JSON_MAX_DEPTH {
+            return .Err(.MaxDepthExceeded)
+        }
+        p.depth += 1
+        p.pos += 1
+        var arr_id = p.doc.new_array()
+        p.skip_ws()
+        if p.pos < p.len && p.src[p.pos] == ']' {
+            p.pos += 1
+            p.depth -= 1
+            return .Ok(arr_id)
+        }
+        loop {
+            var elem_id = p.parse_value()?
+            p.doc.link_child(arr_id, elem_id)
+            p.skip_ws()
+            if p.pos >= p.len {
+                return .Err(.UnexpectedEof)
+            }
+            if p.src[p.pos] == ',' {
+                p.pos += 1
+                continue
+            }
+            if p.src[p.pos] == ']' {
+                p.pos += 1
+                p.depth -= 1
+                return .Ok(arr_id)
+            }
+            return .Err(.UnexpectedToken(p.pos))
+        }
+    }
+    if c == '{' {
+        if p.depth >= JSON_MAX_DEPTH {
+            return .Err(.MaxDepthExceeded)
+        }
+        p.depth += 1
+        p.pos += 1
+        var obj_id = p.doc.new_object()
+        p.skip_ws()
+        if p.pos < p.len && p.src[p.pos] == '}' {
+            p.pos += 1
+            p.depth -= 1
+            return .Ok(obj_id)
+        }
+        loop {
+            p.skip_ws()
+            if p.pos >= p.len {
+                return .Err(.UnexpectedEof)
+            }
+            if p.src[p.pos] != '"' {
+                return .Err(.UnexpectedToken(p.pos))
+            }
+            var koff: i64 = 0
+            var klen: i64 = 0
+            p.parse_string_span(&koff, &klen)?
+            p.skip_ws()
+            if p.pos >= p.len || p.src[p.pos] != ':' {
+                return .Err(.UnexpectedToken(p.pos))
+            }
+            p.pos += 1
+            var val_id = p.parse_value()?
+            var vn = p.doc.nodes.get_ptr(val_id)
+            vn.key_off = koff
+            vn.key_len = klen
+            p.doc.link_child(obj_id, val_id)
+            p.skip_ws()
+            if p.pos >= p.len {
+                return .Err(.UnexpectedEof)
+            }
+            if p.src[p.pos] == ',' {
+                p.pos += 1
+                continue
+            }
+            if p.src[p.pos] == '}' {
+                p.pos += 1
+                p.depth -= 1
+                return .Ok(obj_id)
+            }
+            return .Err(.UnexpectedToken(p.pos))
+        }
+    }
+    if c == '-' || is_digit(c) {
+        return p.parse_number()
+    }
+    return .Err(.UnexpectedToken(p.pos))
+}
+
+// Parses a JSON document string into `doc` (clearing any previous contents).
+// Returns the root node ID on success.
+pub fn json_parse(src: str, doc: *JsonDoc): Result[i64, JsonError] {
+    doc.clear()
+    var p = JsonParser { src: src, pos: 0, len: len(src), depth: 0, doc: doc }
+    var root_id = p.parse_value()?
+    p.skip_ws()
+    if p.pos != p.len {
+        return .Err(.TrailingData(p.pos))
+    }
+    doc.root = root_id
+    return .Ok(root_id)
+}
+
+// -----------------------------------------------------------------------------
+// RFC 8259 Serializer (Compact & Pretty-Printed)
+// -----------------------------------------------------------------------------
+
+priv fn write_escaped_json_str(s: str, out: *StringBuilder) {
+    var hex = "0123456789abcdef"
+    out.append_byte('"')
+    loop i in 0..len(s) {
+        var c = s[i]
+        if c == '"' {
+            out.append(`\"`)
+        } else if c == '\\' {
+            out.append(`\\`)
+        } else if c == '\n' {
+            out.append(`\n`)
+        } else if c == '\r' {
+            out.append(`\r`)
+        } else if c == '\t' {
+            out.append(`\t`)
+        } else if c == 8 {
+            out.append(`\b`)
+        } else if c == 12 {
+            out.append(`\f`)
+        } else if c < 0x20 {
+            out.append(`\u00`)
+            out.append_byte(hex[i64(c >> 4)])
+            out.append_byte(hex[i64(c & 15)])
+        } else {
+            out.append_byte(c)
+        }
+    }
+    out.append_byte('"')
+}
+
+priv fn write_json_f64(v: f64, out: *StringBuilder) {
+    // NaN or Inf serialize to `null` per RFC 8259.
+    if v != v || v > 1.0e308 || v < -1.0e308 {
+        out.append("null")
+        return
+    }
+    var x = v
+    if x < 0.0 {
+        out.append_byte('-')
+        x = -x
+    }
+    if x == 0.0 {
+        out.append("0.0")
+        return
+    }
+    var ipart = i64(x)
+    var frac = x - f64(ipart)
+    // Round to 6 decimal places for clean output.
+    var scaled = i64(frac * 1000000.0 + 0.5)
+    if scaled >= 1000000 {
+        ipart += 1
+        scaled -= 1000000
+    }
+    out.append_i64(ipart)
+    out.append_byte('.')
+    if scaled == 0 {
+        out.append_byte('0')
+        return
+    }
+    var digits[6]: u8
+    var rem = scaled
+    var i: i64 = 5
+    loop i >= 0 {
+        digits[i] = u8('0' + (rem % 10))
+        rem /= 10
+        i -= 1
+    }
+    var end: i64 = 6
+    loop end > 1 && digits[end - 1] == '0' {
+        end -= 1
+    }
+    loop k in 0..end {
+        out.append_byte(digits[k])
+    }
+}
+
+priv fn write_indent(out: *StringBuilder, spaces: i32) {
+    loop i in 0..spaces {
+        out.append_byte(' ')
+    }
+}
+
+priv fn stringify_node(doc: *const JsonDoc, id: i64, indent: i32, depth: i32, out: *StringBuilder) {
+    if id < 0 || id >= doc.nodes.len {
+        out.append("null")
+        return
+    }
+    var n = doc.nodes.get(id)
+    var pool = doc.strings.as_str()
+    match n.kind {
+        .Null {
+            out.append("null")
+        }
+        .Bool {
+            out.append_bool(n.bool_val)
+        }
+        .Int {
+            out.append_i64(n.int_val)
+        }
+        .Float {
+            write_json_f64(n.float_val, out)
+        }
+        .String {
+            var s = ""
+            if n.str_len > 0 {
+                s = pool[n.str_off..n.str_off + n.str_len]
+            }
+            write_escaped_json_str(s, out)
+        }
+        .Array {
+            out.append_byte('[')
+            if n.child_count > 0 {
+                var cur = n.first_child
+                var first = true
+                loop cur >= 0 {
+                    if !first {
+                        out.append_byte(',')
+                    }
+                    first = false
+                    if indent > 0 {
+                        out.append_byte('\n')
+                        write_indent(out, indent * (depth + 1))
+                    }
+                    stringify_node(doc, cur, indent, depth + 1, out)
+                    cur = doc.nodes.get(cur).next_sibling
+                }
+                if indent > 0 {
+                    out.append_byte('\n')
+                    write_indent(out, indent * depth)
+                }
+            }
+            out.append_byte(']')
+        }
+        .Object {
+            out.append_byte('{')
+            if n.child_count > 0 {
+                var cur = n.first_child
+                var first = true
+                loop cur >= 0 {
+                    if !first {
+                        out.append_byte(',')
+                    }
+                    first = false
+                    if indent > 0 {
+                        out.append_byte('\n')
+                        write_indent(out, indent * (depth + 1))
+                    }
+                    var child = doc.nodes.get(cur)
+                    var k = ""
+                    if child.key_len > 0 {
+                        k = pool[child.key_off..child.key_off + child.key_len]
+                    }
+                    write_escaped_json_str(k, out)
+                    if indent > 0 {
+                        out.append(": ")
+                    } else {
+                        out.append_byte(':')
+                    }
+                    stringify_node(doc, cur, indent, depth + 1, out)
+                    cur = child.next_sibling
+                }
+                if indent > 0 {
+                    out.append_byte('\n')
+                    write_indent(out, indent * depth)
+                }
+            }
+            out.append_byte('}')
+        }
+    }
+}
+
+// Serializes node `id` as compact JSON into `out`.
+pub fn (doc: *const JsonDoc) stringify(id: i64, out: *StringBuilder) {
+    stringify_node(doc, id, 0, 0, out)
+}
+
+// Serializes node `id` as pretty-printed JSON with `indent_spaces` spaces per level.
+pub fn (doc: *const JsonDoc) stringify_pretty(id: i64, indent_spaces: i32, out: *StringBuilder) {
+    stringify_node(doc, id, indent_spaces, 0, out)
+}
