@@ -3204,6 +3204,132 @@ print(i)
     Write-Host "PASS [fmt]           phase26_sbc_fmt"
 }
 
+# 36. Phase 27: Unbounded Definite-Assignment Bitset (100+ uninit locals) & Nested Generic Type Inference
+$manyUninitDecls = (0..79 | ForEach-Object { "    var v$_`: i64" }) -join "`n"
+$manyUninitAssign = (0..79 | ForEach-Object { "        v$_ = $_ + 1" }) -join "`n"
+$manyUninitElse = (0..79 | ForEach-Object { "        v$_ = ($_ + 1) * 2" }) -join "`n"
+$manyUninitSum = (0..79 | ForEach-Object { "    total += v$_" }) -join "`n"
+$phase27_uninit_ok = @"
+fn sum80(flag: bool): i64 {
+$manyUninitDecls
+    if flag {
+$manyUninitAssign
+    } else {
+$manyUninitElse
+    }
+    var total: i64 = 0
+$manyUninitSum
+    return total
+}
+
+fn main() {
+    print("{} {}", sum80(true), sum80(false))
+}
+"@
+Test-RunOk   "phase27_unbounded_uninit"      $phase27_uninit_ok "3240 6480"
+Test-RunLlvm "phase27_unbounded_uninit_llvm" $phase27_uninit_ok "3240 6480"
+
+$phase27_uninit_err = @"
+fn main() {
+$manyUninitDecls
+    var cond = true
+    if cond {
+        v75 = 10
+    }
+    print(v75)
+}
+"@
+Test-CompileError "phase27_uninit_high_var_err" $phase27_uninit_err "may be read before it is assigned"
+
+$phase27_nested_gen = @'
+import "std/core.sb"
+import "std/vec.sb"
+
+struct Pair[A, B] {
+    first: A
+    second: B
+}
+
+fn vec_first_or[T](v: *const Vec[T], def: T): T {
+    if v.len == 0 {
+        return def
+    }
+    return v.get(0)
+}
+
+fn opt_unwrap_or[T](o: Option[T], def: T): T {
+    match o {
+        .Some(x) { return x }
+        .None    { return def }
+    }
+}
+
+fn res_ok_or[T, E](r: Result[T, E], def: T): T {
+    match r {
+        .Ok(x)  { return x }
+        .Err(_) { return def }
+    }
+}
+
+fn deep_extract[A, B](p: Pair[A, Option[B]], def_b: B): B {
+    match p.second {
+        .Some(b) { return b }
+        .None    { return def_b }
+    }
+}
+
+fn slice_opt_count[T](items[]: const Option[T]): i64 {
+    var n: i64 = 0
+    loop item in items {
+        if item.is_some() {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn pair_with_opt[T](x: T, o: Option[T]): T {
+    match o {
+        .Some(v) { return v }
+        .None    { return x }
+    }
+}
+
+fn main() {
+    // Infer T = i64 from `*const Vec[i64]` while `0` is untyped
+    var v: Vec[i64]
+    v.init(4)
+    defer v.free()
+    v.push(4200000000)
+    var r1 = vec_first_or(&v, 0)
+
+    // Infer T = i64 from `Option[i64]` while `99` is untyped
+    var o1: Option[i64] = .Some(77)
+    var o2: Option[i64] = .None
+    var r2 = opt_unwrap_or(o1, 99)
+    var r3 = opt_unwrap_or(o2, 99)
+
+    // Infer T = str, E = i32 from `Result[str, i32]`
+    var res: Result[str, i32] = .Ok("nested")
+    var r4 = res_ok_or(res, "fallback")
+
+    // Infer A = str, B = i64 from nested `Pair[str, Option[i64]]`
+    var dp = Pair[str, Option[i64]] { first: "k", second: .Some(12345678901) }
+    var r5 = deep_extract(dp, 0)
+
+    // Infer T = i32 from `[]const Option[i32]`
+    var arr[3]: Option[i32] = [.Some(1), .None, .Some(3)]
+    var r6 = slice_opt_count(arr)
+
+    // Infer T = i64 from arg 0 while arg 1 uses `.Some(500)` inferred enum shorthand
+    var r7 = pair_with_opt(i64(10), .Some(500))
+
+    print("{} {} {} {} {} {} {}", r1, r2, r3, r4, r5, r6, r7)
+}
+'@
+Test-RunOk   "phase27_nested_generic_infer"      $phase27_nested_gen "4200000000 77 99 nested 12345678901 2 500"
+Test-RunLlvm "phase27_nested_generic_infer_llvm" $phase27_nested_gen "4200000000 77 99 nested 12345678901 2 500"
+
 if ($script:SkippedCount -gt 0) {
     Write-Host "`nAll $($script:PassedCount) selected tests passed ($($script:SkippedCount) skipped)."
 } else {

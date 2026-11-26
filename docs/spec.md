@@ -166,7 +166,7 @@ var b: i64 = i64(a) + 1
 
 ### 2.8 Compile-Time Generics (`[T]`)
 - `struct Name[T, U]`, `enum Name[T, E]`, `fn name[T](...)`, and `fn (self: *Name[T]) method(...)` are monomorphized on demand at compile time.
-- Generic function calls support both explicit type arguments (`max_val[i64](a, b)`) and type argument inference from value parameters (`max_val(a, b)`, `swap_val(&x, &y)`).
+- Generic function calls support both explicit type arguments (`max_val[i64](a, b)`) and recursive type argument inference from value parameters, including pointers, slices, arrays, function pointers, and nested generic types (`max_val(a, b)`, `swap_val(&x, &y)`, `first_or(vec, 0)`, `unwrap_pair(pair)`).
 - Standard generic collections are provided in `std/vec.sb` (`Vec[T]`) and `std/map.sb` (`HashMap[K, V]`, `Option[T]`).
 
 ### 2.9 First-Class Function Pointers (`fn(T1, T2): R`) & Stateless Anonymous Functions
@@ -674,10 +674,6 @@ fn main() {
 
 Planned work:
 1. Strings: an ownership/allocation design beyond `str` views and `std/str.sb`'s `StringBuilder`.
-2. Generic type-argument inference through nested generic types.
-3. Ranges as first-class values (currently valid only in `loop` headers, §6.6).
-4. A `fast` build mode in which overflow is undefined behavior (§8.3).
-5. Additional targets (Linux ELF, macOS Mach-O) and self-hosting.
-
-Known implementation limits of `sbc`:
-- A function may declare at most 63 local variables **without an initializer** (`var x: T`); definite-assignment analysis (§4.2) tracks them in a 64-bit set. Variables declared with an initializer, and array/struct locals, do not count toward this limit. Exceeding it is a compile error.
+2. Ranges as first-class values (currently valid only in `loop` headers, §6.6).
+3. A `fast` build mode in which overflow is undefined behavior (§8.3).
+4. Additional targets (Linux ELF, macOS Mach-O) and self-hosting.

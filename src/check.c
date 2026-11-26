@@ -72,8 +72,93 @@ typedef struct Scope {
     VEC(Symbol *) syms;
 } Scope;
 
-typedef uint64_t AssignSet; // bit i = local variable i is definitely assigned
-#define ALL_ASSIGNED UINT64_MAX
+// Unbounded definite-assignment bitset (bit i = local variable i is definitely assigned).
+typedef struct {
+    uint64_t *words;
+    int nwords;
+    bool all_set; // true on unreachable paths (after return, exit, break, continue, infinite loop)
+} AssignSet;
+
+static AssignSet assign_empty(void) {
+    return (AssignSet){ NULL, 0, false };
+}
+
+static AssignSet assign_all(void) {
+    return (AssignSet){ NULL, 0, true };
+}
+
+static void assign_free(AssignSet *s) {
+    free(s->words);
+    s->words = NULL;
+    s->nwords = 0;
+    s->all_set = false;
+}
+
+static AssignSet assign_clone(AssignSet s) {
+    if (s.all_set || s.nwords == 0) {
+        return (AssignSet){ NULL, 0, s.all_set };
+    }
+    uint64_t *w = xmalloc((size_t)s.nwords * sizeof(uint64_t));
+    memcpy(w, s.words, (size_t)s.nwords * sizeof(uint64_t));
+    return (AssignSet){ w, s.nwords, false };
+}
+
+static void assign_replace(AssignSet *dst, AssignSet src) {
+    free(dst->words);
+    *dst = src;
+}
+
+static void assign_grow(AssignSet *s, int need_words, uint64_t fill) {
+    if (need_words <= s->nwords) return;
+    s->words = xrealloc(s->words, (size_t)need_words * sizeof(uint64_t));
+    for (int i = s->nwords; i < need_words; i++) {
+        s->words[i] = fill;
+    }
+    s->nwords = need_words;
+}
+
+static void assign_set(AssignSet *s, int idx) {
+    if (idx < 0 || s->all_set) return;
+    int wi = idx / 64;
+    if (wi >= s->nwords) assign_grow(s, wi + 1, 0);
+    s->words[wi] |= (1ULL << (idx & 63));
+}
+
+static void assign_clear(AssignSet *s, int idx) {
+    if (idx < 0) return;
+    int wi = idx / 64;
+    if (s->all_set) {
+        s->all_set = false;
+        assign_grow(s, wi + 1, UINT64_MAX);
+        s->words[wi] &= ~(1ULL << (idx & 63));
+        return;
+    }
+    if (wi < s->nwords) {
+        s->words[wi] &= ~(1ULL << (idx & 63));
+    }
+}
+
+static bool assign_has(const AssignSet *s, int idx) {
+    if (idx < 0 || s->all_set) return true;
+    int wi = idx / 64;
+    if (wi >= s->nwords) return false;
+    return (s->words[wi] & (1ULL << (idx & 63))) != 0;
+}
+
+static void assign_intersect_into(AssignSet *dst, const AssignSet *other) {
+    if (other->all_set) return;
+    if (dst->all_set) {
+        assign_replace(dst, assign_clone(*other));
+        return;
+    }
+    int common = dst->nwords < other->nwords ? dst->nwords : other->nwords;
+    for (int i = 0; i < common; i++) {
+        dst->words[i] &= other->words[i];
+    }
+    for (int i = common; i < dst->nwords; i++) {
+        dst->words[i] = 0;
+    }
+}
 
 typedef struct {
     Scope *global;
@@ -207,9 +292,9 @@ static bool split_generic_name(const char *name, const char **base_out, StrVec *
             while (seg_end > seg_start && (seg_end[-1] == ' ' || seg_end[-1] == '\t')) seg_end--;
             vec_push(*args_out, intern(seg_start, (int)(seg_end - seg_start)));
             seg_start = p + 1;
-        } else if (*p == '[') {
+        } else if (*p == '[' || *p == '(') {
             depth++;
-        } else if (*p == ']') {
+        } else if (*p == ']' || *p == ')') {
             depth--;
         }
         p++;
@@ -730,21 +815,23 @@ static Symbol *instantiate_generic_method(Checker *c, Type *base_t, const char *
 }
 
 // Matches a formal type specification `pat_str` (with `ptr_depth` / `dk`) against a concrete `arg_t`
-// to infer any unbound type parameters in `tparams` -> `inferred`.
-static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk,
+// to infer any unbound type parameters in `tparams` -> `inferred`, recursively unwrapping pointers,
+// slices, arrays, function pointers, and nested generic types (`Vec[T]`, `Result[Option[T], E]`, etc.).
+static void unify_type_pattern(Checker *c, Pos pos, const char *pat_str, int pat_ptr, DeclKind pat_dk,
                                Type *arg_t, StrVec *tparams, Type **inferred) {
     if (!pat_str || !arg_t || arg_t == &ty_untyped_int || arg_t == &ty_untyped_float || arg_t == &ty_null) {
         return;
     }
+    while (*pat_str == ' ' || *pat_str == '\t') pat_str++;
     if (pat_dk == DECL_SLICE) {
         if (arg_t->kind == TY_SLICE || arg_t->kind == TY_ARRAY) {
-            unify_type_pattern(pat_str, pat_ptr, DECL_SCALAR, arg_t->elem, tparams, inferred);
+            unify_type_pattern(c, pos, pat_str, pat_ptr, DECL_SCALAR, arg_t->elem, tparams, inferred);
         }
         return;
     }
     if (pat_dk == DECL_ARRAY) {
         if (arg_t->kind == TY_ARRAY) {
-            unify_type_pattern(pat_str, pat_ptr, DECL_SCALAR, arg_t->elem, tparams, inferred);
+            unify_type_pattern(c, pos, pat_str, pat_ptr, DECL_SCALAR, arg_t->elem, tparams, inferred);
         }
         return;
     }
@@ -753,11 +840,19 @@ static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk
         arg_t = arg_t->elem;
         pat_ptr--;
     }
-    while (pat_str[0] == '[' && pat_str[1] == ']') {
-        if (arg_t->kind != TY_SLICE && arg_t->kind != TY_ARRAY) return;
-        arg_t = arg_t->elem;
-        pat_str += 2;
-        if (strncmp(pat_str, "const ", 6) == 0) pat_str += 6;
+    while (pat_str[0] == '[') {
+        if (pat_str[1] == ']') {
+            if (arg_t->kind != TY_SLICE && arg_t->kind != TY_ARRAY) return;
+            arg_t = arg_t->elem;
+            pat_str += 2;
+            if (strncmp(pat_str, "const ", 6) == 0) pat_str += 6;
+        } else {
+            const char *rb = strchr(pat_str + 1, ']');
+            if (!rb || arg_t->kind != TY_ARRAY) return;
+            arg_t = arg_t->elem;
+            pat_str = rb + 1;
+        }
+        while (*pat_str == ' ' || *pat_str == '\t') pat_str++;
     }
     while (*pat_str == '*') {
         if (arg_t->kind != TY_PTR) return;
@@ -800,12 +895,12 @@ static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk
             }
             if (p_args.len == arg_t->params.len) {
                 for (int k = 0; k < p_args.len; k++) {
-                    unify_type_pattern(p_args.items[k], 0, DECL_SCALAR, arg_t->params.items[k], tparams, inferred);
+                    unify_type_pattern(c, pos, p_args.items[k], 0, DECL_SCALAR, arg_t->params.items[k], tparams, inferred);
                 }
             }
             free(p_args.items);
             if (rparen[1] == ':' && arg_t->elem) {
-                unify_type_pattern(rparen + 2, 0, DECL_SCALAR, arg_t->elem, tparams, inferred);
+                unify_type_pattern(c, pos, rparen + 2, 0, DECL_SCALAR, arg_t->elem, tparams, inferred);
             }
         }
         return;
@@ -815,11 +910,18 @@ static void unify_type_pattern(const char *pat_str, int pat_ptr, DeclKind pat_dk
     if (split_generic_name(p_intern, &pat_base, &pat_args) &&
         split_generic_name(arg_t->name, &arg_base, &arg_args)) {
         if (pat_base == arg_base && pat_args.len == arg_args.len) {
-            // Note: recursive type arg matching if needed
+            for (int k = 0; k < pat_args.len; k++) {
+                Type *concrete_arg = resolve_type_str(c, arg_args.items[k], pos);
+                unify_type_pattern(c, pos, pat_args.items[k], 0, DECL_SCALAR, concrete_arg, tparams, inferred);
+            }
         }
     }
     free(pat_args.items);
     free(arg_args.items);
+}
+
+static bool is_inferred_enum_arg(Node *arg) {
+    return arg && arg->op == T_DOT && (arg->kind == N_FIELD || arg->kind == N_CALL) && !arg->lhs;
 }
 
 static Symbol *instantiate_generic_fn_call(Checker *c, Node *call_node) {
@@ -857,15 +959,32 @@ static Symbol *instantiate_generic_fn_call(Checker *c, Node *call_node) {
                   base_name, tmpl->list.len, call_node->list.len);
         }
         Type **inferred = xcalloc((size_t)tmpl->tparams.len, sizeof(Type *));
+        // Pass 1: unify from already-concretely-typed arguments without prematurely
+        // materializing untyped literals (so e.g. `unwrap_or(opt_i64, 0)` infers `T = i64`).
         for (int i = 0; i < call_node->list.len; i++) {
             Node *arg = call_node->list.items[i];
+            if (is_inferred_enum_arg(arg)) continue;
             check_expr(c, arg, NULL);
-            if (arg->type == &ty_untyped_int || arg->type == &ty_untyped_float) {
-                materialize(arg);
-            }
             Node *param = tmpl->list.items[i];
-            unify_type_pattern(param->type_name, param->ptr_depth, param->decl_kind,
+            unify_type_pattern(c, call_node->pos, param->type_name, param->ptr_depth, param->decl_kind,
                                arg->type, &tmpl->tparams, inferred);
+        }
+        // Pass 2: if any type parameters remain unbound, default untyped literals (`i32`/`f64`) and retry.
+        bool any_missing = false;
+        for (int i = 0; i < tmpl->tparams.len; i++) {
+            if (!inferred[i]) { any_missing = true; break; }
+        }
+        if (any_missing) {
+            for (int i = 0; i < call_node->list.len; i++) {
+                Node *arg = call_node->list.items[i];
+                if (is_inferred_enum_arg(arg)) continue;
+                if (arg->type == &ty_untyped_int || arg->type == &ty_untyped_float) {
+                    materialize(arg);
+                    Node *param = tmpl->list.items[i];
+                    unify_type_pattern(c, call_node->pos, param->type_name, param->ptr_depth, param->decl_kind,
+                                       arg->type, &tmpl->tparams, inferred);
+                }
+            }
         }
         for (int i = 0; i < tmpl->tparams.len; i++) {
             if (!inferred[i]) {
@@ -1442,7 +1561,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             // Taking `&x` counts as initializing `x` so `fn init(p: *i32)` works on uninitialized vars,
             // and marks `x` as assigned.
             if (!s->is_global && s->var_index >= 0) {
-                c->assigned |= (1ULL << s->var_index);
+                assign_set(&c->assigned, s->var_index);
             }
             opd->sym = s;
             opd->type = s->type;
@@ -1589,7 +1708,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             // and mark `p` as assigned on first field access.
             if (s && s->kind == SYM_VAR && !s->is_global && s->var_index >= 0 &&
                 s->type && s->type->kind == TY_STRUCT) {
-                c->assigned |= (1ULL << s->var_index);
+                assign_set(&c->assigned, s->var_index);
             }
         }
         check_expr(c, n->lhs, NULL);
@@ -1807,7 +1926,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
             resolve_global_const(c, s);
         }
         if (s->kind == SYM_VAR && !s->is_global && s->var_index >= 0) {
-            if (!(c->assigned & (1ULL << s->var_index))) {
+            if (!assign_has(&c->assigned, s->var_index)) {
                 fatal(n->pos, "variable '%s' may be read before it is assigned", n->name);
             }
         }
@@ -2185,7 +2304,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
                     }
                     if (ms && ms->kind == SYM_FN && ms->decl->list.items[0]->type->kind == TY_PTR &&
                         !ms->decl->list.items[0]->type->is_const_elem) {
-                        c->assigned |= (1ULL << vs->var_index);
+                        assign_set(&c->assigned, vs->var_index);
                     }
                 }
             }
@@ -2571,7 +2690,7 @@ static void check_expr(Checker *c, Node *n, Type *expected) {
         if (s->kind != SYM_FN) {
             if ((s->kind == SYM_VAR || s->kind == SYM_PARAM) && s->type && s->type->kind == TY_FN) {
                 if (s->kind == SYM_VAR && !s->is_global && s->var_index >= 0) {
-                    if (!(c->assigned & (1ULL << s->var_index))) {
+                    if (!assign_has(&c->assigned, s->var_index)) {
                         fatal(n->pos, "variable '%s' may be read before it is assigned", n->name);
                     }
                 }
@@ -2781,13 +2900,13 @@ static void check_assign(Checker *c, Node *n) {
         if (n->op == T_ASSIGN) {
             check_expr(c, n->rhs, s->type);
             if (!s->is_global && s->var_index >= 0) {
-                c->assigned |= (1ULL << s->var_index);
+                assign_set(&c->assigned, s->var_index);
             }
             return;
         }
 
         // Compound assignment: the variable is both read and written.
-        if (!s->is_global && s->var_index >= 0 && !(c->assigned & (1ULL << s->var_index))) {
+        if (!s->is_global && s->var_index >= 0 && !assign_has(&c->assigned, s->var_index)) {
             fatal(n->pos, "variable '%s' may be read before it is assigned", n->name);
         }
     }
@@ -2907,29 +3026,24 @@ static bool check_stmt(Checker *c, Node *n) {
             if (n->rhs) {
                 s->var_index = -1;
             } else {
-                if (c->next_var_index >= 63) fatal(n->pos, "too many uninitialized variables");
                 s->var_index = c->next_var_index++;
-                c->assigned &= ~(1ULL << s->var_index);
+                assign_clear(&c->assigned, s->var_index);
             }
         } else if (decl_t->kind == TY_SLICE || decl_t == &ty_str) {
             s->slot = alloc_slots_bytes(c, 16); // {ptr, len}
             if (n->rhs) {
                 s->var_index = -1;
             } else {
-                if (c->next_var_index >= 63) fatal(n->pos, "too many uninitialized variables");
                 s->var_index = c->next_var_index++;
-                c->assigned &= ~(1ULL << s->var_index);
+                assign_clear(&c->assigned, s->var_index);
             }
         } else {
             s->slot = alloc_slot(c);
             if (n->rhs) {
                 s->var_index = -1; // initialized at declaration
             } else {
-                if (c->next_var_index >= 63) {
-                    fatal(n->pos, "too many uninitialized variables in one function (limit 63)");
-                }
                 s->var_index = c->next_var_index++;
-                c->assigned &= ~(1ULL << s->var_index);
+                assign_clear(&c->assigned, s->var_index);
             }
         }
         n->sym = s;
@@ -2961,7 +3075,7 @@ static bool check_stmt(Checker *c, Node *n) {
     case N_EXPR_STMT:
         check_expr(c, n->lhs, NULL);
         if (n->lhs->kind == N_CALL && n->lhs->builtin == B_EXIT) {
-            c->assigned = ALL_ASSIGNED;
+            assign_replace(&c->assigned, assign_all());
             return true;
         }
         return false;
@@ -3007,7 +3121,7 @@ static bool check_stmt(Checker *c, Node *n) {
                 }
             }
         }
-        c->assigned = ALL_ASSIGNED;
+        assign_replace(&c->assigned, assign_all());
         return true;
 
     case N_BREAK:
@@ -3032,7 +3146,7 @@ static bool check_stmt(Checker *c, Node *n) {
             target = c->loops.items[c->loops.len - 1];
         }
         n->target = target;
-        c->assigned = ALL_ASSIGNED;
+        assign_replace(&c->assigned, assign_all());
         return true;
     }
 
@@ -3044,33 +3158,35 @@ static bool check_stmt(Checker *c, Node *n) {
             fatal(n->body->pos, "cannot declare a variable or constant directly in 'defer' (use 'defer { ... }')");
         }
         c->in_defer++;
-        AssignSet saved = c->assigned;
+        AssignSet saved = assign_clone(c->assigned);
         if (n->body->kind == N_BLOCK) {
             check_block(c, n->body, true);
         } else {
             check_stmt(c, n->body);
         }
-        c->assigned = saved;
+        assign_replace(&c->assigned, saved);
         c->in_defer--;
         return false;
     }
 
     case N_IF: {
         check_expr(c, n->cond, &ty_bool);
-        AssignSet before = c->assigned;
-        c->assigned = before;
+        AssignSet before = assign_clone(c->assigned);
         bool t_ret = check_block(c, n->body, true);
         AssignSet after_then = c->assigned;
+        c->assigned = assign_empty();
 
         if (n->els) {
-            c->assigned = before;
+            assign_replace(&c->assigned, assign_clone(before));
             bool e_ret = (n->els->kind == N_IF) ? check_stmt(c, n->els)
                                                 : check_block(c, n->els, true);
-            AssignSet after_else = c->assigned;
-            c->assigned = after_then & after_else;
+            assign_intersect_into(&after_then, &c->assigned);
+            assign_replace(&c->assigned, after_then);
+            assign_free(&before);
             return t_ret && e_ret;
         } else {
-            c->assigned = before;
+            assign_free(&after_then);
+            assign_replace(&c->assigned, before);
             return false;
         }
     }
@@ -3095,8 +3211,8 @@ static bool check_stmt(Checker *c, Node *n) {
         VEC(i128)   seen_vals = {0};
         VEC(Node *) seen_strs = {0};
         VEC(Pos)    seen_pos  = {0};
-        AssignSet before = c->assigned;
-        AssignSet after_all = ALL_ASSIGNED;
+        AssignSet before = assign_clone(c->assigned);
+        AssignSet after_all = assign_all();
         bool all_ret = true;
 
         for (int i = 0; i < n->list.len; i++) {
@@ -3191,7 +3307,7 @@ static bool check_stmt(Checker *c, Node *n) {
                     vec_push(seen_pos, pat->pos);
                 }
             }
-            c->assigned = before;
+            assign_replace(&c->assigned, assign_clone(before));
             push_scope(c, false);
             if (arm->name && strcmp(arm->name, "_") != 0) {
                 Type *pt = arm->type;
@@ -3209,7 +3325,7 @@ static bool check_stmt(Checker *c, Node *n) {
             }
             bool arm_ret = check_block(c, arm->body, false);
             pop_scope(c);
-            after_all &= c->assigned;
+            assign_intersect_into(&after_all, &c->assigned);
             if (!arm_ret) all_ret = false;
         }
 
@@ -3221,9 +3337,9 @@ static bool check_stmt(Checker *c, Node *n) {
             if (st == &ty_bool && seen_vals.len == 2) {
                 fatal(n->els->pos, "unreachable 'else' arm: both 'true' and 'false' are already covered");
             }
-            c->assigned = before;
+            assign_replace(&c->assigned, assign_clone(before));
             bool els_ret = check_block(c, n->els, true);
-            after_all &= c->assigned;
+            assign_intersect_into(&after_all, &c->assigned);
             if (!els_ret) all_ret = false;
             exhaustive = true;
         } else if (st->kind == TY_ENUM) {
@@ -3274,27 +3390,38 @@ static bool check_stmt(Checker *c, Node *n) {
         free(seen_vals.items);
         free(seen_strs.items);
         free(seen_pos.items);
-        c->assigned = exhaustive ? after_all : before;
+        if (exhaustive) {
+            assign_replace(&c->assigned, after_all);
+            assign_free(&before);
+        } else {
+            assign_replace(&c->assigned, before);
+            assign_free(&after_all);
+        }
         return exhaustive && all_ret;
     }
 
     case N_LOOP_INF: {
-        AssignSet before = c->assigned;
+        AssignSet before = assign_clone(c->assigned);
         vec_push(c->loops, n);
         check_block(c, n->body, true);
         c->loops.len--;
         bool has_break = loop_has_break_to(n->body, n);
-        c->assigned = has_break ? before : ALL_ASSIGNED;
+        if (has_break) {
+            assign_replace(&c->assigned, before);
+        } else {
+            assign_free(&before);
+            assign_replace(&c->assigned, assign_all());
+        }
         return !has_break;
     }
 
     case N_LOOP_COND: {
         check_expr(c, n->cond, &ty_bool);
-        AssignSet before = c->assigned;
+        AssignSet before = assign_clone(c->assigned);
         vec_push(c->loops, n);
         check_block(c, n->body, true);
         c->loops.len--;
-        c->assigned = before; // body may run 0 times
+        assign_replace(&c->assigned, before); // body may run 0 times
         return false;
     }
 
@@ -3323,7 +3450,7 @@ static bool check_stmt(Checker *c, Node *n) {
             }
         }
 
-        AssignSet before = c->assigned;
+        AssignSet before = assign_clone(c->assigned);
         push_scope(c, false);
         Symbol *iv = define(c, SYM_VAR, n->name, it, n->pos);
         iv->readonly = true;
@@ -3338,7 +3465,7 @@ static bool check_stmt(Checker *c, Node *n) {
         check_block(c, n->body, false);
         c->loops.len--;
         pop_scope(c);
-        c->assigned = before;
+        assign_replace(&c->assigned, before);
         return false;
     }
 
@@ -3349,7 +3476,7 @@ static bool check_stmt(Checker *c, Node *n) {
             fatal(n->lhs->pos, "cannot iterate over '%s' (expected array, slice, or string)", ct->name);
         }
         Type *elem_t = (ct == &ty_str) ? &ty_u8 : ct->elem;
-        AssignSet before = c->assigned;
+        AssignSet before = assign_clone(c->assigned);
         push_scope(c, false);
         if (n->name2) {
             // `loop i, x in arr`
@@ -3390,7 +3517,7 @@ static bool check_stmt(Checker *c, Node *n) {
         check_block(c, n->body, false);
         c->loops.len--;
         pop_scope(c);
-        c->assigned = before;
+        assign_replace(&c->assigned, before);
         return false;
     }
 
@@ -3398,13 +3525,13 @@ static bool check_stmt(Checker *c, Node *n) {
         push_scope(c, false);
         check_stmt(c, n->init);
         check_expr(c, n->cond, &ty_bool);
-        AssignSet after_init = c->assigned;
+        AssignSet after_init = assign_clone(c->assigned);
         vec_push(c->loops, n);
         check_block(c, n->body, false);
         c->loops.len--;
         check_assign(c, n->step);
         pop_scope(c);
-        c->assigned = after_init;
+        assign_replace(&c->assigned, after_init);
 
         // Hint if this C-style loop is a plain `var i = a; i < b; i += 1`.
         Symbol *iv = n->init->sym;
@@ -3810,7 +3937,7 @@ Program check_ex(NodeVec decls, bool require_main) {
         c.ret_type = fn->type;
         c.next_slot = 0;
         c.next_var_index = 0;
-        c.assigned = 0;
+        assign_replace(&c.assigned, assign_empty());
 
         push_scope(&c, true);
         if (is_aggregate_type(fn->type)) {
@@ -3835,6 +3962,7 @@ Program check_ex(NodeVec decls, bool require_main) {
         pop_scope(&c);
         fn->num_slots = c.next_slot;
     }
+    assign_free(&c.assigned);
 
     // Check `main` signature (spec §5.4).
     const char *main_name = intern("main", 4);
