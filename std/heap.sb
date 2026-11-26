@@ -1,0 +1,172 @@
+// =============================================================================
+// Antimony Standard Library: std/heap.sb
+// Generic binary priority queues: `BinaryHeap[T]` (max-heap) and `MinHeap[T]`
+// (min-heap) backed by `Vec[T]` with O(log N) push/pop and O(1) peek.
+// =============================================================================
+
+import "std/core.sb"
+import "std/vec.sb"
+
+// -----------------------------------------------------------------------------
+// Max-Heap (`BinaryHeap[T]`)
+// -----------------------------------------------------------------------------
+
+pub struct BinaryHeap[T] {
+    data: Vec[T]
+    len: i64
+}
+
+pub fn (h: *BinaryHeap[T]) init(initial_cap: i64) {
+    h.data.init(initial_cap)
+    h.len = 0
+}
+
+pub fn (h: BinaryHeap[T]) is_empty(): bool {
+    return h.len == 0
+}
+
+pub fn (h: BinaryHeap[T]) peek(): Option[T] {
+    if h.len == 0 {
+        return .None
+    }
+    return .Some(h.data.get(0))
+}
+
+pub fn (h: *BinaryHeap[T]) push(val: T) {
+    h.data.push(val)
+    var idx = h.data.len - 1
+    loop idx > 0 {
+        var parent = (idx - 1) >> 1
+        var pv = h.data.get(parent)
+        var cv = h.data.get(idx)
+        if !(pv < cv) {
+            break
+        }
+        h.data.set(parent, cv)
+        h.data.set(idx, pv)
+        idx = parent
+    }
+    h.len = h.data.len
+}
+
+pub fn (h: *BinaryHeap[T]) pop(): Option[T] {
+    if h.data.len == 0 {
+        return .None
+    }
+    var top = h.data.swap_remove(0)
+    var n = h.data.len
+    var idx: i64 = 0
+    loop {
+        var left = (idx << 1) + 1
+        if left >= n {
+            break
+        }
+        var best = left
+        var right = left + 1
+        if right < n && h.data.get(best) < h.data.get(right) {
+            best = right
+        }
+        var cur = h.data.get(idx)
+        var bv  = h.data.get(best)
+        if !(cur < bv) {
+            break
+        }
+        h.data.set(idx, bv)
+        h.data.set(best, cur)
+        idx = best
+    }
+    h.len = h.data.len
+    return .Some(top)
+}
+
+pub fn (h: *BinaryHeap[T]) clear() {
+    h.data.clear()
+    h.len = 0
+}
+
+pub fn (h: *BinaryHeap[T]) free() {
+    h.data.free()
+    h.len = 0
+}
+
+// -----------------------------------------------------------------------------
+// Min-Heap (`MinHeap[T]`)
+// -----------------------------------------------------------------------------
+
+pub struct MinHeap[T] {
+    data: Vec[T]
+    len: i64
+}
+
+pub fn (h: *MinHeap[T]) init(initial_cap: i64) {
+    h.data.init(initial_cap)
+    h.len = 0
+}
+
+pub fn (h: MinHeap[T]) is_empty(): bool {
+    return h.len == 0
+}
+
+pub fn (h: MinHeap[T]) peek(): Option[T] {
+    if h.len == 0 {
+        return .None
+    }
+    return .Some(h.data.get(0))
+}
+
+pub fn (h: *MinHeap[T]) push(val: T) {
+    h.data.push(val)
+    var idx = h.data.len - 1
+    loop idx > 0 {
+        var parent = (idx - 1) >> 1
+        var pv = h.data.get(parent)
+        var cv = h.data.get(idx)
+        if !(cv < pv) {
+            break
+        }
+        h.data.set(parent, cv)
+        h.data.set(idx, pv)
+        idx = parent
+    }
+    h.len = h.data.len
+}
+
+pub fn (h: *MinHeap[T]) pop(): Option[T] {
+    if h.data.len == 0 {
+        return .None
+    }
+    var top = h.data.swap_remove(0)
+    var n = h.data.len
+    var idx: i64 = 0
+    loop {
+        var left = (idx << 1) + 1
+        if left >= n {
+            break
+        }
+        var best = left
+        var right = left + 1
+        if right < n && h.data.get(right) < h.data.get(best) {
+            best = right
+        }
+        var cur = h.data.get(idx)
+        var bv  = h.data.get(best)
+        if !(bv < cur) {
+            break
+        }
+        h.data.set(idx, bv)
+        h.data.set(best, cur)
+        idx = best
+    }
+    h.len = h.data.len
+    return .Some(top)
+}
+
+pub fn (h: *MinHeap[T]) clear() {
+    h.data.clear()
+    h.len = 0
+}
+
+pub fn (h: *MinHeap[T]) free() {
+    h.data.free()
+    h.len = 0
+}

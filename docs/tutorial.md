@@ -1034,17 +1034,19 @@ fn main() {
 ```
 
 ### 15.3 Standard Library Modules (`std/`)
-Antimony ships with 18 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
+Antimony ships with 20 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
 - `import "std/core.sb"` — Canonical `Option[T]`, `Result[T, E]`, `Ordering`, `panic`, `assert`, and `swap[T]`.
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `alloc_typed`, `realloc_mem`, `free_mem`, `copy_mem`, `move_mem`, `set_mem`, `cmp_mem`, `eq_mem`) and fast bump-pointer `Arena`.
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `extend_slice`, `pop`, `try_pop`, `get`, `try_get`, `get_ptr`, `set`, `first`, `last`, `insert`, `remove`, `swap_remove`, `shrink_to_fit`, `as_slice`, `as_const_slice`, `clear`, `free`).
 - `import "std/map.sb"` — Generic open-addressing hash table `HashMap[K, V]` (`init`, `reserve`, `put`, `get`, `get_ptr`, `get_or`, `contains`, `remove`, `take`, `clear`, `free`).
 - `import "std/set.sb"` — Generic hash set `HashSet[T]` (`init`, `insert`, `contains`, `remove`, `clear`, `free`).
 - `import "std/deque.sb"` — Generic ring-buffer double-ended queue `Deque[T]` (`init`, `push_front`, `push_back`, `pop_front`, `pop_back`, `front`, `back`, `get`, `clear`, `free`).
+- `import "std/heap.sb"` — Generic binary priority queues `BinaryHeap[T]` (max-heap) and `MinHeap[T]` (min-heap) with O(log N) `push`/`pop` and O(1) `peek`.
 - `import "std/sort.sb"` — Generic sorting and slice algorithms (`sort[T]`, `sort_desc[T]`, `sort_by[T]`, `is_sorted[T]`, `is_sorted_by[T]`, `binary_search[T]`, `binary_search_by[T]`, `lower_bound[T]`, `upper_bound[T]`, `reverse[T]`).
 - `import "std/math.sb"` — Math constants (`PI`, `TAU`, `E`, `SQRT2`, `INF`, `NAN`, `EPSILON_F64`), `f64`/`f32` CRT transcendental/rounding functions (`sqrt`, `sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow`, `floor`, `ceil`, `round`, `trunc`, `cbrt`, `hypot`, `is_nan`, `is_inf`), generic `min`/`max`/`clamp`, interpolation (`lerp`, `smoothstep`), and integer/bit utilities (`gcd`, `lcm`, `pow_i64`, `is_pow2`, `next_pow2`, `ilog2`, `div_ceil_u64`).
 - `import "std/thread.sb"` — Native Win32 OS threads (`Thread`, `spawn`, `join`, `detach`, `current_thread_id`), fast user-mode `SRWLOCK` locks (`Mutex`, `RwLock`, `CondVar` with `wait_timeout`), and hardware atomic wrapper `AtomicI64` (`init`, `load`, `store`, `fetch_add`, `fetch_sub`, `cas`).
 - `import "std/io.sb"` — Native Win32 `File` handle (`file_open`, `file_create`, `file_open_append`, `file_open_rw`, `read`, `write`, `write_all`, `write_str`, `seek`, `size`, `flush`, `close`), `IoError`, `SeekFrom`, `read_file_all`, `write_file_all`, and low-level helpers.
+- `import "std/bufio.sb"` — Buffered file I/O: `BufReader` (`read_byte`, `read`, `read_line`) and `BufWriter` (`write_byte`, `write`, `write_str`, `flush`).
 - `import "std/fs.sb"` — Native Win32 filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`) returning `Result[bool, IoError]`.
 - `import "std/path.sb"` — Zero-allocation path utilities (`path_is_sep`, `path_is_abs`, `path_basename`, `path_dirname`, `path_extension`, `path_stem`) and `path_join`.
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `elapsed_ms`, `ticks_ms`, `sleep_ms`) and `Stopwatch`.

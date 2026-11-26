@@ -3415,7 +3415,7 @@ static bool check_stmt(Checker *c, Node *n) {
             n->step->rhs->is_const && n->step->rhs->cval == 1 &&
             !body_assigns_var(n->body, iv)) {
             fprintf(stderr, "%s:%d:%d: hint: plain counting loop can be written 'loop %s in a..b'\n",
-                    g_filename, n->pos.line, n->pos.col, iv->name);
+                    file_name_of(n->pos), n->pos.line, n->pos.col, iv->name);
         }
         return false;
     }

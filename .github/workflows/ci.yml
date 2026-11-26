@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sbc (MinGW-w64 GCC, warnings as errors)
+        shell: cmd
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror src\util.c src\lexer.c src\parser.c src\check.c src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\main.c -o sbc.exe
+
+      - name: Run full test suite (Native x64 & LLVM -O3)
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
+
+      - name: Run example programs
+        shell: pwsh
+        run: |
+          .\sbc.exe examples\demo.sb --run
+          .\sbc.exe examples\sbwc.sb --run

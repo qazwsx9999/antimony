@@ -2742,4 +2742,95 @@ Test-RunLlvm "phase23_process_net_llvm" $phase23_code $phase23_expected
 Test-CompileError "std_process_priv_hidden" "import `"std/process.sb`"`nfn main() { print(GetCurrentProcessId()) }" "cannot access private"
 Test-CompileError "std_net_priv_hidden"     "import `"std/net.sb`"`nfn main() { print(WSAGetLastError()) }"         "cannot access private"
 
+# 33. Phase 24: std/bufio.sb (BufReader / BufWriter) and std/heap.sb (BinaryHeap / MinHeap)
+$phase24_code = @'
+import "std/core.sb"
+import "std/str.sb"
+import "std/io.sb"
+import "std/fs.sb"
+import "std/bufio.sb"
+import "std/heap.sb"
+
+fn test_bufio(path: str): Result[i64, IoError] {
+    var wf = file_create(path)?
+    var bw: BufWriter
+    bw.init(&wf, 16)
+    defer bw.free()
+    bw.write_str("alpha\r\n")?
+    bw.write_str("beta-long-line-exceeding-buffer\n")?
+    bw.write_str("gamma")?
+    bw.flush()?
+    wf.close()
+
+    var rf = file_open(path)?
+    defer rf.close()
+    var br: BufReader
+    br.init(&rf, 12)
+    defer br.free()
+
+    var line: StringBuilder
+    line.init(32)
+    defer line.free()
+
+    var count: i64 = 0
+    var ok1 = br.read_line(&line)?
+    assert(ok1 && line.as_str() == "alpha", "line 1")
+    count += 1
+
+    var ok2 = br.read_line(&line)?
+    assert(ok2 && line.as_str() == "beta-long-line-exceeding-buffer", "line 2")
+    count += 1
+
+    var ok3 = br.read_line(&line)?
+    assert(ok3 && line.as_str() == "gamma", "line 3")
+    count += 1
+
+    var ok4 = br.read_line(&line)?
+    assert(!ok4, "eof")
+    return .Ok(count)
+}
+
+fn main() {
+    // 1. BufWriter + BufReader line-by-line with tiny buffers
+    var p = `tests\tmp\phase24_bufio.txt`
+    var lines = test_bufio(p).unwrap_or(-1)
+    assert(fs_remove_file(p).is_ok(), "cleanup")
+    print("bufio={}", lines)
+
+    // 2. BinaryHeap (max-heap)
+    var maxh: BinaryHeap[i32]
+    maxh.init(4)
+    defer maxh.free()
+    var vals[6]: i32 = [3, 1, 9, 4, 7, 2]
+    loop x in vals {
+        maxh.push(x)
+    }
+    var a1 = maxh.pop().unwrap_or(-1)
+    var a2 = maxh.pop().unwrap_or(-1)
+    var a3 = maxh.peek().unwrap_or(-1)
+    print("maxh={} {} {} {}", a1, a2, a3, maxh.len)
+
+    // 3. MinHeap (min-heap)
+    var minh: MinHeap[i32]
+    minh.init(4)
+    defer minh.free()
+    loop x in vals {
+        minh.push(x)
+    }
+    var b1 = minh.pop().unwrap_or(-1)
+    var b2 = minh.pop().unwrap_or(-1)
+    var b3 = minh.peek().unwrap_or(-1)
+    print("minh={} {} {} {}", b1, b2, b3, minh.len)
+}
+'@
+$phase24_expected = @(
+    "bufio=3"
+    "maxh=9 7 4 4"
+    "minh=1 2 3 4"
+) -join "`n"
+Test-RunOk   "phase24_bufio_heap"      $phase24_code $phase24_expected
+Test-RunLlvm "phase24_bufio_heap_llvm" $phase24_code $phase24_expected
+
+Test-CompileError "std_bufio_priv_hidden" "import `"std/bufio.sb`"`nfn main() { print(DEFAULT_BUF_CAP) }" "cannot access private"
+
 Write-Host "`nAll tests passed."

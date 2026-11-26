@@ -1,0 +1,204 @@
+// =============================================================================
+// Antimony Standard Library: std/bufio.sb
+// Buffered file I/O: `BufReader` (fast buffered reading + `read_line`) and
+// `BufWriter` (batched writes with explicit `flush`).
+// =============================================================================
+
+import "std/core.sb"
+import "std/mem.sb"
+import "std/str.sb"
+import "std/io.sb"
+
+const DEFAULT_BUF_CAP: i64 = 8192
+
+// -----------------------------------------------------------------------------
+// Buffered Reader (`BufReader`)
+// -----------------------------------------------------------------------------
+
+pub struct BufReader {
+    file: *File
+    buf: *u8
+    cap: i64
+    pos: i64
+    end: i64
+}
+
+pub fn (r: *BufReader) init(file: *File, buf_cap: i64) {
+    var c = buf_cap
+    if c <= 0 {
+        c = DEFAULT_BUF_CAP
+    }
+    r.file = file
+    r.buf  = alloc_uninit(usize(c))
+    r.cap  = c
+    r.pos  = 0
+    r.end  = 0
+}
+
+priv fn (r: *BufReader) refill(): Result[i64, IoError] {
+    r.pos = 0
+    r.end = 0
+    var n = r.file.read(r.buf[0..r.cap])?
+    r.end = n
+    return .Ok(n)
+}
+
+// Reads a single byte, returning `.Ok(.None)` at EOF.
+pub fn (r: *BufReader) read_byte(): Result[Option[u8], IoError] {
+    if r.pos >= r.end {
+        var n = r.refill()?
+        if n == 0 {
+            return .Ok(.None)
+        }
+    }
+    var b = r.buf[r.pos]
+    r.pos += 1
+    return .Ok(.Some(b))
+}
+
+// Reads up to `len(dst)` bytes into `dst[]`, returning bytes read (`0` at EOF).
+pub fn (r: *BufReader) read(dst[]: u8): Result[i64, IoError] {
+    var want = len(dst)
+    if want == 0 {
+        return .Ok(0)
+    }
+    if r.pos >= r.end {
+        // Bypass internal buffer for large reads when empty.
+        if want >= r.cap {
+            return r.file.read(dst)
+        }
+        var n = r.refill()?
+        if n == 0 {
+            return .Ok(0)
+        }
+    }
+    var avail = r.end - r.pos
+    var take = avail
+    if want < take {
+        take = want
+    }
+    copy_mem(&dst[0], r.buf + usize(r.pos), usize(take))
+    r.pos += take
+    return .Ok(take)
+}
+
+// Clears `out` and reads the next line (stripping trailing `\n` or `\r\n`).
+// Returns `.Ok(true)` if a line was read, or `.Ok(false)` at EOF.
+pub fn (r: *BufReader) read_line(out: *StringBuilder): Result[bool, IoError] {
+    out.clear()
+    var any = false
+    loop {
+        if r.pos >= r.end {
+            var n = r.refill()?
+            if n == 0 {
+                break
+            }
+        }
+        any = true
+        // Scan buffered slice for '\n'.
+        var i = r.pos
+        loop i < r.end && r.buf[i] != '\n' {
+            i += 1
+        }
+        if i > r.pos {
+            out.append_bytes(r.buf[r.pos..i])
+        }
+        if i < r.end {
+            // Consumed '\n'; strip optional preceding '\r'.
+            r.pos = i + 1
+            if out.len > 0 && out.buf[out.len - 1] == '\r' {
+                out.len -= 1
+                out.buf[out.len] = 0
+            }
+            return .Ok(true)
+        }
+        r.pos = r.end
+    }
+    return .Ok(any)
+}
+
+pub fn (r: *BufReader) free() {
+    if r.buf != null {
+        free_mem(r.buf)
+    }
+    r.buf = null
+    r.cap = 0
+    r.pos = 0
+    r.end = 0
+}
+
+// -----------------------------------------------------------------------------
+// Buffered Writer (`BufWriter`)
+// -----------------------------------------------------------------------------
+
+pub struct BufWriter {
+    file: *File
+    buf: *u8
+    cap: i64
+    len: i64
+}
+
+pub fn (w: *BufWriter) init(file: *File, buf_cap: i64) {
+    var c = buf_cap
+    if c <= 0 {
+        c = DEFAULT_BUF_CAP
+    }
+    w.file = file
+    w.buf  = alloc_uninit(usize(c))
+    w.cap  = c
+    w.len  = 0
+}
+
+// Flushes any buffered bytes to the underlying `File`.
+pub fn (w: *BufWriter) flush(): Result[bool, IoError] {
+    if w.len > 0 {
+        w.file.write_all(w.buf[0..w.len])?
+        w.len = 0
+    }
+    return .Ok(true)
+}
+
+pub fn (w: *BufWriter) write_byte(b: u8): Result[bool, IoError] {
+    if w.len >= w.cap {
+        w.flush()?
+    }
+    w.buf[w.len] = b
+    w.len += 1
+    return .Ok(true)
+}
+
+pub fn (w: *BufWriter) write(data[]: const u8): Result[i64, IoError] {
+    var n = len(data)
+    if n == 0 {
+        return .Ok(0)
+    }
+    if w.len + n <= w.cap {
+        copy_mem(w.buf + usize(w.len), &data[0], usize(n))
+        w.len += n
+        return .Ok(n)
+    }
+    w.flush()?
+    if n >= w.cap {
+        return w.file.write_all(data)
+    }
+    copy_mem(w.buf, &data[0], usize(n))
+    w.len = n
+    return .Ok(n)
+}
+
+pub fn (w: *BufWriter) write_str(s: str): Result[i64, IoError] {
+    if len(s) == 0 {
+        return .Ok(0)
+    }
+    var p = ptr_cast(*const u8, s)
+    return w.write(p[0..len(s)])
+}
+
+pub fn (w: *BufWriter) free() {
+    if w.buf != null {
+        free_mem(w.buf)
+    }
+    w.buf = null
+    w.cap = 0
+    w.len = 0
+}

@@ -31,7 +31,7 @@ Windows x64, Antimony `--llvm` generating LLVM IR directly for **LLVM Clang 23.1
 | **Total** | **402.7** | **114.2** | **173.6** | **196.2** | **115.8** |
 
 What the numbers show:
-- **Direct LLVM IR emission gives Antimony `--llvm` parity with (and on this run a slight edge over) Rust (`114.2 ms` total vs `115.8 ms` Rust, `173.6 ms` C, and `196.2 ms` Go).**
+- **Direct LLVM IR emission gives Antimony `--llvm` parity with Rust (`114.2 ms` total vs `115.8 ms` Rust — well within session variance — and ahead of `173.6 ms` GCC C and `196.2 ms` Go on these workloads).**
 - **On Workload 1 and Workload 3, LLVM (`sb --llvm` and Rust) vectorizes/reduces the loops tightly**, finishing well ahead of GCC and Go.
 - **Workload 1 is an outlier for GCC (`bench.c` at 68.3 ms vs Clang/LLVM at 13.7–14.3 ms).**
 - **The native backend trades runtime for compile time.** It runs about 3–4× slower than `--llvm` overall, but compiles in ~3.6 ms with zero external dependencies.

@@ -53,11 +53,15 @@ fn main() {
 ### Build
 
 ```powershell
+.\build.bat
+```
+
+`build.bat` automatically finds `gcc` or `clang` on `PATH` (or common MinGW-w64/MSYS2 locations, or `%CC%`). You can also invoke `gcc` directly:
+
+```powershell
 gcc -std=c11 -O2 -Wall -Wextra src\util.c src\lexer.c src\parser.c src\check.c `
     src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\main.c -o sbc.exe
 ```
-
-`build.bat` runs the same command using a fixed GCC path; edit that path to match your installation.
 
 Keep `std/` next to `sbc.exe`: imports are resolved relative to the importing file first, then relative to the compiler's directory.
 
@@ -108,10 +112,12 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/map.sb` | Generic open-addressing hash table `HashMap[K, V]` (`put`, `get`, `get_ptr`, `take`, `remove`, `reserve`) |
 | `std/set.sb` | Generic hash set `HashSet[T]` |
 | `std/deque.sb` | Generic ring-buffer double-ended queue `Deque[T]` |
+| `std/heap.sb` | Generic priority queues `BinaryHeap[T]` (max-heap) and `MinHeap[T]` (min-heap) |
 | `std/sort.sb` | Generic sorting (`sort`, `sort_desc`, `sort_by`), `binary_search`, `lower_bound`, `upper_bound`, `reverse` |
 | `std/str.sb` | String search (`str_find`, `str_contains`, `str_count`, `str_split_once`), strict `Result` parsers (`try_parse_i64`/`u64`/`f64`), C-string interop, `StringBuilder` |
 | `std/math.sb` | Constants, transcendental and rounding functions, integer and bit utilities |
 | `std/io.sb` | `File` handle (`file_open`, `file_create`, `read`, `write_all`, `seek`, `flush`), `IoError`, `read_file_all`, `write_file_all` |
+| `std/bufio.sb` | Buffered file I/O (`BufReader` with `read_line`/`read_byte`, `BufWriter` with batched `write`/`flush`) |
 | `std/fs.sb` | Filesystem operations (`fs_exists`, `fs_is_file`, `fs_is_dir`, `fs_mkdir`, `fs_rmdir`, `fs_remove_file`, `fs_rename`, `fs_copy`) |
 | `std/path.sb` | Path utilities (`path_basename`, `path_dirname`, `path_extension`, `path_stem`, `path_is_abs`, `path_join`) |
 | `std/os.sb` | Console streams (`stdin`/`stdout`/`stderr`), command-line arguments, environment variables, `cwd_into` |
