@@ -1,0 +1,526 @@
+// =============================================================================
+// Antimony Standard Library: std/net.sb
+// Native Winsock2 (`ws2_32.dll`) IPv4 TCP & UDP networking (`Ipv4Addr`,
+// `SocketAddr`, `TcpListener`, `TcpStream`, `UdpSocket`, `NetError`).
+// Automatically initializes Winsock on first use.
+// =============================================================================
+
+import "std/core.sb"
+import "std/str.sb"
+
+const AF_INET: i32          = 2
+const SOCK_STREAM: i32      = 1
+const SOCK_DGRAM: i32       = 2
+const IPPROTO_TCP: i32      = 6
+const IPPROTO_UDP: i32      = 17
+const SOL_SOCKET: i32       = 0xFFFF
+const SO_REUSEADDR: i32     = 0x0004
+const SO_SNDTIMEO: i32      = 0x1005
+const SO_RCVTIMEO: i32      = 0x1006
+const TCP_NODELAY: i32      = 0x0001
+const SD_SEND: i32          = 1
+const INVALID_SOCK: usize   = 0xFFFFFFFFFFFFFFFF
+
+const WSAEWOULDBLOCK: i32   = 10035
+const WSAEADDRINUSE: i32    = 10048
+const WSAECONNABORTED: i32  = 10053
+const WSAECONNRESET: i32    = 10054
+const WSAETIMEDOUT: i32     = 10060
+const WSAECONNREFUSED: i32  = 10061
+
+priv struct SockAddrIn {
+    sin_family: u16
+    sin_port: u16
+    sin_addr: u32
+    sin_zero[8]: u8
+}
+
+priv extern "ws2_32.dll" {
+    fn WSAStartup(wVersionRequested: u16, lpWSAData: *u8): i32
+    fn WSAGetLastError(): i32
+    fn socket(af: i32, sock_type: i32, protocol: i32): usize
+    fn bind(s: usize, name: *const u8, namelen: i32): i32
+    fn listen(s: usize, backlog: i32): i32
+    fn accept(s: usize, addr: *u8, addrlen: *i32): usize
+    fn connect(s: usize, name: *const u8, namelen: i32): i32
+    fn send(s: usize, buf: *const u8, len: i32, flags: i32): i32
+    fn recv(s: usize, buf: *u8, len: i32, flags: i32): i32
+    fn sendto(s: usize, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32): i32
+    fn recvfrom(s: usize, buf: *u8, len: i32, flags: i32, from: *u8, fromlen: *i32): i32
+    fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32): i32
+    fn getsockname(s: usize, name: *u8, namelen: *i32): i32
+    fn getpeername(s: usize, name: *u8, namelen: *i32): i32
+    fn shutdown(s: usize, how: i32): i32
+    fn closesocket(s: usize): i32
+}
+
+var g_wsa_ready: i64 = 0
+
+priv fn ensure_wsa(): Result[bool, NetError] {
+    if atomic_load(&g_wsa_ready) != 0 {
+        return .Ok(true)
+    }
+    var wsa_data[512]: u8 = []
+    var rc = WSAStartup(0x0202, &wsa_data[0])
+    if rc != 0 {
+        return .Err(.WsaError(rc))
+    }
+    atomic_store(&g_wsa_ready, 1)
+    return .Ok(true)
+}
+
+// -----------------------------------------------------------------------------
+// Structured Network Errors
+// -----------------------------------------------------------------------------
+
+pub enum NetError {
+    InvalidAddress
+    AddrInUse
+    ConnectionRefused
+    ConnectionReset
+    TimedOut
+    WouldBlock
+    UnexpectedEof
+    WsaError(i32)
+}
+
+priv fn net_error_from_wsa(code: i32): NetError {
+    match code {
+        WSAEADDRINUSE                     { return .AddrInUse }
+        WSAECONNREFUSED                   { return .ConnectionRefused }
+        WSAECONNRESET, WSAECONNABORTED    { return .ConnectionReset }
+        WSAETIMEDOUT                      { return .TimedOut }
+        WSAEWOULDBLOCK                    { return .WouldBlock }
+        else                              { return .WsaError(code) }
+    }
+}
+
+pub fn (e: NetError) message(): str {
+    match e {
+        .InvalidAddress    { return "invalid network address" }
+        .AddrInUse         { return "address already in use" }
+        .ConnectionRefused { return "connection refused" }
+        .ConnectionReset   { return "connection reset" }
+        .TimedOut          { return "operation timed out" }
+        .WouldBlock        { return "operation would block" }
+        .UnexpectedEof     { return "unexpected end of stream" }
+        .WsaError(_)       { return "Winsock error" }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// IPv4 & Socket Addresses
+// -----------------------------------------------------------------------------
+
+pub struct Ipv4Addr {
+    a: u8
+    b: u8
+    c: u8
+    d: u8
+}
+
+pub fn ipv4(a: u8, b: u8, c: u8, d: u8): Ipv4Addr {
+    return Ipv4Addr { a: a, b: b, c: c, d: d }
+}
+
+pub fn ipv4_localhost(): Ipv4Addr {
+    return Ipv4Addr { a: 127, b: 0, c: 0, d: 1 }
+}
+
+pub fn ipv4_any(): Ipv4Addr {
+    return Ipv4Addr { a: 0, b: 0, c: 0, d: 0 }
+}
+
+pub fn (ip: Ipv4Addr) eq(other: Ipv4Addr): bool {
+    return ip.a == other.a && ip.b == other.b && ip.c == other.c && ip.d == other.d
+}
+
+pub fn (ip: Ipv4Addr) format_into(sb: *StringBuilder) {
+    sb.append_u64(u64(ip.a))
+    sb.append_byte('.')
+    sb.append_u64(u64(ip.b))
+    sb.append_byte('.')
+    sb.append_u64(u64(ip.c))
+    sb.append_byte('.')
+    sb.append_u64(u64(ip.d))
+}
+
+// Parses a dotted-quad IPv4 address such as `"127.0.0.1"`.
+pub fn ipv4_parse(s: str): Result[Ipv4Addr, NetError] {
+    var octets[4]: u8 = []
+    var cur = s
+    loop idx in 0..4 {
+        var part = cur
+        if idx < 3 {
+            var dot = str_find_byte(cur, '.')
+            if dot <= 0 {
+                return .Err(.InvalidAddress)
+            }
+            part = cur[0..dot]
+            cur = cur[dot + 1..len(cur)]
+        }
+        if len(part) == 0 || len(part) > 3 {
+            return .Err(.InvalidAddress)
+        }
+        var val: u32 = 0
+        loop i in 0..len(part) {
+            var c = part[i]
+            if !is_digit(c) {
+                return .Err(.InvalidAddress)
+            }
+            val = val * 10 + u32(c - '0')
+        }
+        if val > 255 {
+            return .Err(.InvalidAddress)
+        }
+        octets[idx] = u8(val)
+    }
+    return .Ok(Ipv4Addr { a: octets[0], b: octets[1], c: octets[2], d: octets[3] })
+}
+
+pub struct SocketAddr {
+    ip: Ipv4Addr
+    port: u16
+}
+
+pub fn socket_addr(ip: Ipv4Addr, port: u16): SocketAddr {
+    return SocketAddr { ip: ip, port: port }
+}
+
+// Parses `"a.b.c.d:port"` (e.g. `"127.0.0.1:8080"`).
+pub fn socket_addr_parse(s: str): Result[SocketAddr, NetError] {
+    var colon = str_rfind_byte(s, ':')
+    if colon <= 0 || colon + 1 >= len(s) {
+        return .Err(.InvalidAddress)
+    }
+    var ip = ipv4_parse(s[0..colon])?
+    var port_str = s[colon + 1..len(s)]
+    match try_parse_u64(port_str) {
+        .Ok(p) {
+            if p > 65535 {
+                return .Err(.InvalidAddress)
+            }
+            return .Ok(SocketAddr { ip: ip, port: u16(p) })
+        }
+        .Err(_) {
+            return .Err(.InvalidAddress)
+        }
+    }
+}
+
+priv fn htons(v: u16): u16 {
+    return ((v & 0x00FF) << 8) | ((v >> 8) & 0x00FF)
+}
+
+priv fn to_sockaddr_in(addr: SocketAddr): SockAddrIn {
+    var ip_net: u32 = u32(addr.ip.a) |
+                      (u32(addr.ip.b) << 8) |
+                      (u32(addr.ip.c) << 16) |
+                      (u32(addr.ip.d) << 24)
+    return SockAddrIn {
+        sin_family: u16(AF_INET),
+        sin_port: htons(addr.port),
+        sin_addr: ip_net
+    }
+}
+
+priv fn from_sockaddr_in(sa: SockAddrIn): SocketAddr {
+    var ip = Ipv4Addr {
+        a: u8(sa.sin_addr & 0xFF),
+        b: u8((sa.sin_addr >> 8) & 0xFF),
+        c: u8((sa.sin_addr >> 16) & 0xFF),
+        d: u8((sa.sin_addr >> 24) & 0xFF)
+    }
+    return SocketAddr { ip: ip, port: htons(sa.sin_port) }
+}
+
+priv fn sock_local_addr(sock: usize): Result[SocketAddr, NetError] {
+    var sa = SockAddrIn {}
+    var slen: i32 = i32(sizeof(SockAddrIn))
+    if getsockname(sock, ptr_cast(*u8, &sa), &slen) != 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(from_sockaddr_in(sa))
+}
+
+priv fn set_sock_opt_u32(sock: usize, level: i32, opt: i32, val: u32): Result[bool, NetError] {
+    var v = val
+    if setsockopt(sock, level, opt, ptr_cast(*const u8, &v), 4) != 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(true)
+}
+
+// -----------------------------------------------------------------------------
+// TCP Stream (`TcpStream`)
+// -----------------------------------------------------------------------------
+
+pub struct TcpStream {
+    sock: usize
+}
+
+// Connects a TCP stream to `addr`.
+pub fn tcp_connect(addr: SocketAddr): Result[TcpStream, NetError] {
+    ensure_wsa()?
+    var s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    if s == INVALID_SOCK {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    var sa = to_sockaddr_in(addr)
+    if connect(s, ptr_cast(*const u8, &sa), i32(sizeof(SockAddrIn))) != 0 {
+        var err = WSAGetLastError()
+        closesocket(s)
+        return .Err(net_error_from_wsa(err))
+    }
+    return .Ok(TcpStream { sock: s })
+}
+
+pub fn (s: *TcpStream) is_open(): bool {
+    return s.sock != INVALID_SOCK && s.sock != 0
+}
+
+pub fn (s: *TcpStream) read(buf[]: u8): Result[i64, NetError] {
+    if !s.is_open() {
+        return .Err(.InvalidAddress)
+    }
+    if len(buf) == 0 {
+        return .Ok(0)
+    }
+    var chunk = len(buf)
+    if chunk > 0x7FFF_FFFF {
+        chunk = 0x7FFF_FFFF
+    }
+    var n = recv(s.sock, &buf[0], i32(chunk), 0)
+    if n < 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(i64(n))
+}
+
+// Reads until `buf[]` is completely filled or returns `.Err(.UnexpectedEof)` on early EOF.
+pub fn (s: *TcpStream) read_exact(buf[]: u8): Result[i64, NetError] {
+    var total = len(buf)
+    var off: i64 = 0
+    loop off < total {
+        var n = s.read(buf[off..total])?
+        if n == 0 {
+            return .Err(.UnexpectedEof)
+        }
+        off += n
+    }
+    return .Ok(off)
+}
+
+pub fn (s: *TcpStream) write(data[]: const u8): Result[i64, NetError] {
+    if !s.is_open() {
+        return .Err(.InvalidAddress)
+    }
+    if len(data) == 0 {
+        return .Ok(0)
+    }
+    var chunk = len(data)
+    if chunk > 0x7FFF_FFFF {
+        chunk = 0x7FFF_FFFF
+    }
+    var n = send(s.sock, &data[0], i32(chunk), 0)
+    if n < 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(i64(n))
+}
+
+pub fn (s: *TcpStream) write_all(data[]: const u8): Result[i64, NetError] {
+    var total = len(data)
+    var off: i64 = 0
+    loop off < total {
+        var n = s.write(data[off..total])?
+        if n <= 0 {
+            return .Err(.UnexpectedEof)
+        }
+        off += n
+    }
+    return .Ok(off)
+}
+
+pub fn (s: *TcpStream) write_str(text: str): Result[i64, NetError] {
+    if len(text) == 0 {
+        return .Ok(0)
+    }
+    var p = ptr_cast(*const u8, text)
+    return s.write_all(p[0..len(text)])
+}
+
+pub fn (s: *TcpStream) set_nodelay(enabled: bool): Result[bool, NetError] {
+    var v: u32 = 0
+    if enabled {
+        v = 1
+    }
+    return set_sock_opt_u32(s.sock, IPPROTO_TCP, TCP_NODELAY, v)
+}
+
+pub fn (s: *TcpStream) set_read_timeout(ms: u32): Result[bool, NetError] {
+    return set_sock_opt_u32(s.sock, SOL_SOCKET, SO_RCVTIMEO, ms)
+}
+
+pub fn (s: *TcpStream) set_write_timeout(ms: u32): Result[bool, NetError] {
+    return set_sock_opt_u32(s.sock, SOL_SOCKET, SO_SNDTIMEO, ms)
+}
+
+pub fn (s: *TcpStream) shutdown_write(): Result[bool, NetError] {
+    if !s.is_open() {
+        return .Err(.InvalidAddress)
+    }
+    if shutdown(s.sock, SD_SEND) != 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(true)
+}
+
+pub fn (s: *TcpStream) peer_addr(): Result[SocketAddr, NetError] {
+    var sa = SockAddrIn {}
+    var slen: i32 = i32(sizeof(SockAddrIn))
+    if getpeername(s.sock, ptr_cast(*u8, &sa), &slen) != 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(from_sockaddr_in(sa))
+}
+
+pub fn (s: *TcpStream) close() {
+    if s.is_open() {
+        closesocket(s.sock)
+        s.sock = INVALID_SOCK
+    }
+}
+
+// -----------------------------------------------------------------------------
+// TCP Listener (`TcpListener`)
+// -----------------------------------------------------------------------------
+
+pub struct TcpListener {
+    sock: usize
+}
+
+// Binds a TCP listener to `addr` (pass port `0` for an OS-assigned ephemeral port).
+pub fn tcp_bind(addr: SocketAddr): Result[TcpListener, NetError] {
+    ensure_wsa()?
+    var s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    if s == INVALID_SOCK {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    var reuse: u32 = 1
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, ptr_cast(*const u8, &reuse), 4)
+
+    var sa = to_sockaddr_in(addr)
+    if bind(s, ptr_cast(*const u8, &sa), i32(sizeof(SockAddrIn))) != 0 {
+        var err = WSAGetLastError()
+        closesocket(s)
+        return .Err(net_error_from_wsa(err))
+    }
+    if listen(s, 128) != 0 {
+        var err = WSAGetLastError()
+        closesocket(s)
+        return .Err(net_error_from_wsa(err))
+    }
+    return .Ok(TcpListener { sock: s })
+}
+
+pub fn (l: *TcpListener) local_addr(): Result[SocketAddr, NetError] {
+    return sock_local_addr(l.sock)
+}
+
+pub fn (l: *TcpListener) accept(): Result[TcpStream, NetError] {
+    var sa = SockAddrIn {}
+    var slen: i32 = i32(sizeof(SockAddrIn))
+    var client = accept(l.sock, ptr_cast(*u8, &sa), &slen)
+    if client == INVALID_SOCK {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(TcpStream { sock: client })
+}
+
+pub fn (l: *TcpListener) close() {
+    if l.sock != INVALID_SOCK && l.sock != 0 {
+        closesocket(l.sock)
+        l.sock = INVALID_SOCK
+    }
+}
+
+// -----------------------------------------------------------------------------
+// UDP Socket (`UdpSocket`)
+// -----------------------------------------------------------------------------
+
+pub struct UdpPacket {
+    len: i64
+    from: SocketAddr
+}
+
+pub struct UdpSocket {
+    sock: usize
+}
+
+// Binds a UDP socket to `addr` (pass port `0` for an OS-assigned ephemeral port).
+pub fn udp_bind(addr: SocketAddr): Result[UdpSocket, NetError] {
+    ensure_wsa()?
+    var s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    if s == INVALID_SOCK {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    var sa = to_sockaddr_in(addr)
+    if bind(s, ptr_cast(*const u8, &sa), i32(sizeof(SockAddrIn))) != 0 {
+        var err = WSAGetLastError()
+        closesocket(s)
+        return .Err(net_error_from_wsa(err))
+    }
+    return .Ok(UdpSocket { sock: s })
+}
+
+pub fn (u: *UdpSocket) local_addr(): Result[SocketAddr, NetError] {
+    return sock_local_addr(u.sock)
+}
+
+pub fn (u: *UdpSocket) send_to(data[]: const u8, dest: SocketAddr): Result[i64, NetError] {
+    var sa = to_sockaddr_in(dest)
+    var ptr: *const u8 = null
+    if len(data) > 0 {
+        ptr = &data[0]
+    }
+    var n = sendto(u.sock, ptr, i32(len(data)), 0, ptr_cast(*const u8, &sa), i32(sizeof(SockAddrIn)))
+    if n < 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(i64(n))
+}
+
+pub fn (u: *UdpSocket) send_str_to(text: str, dest: SocketAddr): Result[i64, NetError] {
+    if len(text) == 0 {
+        var empty: *const u8 = null
+        return u.send_to(empty[0..0], dest)
+    }
+    var p = ptr_cast(*const u8, text)
+    return u.send_to(p[0..len(text)], dest)
+}
+
+pub fn (u: *UdpSocket) recv_from(buf[]: u8): Result[UdpPacket, NetError] {
+    var sa = SockAddrIn {}
+    var slen: i32 = i32(sizeof(SockAddrIn))
+    var ptr: *u8 = null
+    if len(buf) > 0 {
+        ptr = &buf[0]
+    }
+    var n = recvfrom(u.sock, ptr, i32(len(buf)), 0, ptr_cast(*u8, &sa), &slen)
+    if n < 0 {
+        return .Err(net_error_from_wsa(WSAGetLastError()))
+    }
+    return .Ok(UdpPacket { len: i64(n), from: from_sockaddr_in(sa) })
+}
+
+pub fn (u: *UdpSocket) set_read_timeout(ms: u32): Result[bool, NetError] {
+    return set_sock_opt_u32(u.sock, SOL_SOCKET, SO_RCVTIMEO, ms)
+}
+
+pub fn (u: *UdpSocket) close() {
+    if u.sock != INVALID_SOCK && u.sock != 0 {
+        closesocket(u.sock)
+        u.sock = INVALID_SOCK
+    }
+}

@@ -117,6 +117,8 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/os.sb` | Console streams (`stdin`/`stdout`/`stderr`), command-line arguments, environment variables, `cwd_into` |
 | `std/time.sb` | High-resolution timers, `Stopwatch`, `sleep_ms` |
 | `std/rand.sb` | Deterministic PRNG (`Rng`, xoshiro256++), `rng_shuffle`, OS CSPRNG (`os_random_bytes` via `bcrypt.dll`) |
+| `std/process.sb` | Child process spawning, `wait`/`try_wait`/`kill`, stdout/stderr pipe capture (`process_capture`), `current_pid` |
+| `std/net.sb` | Winsock2 IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `NetError`) |
 | `std/thread.sb` | Threads, `Mutex`, `RwLock`, `CondVar`, `AtomicI64` |
 
 ## Documentation

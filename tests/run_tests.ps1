@@ -2636,4 +2636,110 @@ Test-CompileError "std_mem_priv_hidden"  "import `"std/mem.sb`"`nfn main() { pri
 Test-CompileError "std_io_priv_hidden"   "import `"std/io.sb`"`nfn main() { print(GetLastError()) }"    "cannot access private"
 Test-CompileError "std_rand_priv_hidden" "import `"std/rand.sb`"`nfn main() { var x: u8 = 0`n print(BCryptGenRandom(0, &x, 1, 2)) }" "cannot access private"
 
+# 32. Phase 23: std/process.sb (Child Processes & Pipes) and std/net.sb (Winsock2 TCP & UDP)
+$phase23_code = @'
+import "std/core.sb"
+import "std/str.sb"
+import "std/process.sb"
+import "std/net.sb"
+import "std/thread.sb"
+
+struct TcpServerArg {
+    listener: TcpListener
+    ok: bool
+}
+
+fn tcp_server_worker(raw: *u8): u32 {
+    var arg = ptr_cast(*TcpServerArg, raw)
+    match arg.listener.accept() {
+        .Ok(conn) {
+            var c = conn
+            defer c.close()
+            var buf[64]: u8 = []
+            match c.read_exact(buf[0..11]) {
+                .Ok(_) {
+                    if str(buf[0..11]) == "ping-client" {
+                        match c.write_str("pong-server") {
+                            .Ok(_)  { arg.ok = true }
+                            .Err(_) { arg.ok = false }
+                        }
+                    }
+                }
+                .Err(_) { arg.ok = false }
+            }
+        }
+        .Err(_) { arg.ok = false }
+    }
+    return 0
+}
+
+fn run_tcp_echo(): Result[bool, NetError] {
+    var listener = tcp_bind(socket_addr(ipv4_localhost(), 0))?
+    var addr = listener.local_addr()?
+
+    var arg = TcpServerArg { listener: listener, ok: false }
+    var th = spawn(tcp_server_worker, ptr_cast(*u8, &arg))
+
+    var client = tcp_connect(addr)?
+    defer client.close()
+    client.set_nodelay(true)?
+    client.set_read_timeout(3000)?
+    client.write_str("ping-client")?
+    client.shutdown_write()?
+
+    var resp[11]: u8 = []
+    client.read_exact(resp)?
+    th.join()
+    arg.listener.close()
+    return .Ok(arg.ok && str(resp) == "pong-server")
+}
+
+fn run_udp_loopback(): Result[bool, NetError] {
+    var srv = udp_bind(socket_addr(ipv4_localhost(), 0))?
+    defer srv.close()
+    srv.set_read_timeout(3000)?
+    var srv_addr = srv.local_addr()?
+
+    var cli = udp_bind(socket_addr(ipv4_localhost(), 0))?
+    defer cli.close()
+    cli.send_str_to("hello-udp", srv_addr)?
+
+    var buf[64]: u8 = []
+    var pkt = srv.recv_from(buf)?
+    return .Ok(pkt.len == 9 && str(buf[0..pkt.len]) == "hello-udp" && pkt.from.ip.eq(ipv4_localhost()))
+}
+
+fn main() {
+    assert(current_pid() > 0, "pid")
+    var rc1 = process_run("cmd.exe /c exit /b 7").unwrap_or(99)
+    var out: StringBuilder
+    out.init(64)
+    defer out.free()
+    var rc2 = process_capture("cmd.exe /c echo hello-from-child", &out).unwrap_or(99)
+    print("proc={} {} {}", rc1, rc2, str_trim(out.as_str()))
+
+    var sa = socket_addr_parse("127.0.0.1:8080").unwrap_or(socket_addr(ipv4_any(), 0))
+    var ipb: StringBuilder
+    ipb.init(32)
+    defer ipb.free()
+    sa.ip.format_into(&ipb)
+    var bad_addr = socket_addr_parse("999.0.0.1:80").is_err()
+    print("addr={} {} {}", ipb.as_str(), sa.port, bad_addr)
+
+    var tcp_ok = run_tcp_echo().unwrap_or(false)
+    var udp_ok = run_udp_loopback().unwrap_or(false)
+    print("net={} {}", tcp_ok, udp_ok)
+}
+'@
+$phase23_expected = @(
+    "proc=7 0 hello-from-child"
+    "addr=127.0.0.1 8080 true"
+    "net=true true"
+) -join "`n"
+Test-RunOk   "phase23_process_net"      $phase23_code $phase23_expected
+Test-RunLlvm "phase23_process_net_llvm" $phase23_code $phase23_expected
+
+Test-CompileError "std_process_priv_hidden" "import `"std/process.sb`"`nfn main() { print(GetCurrentProcessId()) }" "cannot access private"
+Test-CompileError "std_net_priv_hidden"     "import `"std/net.sb`"`nfn main() { print(WSAGetLastError()) }"         "cannot access private"
+
 Write-Host "`nAll tests passed."

@@ -1034,7 +1034,7 @@ fn main() {
 ```
 
 ### 15.3 Standard Library Modules (`std/`)
-Antimony ships with 16 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
+Antimony ships with 18 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
 - `import "std/core.sb"` — Canonical `Option[T]`, `Result[T, E]`, `Ordering`, `panic`, `assert`, and `swap[T]`.
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `alloc_typed`, `realloc_mem`, `free_mem`, `copy_mem`, `move_mem`, `set_mem`, `cmp_mem`, `eq_mem`) and fast bump-pointer `Arena`.
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `extend_slice`, `pop`, `try_pop`, `get`, `try_get`, `get_ptr`, `set`, `first`, `last`, `insert`, `remove`, `swap_remove`, `shrink_to_fit`, `as_slice`, `as_const_slice`, `clear`, `free`).
@@ -1049,6 +1049,8 @@ Antimony ships with 16 native, encapsulated (`pub`/`priv`) standard library modu
 - `import "std/path.sb"` — Zero-allocation path utilities (`path_is_sep`, `path_is_abs`, `path_basename`, `path_dirname`, `path_extension`, `path_stem`) and `path_join`.
 - `import "std/time.sb"` — High-resolution performance counters (`perf_counter`, `perf_freq`, `elapsed_us`, `elapsed_ms`, `ticks_ms`, `sleep_ms`) and `Stopwatch`.
 - `import "std/rand.sb"` — Deterministic xoshiro256++ PRNG (`Rng`, `rng_from_seed`, `rng_from_os`, `next_u64`, `next_u32`, `next_f64`, `range_i64`, `next_bool`, `rng_shuffle[T]`) and OS CSPRNG (`os_random_bytes`, `os_random_u64` via `bcrypt.dll`).
+- `import "std/process.sb"` — Native Win32 child process management (`Child`, `process_spawn`, `process_run`, `process_capture`, `wait`, `try_wait`, `kill`, `current_pid`).
+- `import "std/net.sb"` — Native Winsock2 (`ws2_32.dll`) IPv4 networking (`Ipv4Addr`, `SocketAddr`, `TcpListener`, `TcpStream`, `UdpSocket`, `NetError`, `tcp_bind`, `tcp_connect`, `udp_bind`).
 - `import "std/str.sb"` — String utilities: C-string interop (`cstr_len`, `cstr_eq`, `cstr_to_str`, `str_from_ptr`), ASCII classification & case helpers, `str` search & slicing (`str_cmp`, `str_eq_ignore_ascii_case`, `str_starts_with`, `str_ends_with`, `str_strip_prefix`, `str_strip_suffix`, `str_trim`, `str_find`, `str_contains`, `str_count`, `str_split_once`), strict `Result` parsers (`try_parse_i64`, `try_parse_u64`, `try_parse_f64`), and `StringBuilder` (`append`, `append_bytes`, `append_i64`, `append_u64`, `append_hex`, `append_replace`, `append_lower`, `append_upper`, `as_str`, `cstr`).
 - `import "std/os.sb"` — Console streams (`print_raw`, `eprint_raw`, `eprint`, `read_stdin`), command-line arguments (`cmd_line`, `arg_count`, `arg_at`), environment (`getenv_into`, `getenv_str`), and `cwd_into`.
 
