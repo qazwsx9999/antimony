@@ -1,6 +1,7 @@
 const vscode = require("vscode");
 const fs = require("fs");
 const path = require("path");
+const { execFile, spawn } = require("child_process");
 
 const BUILTIN_DOCS = {
   // Scalar & built-in types
@@ -30,7 +31,7 @@ const BUILTIN_DOCS = {
   atomic_load: "**`atomic_load(ptr: *i64): i64`** — Hardware atomic load.",
   atomic_store: "**`atomic_store(ptr: *i64, val: i64)`** — Hardware atomic store.",
   atomic_add: "**`atomic_add(ptr: *i64, delta: i64): i64`** — Hardware atomic fetch-and-add.",
-  atomic_cas: "**`atomic_cas(ptr: *i64, expected: i64, desired: i64): bool`** — Hardware atomic compare-and-swap.",
+  atomic_cas: "**`atomic_cas(ptr: *i64, expected: i64, desired: i64): i64`** — Hardware atomic compare-and-swap (returns the previous value).",
 
   // Keywords
   fn: "**`fn`** — Declares a function, method (`fn (self: *T) name(...)`), function pointer type (`fn(T): R`), or stateless anonymous function.",
@@ -366,6 +367,122 @@ function resolveCompiler(fileUri) {
   return process.platform === "win32" ? "sbc.exe" : "sbc";
 }
 
+function formatTextWithSbc(text, fileUri) {
+  return new Promise((resolve, reject) => {
+    const compiler = resolveCompiler(fileUri);
+    const wsFolder = vscode.workspace.getWorkspaceFolder(fileUri);
+    const cwd = wsFolder ? wsFolder.uri.fsPath : (fileUri && fileUri.fsPath ? path.dirname(fileUri.fsPath) : undefined);
+
+    const child = spawn(compiler, ["fmt", "--stdin"], { cwd, windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString("utf8");
+    });
+    child.on("error", (err) => {
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(stderr.trim() || `sbc fmt exited with code ${code}`));
+      }
+    });
+
+    child.stdin.write(text, "utf8");
+    child.stdin.end();
+  });
+}
+
+class AntimonyDocumentFormattingEditProvider {
+  async provideDocumentFormattingEdits(document) {
+    const original = document.getText();
+    try {
+      const formatted = await formatTextWithSbc(original, document.uri);
+      if (formatted === original || formatted.replace(/\r\n/g, "\n") === original.replace(/\r\n/g, "\n")) {
+        return [];
+      }
+      const lastLine = document.lineCount - 1;
+      const fullRange = new vscode.Range(
+        new vscode.Position(0, 0),
+        document.lineAt(lastLine).range.end
+      );
+      return [vscode.TextEdit.replace(fullRange, formatted)];
+    } catch (err) {
+      vscode.window.setStatusBarMessage(`Antimony fmt: ${err.message.split(/\r?\n/)[0]}`, 4000);
+      return [];
+    }
+  }
+}
+
+function parseCompilerDiagnostics(output, fallbackFilePath) {
+  const byFile = new Map();
+  const lines = output.split(/\r?\n/);
+  const locRe = /^(.+?):(\d+):(\d+):\s*(error|warning|hint):\s*(.+)$/;
+  const plainErrRe = /^error:\s*(.+)$/;
+
+  const pushDiag = (filePath, lineNum, colNum, severityStr, message) => {
+    const resolved = path.resolve(filePath);
+    const ln = Math.max(0, lineNum - 1);
+    const col = Math.max(0, colNum - 1);
+    const range = new vscode.Range(ln, col, ln, col + 1);
+    let severity = vscode.DiagnosticSeverity.Error;
+    if (severityStr === "warning") severity = vscode.DiagnosticSeverity.Warning;
+    else if (severityStr === "hint") severity = vscode.DiagnosticSeverity.Hint;
+
+    const diag = new vscode.Diagnostic(range, message, severity);
+    diag.source = "sbc";
+    if (!byFile.has(resolved)) {
+      byFile.set(resolved, []);
+    }
+    byFile.get(resolved).push(diag);
+  };
+
+  for (const raw of lines) {
+    const m = raw.match(locRe);
+    if (m) {
+      const filePart = m[1] === "<input>" ? fallbackFilePath : m[1];
+      pushDiag(filePart, parseInt(m[2], 10), parseInt(m[3], 10), m[4], m[5]);
+      continue;
+    }
+    const pm = raw.match(plainErrRe);
+    if (pm) {
+      pushDiag(fallbackFilePath, 1, 1, "error", pm[1]);
+    }
+  }
+  return byFile;
+}
+
+function runDiagnostics(document, collection) {
+  if (!document || document.languageId !== "antimony" || document.uri.scheme !== "file") {
+    return;
+  }
+  const config = vscode.workspace.getConfiguration("antimony", document.uri);
+  if (!config.get("enableDiagnostics", true)) {
+    collection.delete(document.uri);
+    return;
+  }
+
+  const filePath = document.uri.fsPath;
+  const compiler = resolveCompiler(document.uri);
+  const wsFolder = vscode.workspace.getWorkspaceFolder(document.uri);
+  const cwd = wsFolder ? wsFolder.uri.fsPath : path.dirname(filePath);
+
+  execFile(compiler, ["check", "--lib", filePath], { cwd, windowsHide: true }, (_err, stdout, stderr) => {
+    const combined = `${stdout || ""}\n${stderr || ""}`;
+    const byFile = parseCompilerDiagnostics(combined, filePath);
+    collection.delete(document.uri);
+    for (const [diagPath, diags] of byFile.entries()) {
+      collection.set(vscode.Uri.file(diagPath), diags);
+    }
+  });
+}
+
 async function runCompilerTask(runAfter) {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.languageId !== "antimony") {
@@ -385,7 +502,7 @@ async function runCompilerTask(runAfter) {
 
   const filePath = editor.document.uri.fsPath;
   const compiler = resolveCompiler(editor.document.uri);
-  const args = runAfter ? [filePath, "--run"] : [filePath];
+  const args = runAfter ? ["run", filePath] : ["build", filePath];
   const wsFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
   const cwd = wsFolder ? wsFolder.uri.fsPath : path.dirname(filePath);
 
@@ -408,13 +525,38 @@ async function runCompilerTask(runAfter) {
 function activate(context) {
   const selector = { language: "antimony", scheme: "file" };
   const untitledSelector = { language: "antimony", scheme: "untitled" };
+  const diagnostics = vscode.languages.createDiagnosticCollection("antimony");
 
   context.subscriptions.push(
+    diagnostics,
     vscode.languages.registerDocumentSymbolProvider([selector, untitledSelector], new AntimonyDocumentSymbolProvider()),
     vscode.languages.registerHoverProvider([selector, untitledSelector], new AntimonyHoverProvider()),
+    vscode.languages.registerDocumentFormattingEditProvider(
+      [selector, untitledSelector],
+      new AntimonyDocumentFormattingEditProvider()
+    ),
     vscode.commands.registerCommand("antimony.runFile", () => runCompilerTask(true)),
-    vscode.commands.registerCommand("antimony.buildFile", () => runCompilerTask(false))
+    vscode.commands.registerCommand("antimony.buildFile", () => runCompilerTask(false)),
+    vscode.commands.registerCommand("antimony.checkFile", () => {
+      const editor = vscode.window.activeTextEditor;
+      if (editor && editor.document.languageId === "antimony") {
+        runDiagnostics(editor.document, diagnostics);
+      }
+    }),
+    vscode.commands.registerCommand("antimony.formatFile", async () => {
+      await vscode.commands.executeCommand("editor.action.formatDocument");
+    }),
+    vscode.workspace.onDidOpenTextDocument((doc) => runDiagnostics(doc, diagnostics)),
+    vscode.workspace.onDidSaveTextDocument((doc) => runDiagnostics(doc, diagnostics)),
+    vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.delete(doc.uri)),
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      if (editor) runDiagnostics(editor.document, diagnostics);
+    })
   );
+
+  if (vscode.window.activeTextEditor) {
+    runDiagnostics(vscode.window.activeTextEditor.document, diagnostics);
+  }
 }
 
 function deactivate() {}

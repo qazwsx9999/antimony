@@ -3522,6 +3522,10 @@ static int find_iat_slot(Program *prog, const char *dll_name, const char *fn_nam
 }
 
 Program check(NodeVec decls) {
+    return check_ex(decls, true);
+}
+
+Program check_ex(NodeVec decls, bool require_main) {
     Checker c = {0};
     c.global = push_scope(&c, false);
     register_builtins(&c);
@@ -3836,7 +3840,11 @@ Program check(NodeVec decls) {
     const char *main_name = intern("main", 4);
     Symbol *m = lookup_in(c.global, main_name);
     if (!m || m->kind != SYM_FN) {
-        die("missing entry point 'fn main()'");
+        if (require_main) {
+            die("missing entry point 'fn main()'");
+        }
+        prog.main_fn = NULL;
+        return prog;
     }
     if (m->decl->list.len != 0 || m->type != &ty_void) {
         fatal(m->pos, "'main' must have signature 'fn main()' with no parameters and no return type");

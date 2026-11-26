@@ -1,8 +1,8 @@
 {
   "name": "antimony",
   "displayName": "Antimony (sb)",
-  "description": "Syntax highlighting, snippets, outline symbols, hover docs, and build/run support for the Antimony (.sb) programming language.",
-  "version": "0.1.0",
+  "description": "Syntax highlighting, live diagnostics, canonical formatting (sbc fmt), snippets, outline symbols, hover docs, and build/run support for the Antimony (.sb) programming language.",
+  "version": "0.2.0",
   "publisher": "antimony-lang",
   "license": "MIT",
   "engines": {
@@ -64,6 +64,16 @@
         "command": "antimony.buildFile",
         "title": "Antimony: Compile Current File",
         "icon": "$(tools)"
+      },
+      {
+        "command": "antimony.checkFile",
+        "title": "Antimony: Type-Check Current File",
+        "icon": "$(check)"
+      },
+      {
+        "command": "antimony.formatFile",
+        "title": "Antimony: Format Current File (sbc fmt)",
+        "icon": "$(wand)"
       }
     ],
     "menus": {
@@ -82,6 +92,11 @@
           "type": "string",
           "default": "",
           "description": "Path to the Antimony compiler (sbc / sbc.exe). Leave empty to auto-detect sbc.exe in the workspace root or PATH."
+        },
+        "antimony.enableDiagnostics": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run `sbc check --lib` automatically on open and save to show inline compiler errors and hints."
         }
       }
     }

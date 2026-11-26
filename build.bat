@@ -42,6 +42,7 @@ exit /b 1
     "%~dp0src\codegen.c" ^
     "%~dp0src\pe.c" ^
     "%~dp0src\llvm_c.c" ^
+    "%~dp0src\fmt.c" ^
     "%~dp0src\main.c" ^
     -o "%~dp0sbc.exe"
 exit /b %errorlevel%

@@ -2,6 +2,8 @@
 #ifndef SB_H
 #define SB_H
 
+#define SB_VERSION "1.0.0"
+
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -284,6 +286,7 @@ typedef struct {
 } Program;
 
 Program check(NodeVec decls);
+Program check_ex(NodeVec decls, bool require_main);
 bool is_int(Type *t);
 bool is_float(Type *t);
 bool fits(i128 v, Type *t);
@@ -422,5 +425,6 @@ Image codegen(Program *prog, bool release);
 void write_pe(const char *path, Image *img);
 bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release);
 bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release);
+char *fmt_source(const char *filename, const char *src);
 
 #endif

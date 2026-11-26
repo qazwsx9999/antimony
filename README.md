@@ -80,17 +80,24 @@ fn main() {
 ## Usage
 
 ```
-sbc <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]
+sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]
+sbc run <file.sb> [--release] [--llvm | -O3]
+sbc check [--lib] <file.sb>
+sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
+sbc --version | --help
 ```
 
-| Option | Effect |
+| Command / Option | Effect |
 |---|---|
-| *(none)* | Debug build with the native backend: overflow, narrowing, null, and bounds checks enabled. |
+| `sbc [build] <file.sb>` | Debug build with the native backend: overflow, narrowing, null, and bounds checks enabled. |
+| `sbc run <file.sb>` | Compile and execute immediately (equivalent to `--run` / `-r`). |
+| `sbc check [--lib] <file.sb>` | Fast type-check only (no codegen, no output file). Pass `--lib` for library modules without `fn main()`. |
+| `sbc fmt <file.sb>...` | Canonical 4-space source formatter (lossless, comment-preserving). Use `-w` to format in place, `--check` for CI, or `--stdin` for editors. |
 | `--release` | Release build: arithmetic wraps; bounds checks, division by zero, and `MIN / -1` still trap. |
 | `--llvm`, `-O3` | Compile through LLVM (`clang -O3 -march=native`); implies `--release`. |
 | `--emit-llvm` | Write textual LLVM IR (`.ll`) to the output path instead of an executable. |
 | `-o <path>` | Output path (default: input name with `.exe`). |
-| `--run`, `-r` | Run the program after a successful build. |
+| `--version`, `-V` | Print compiler version information. |
 
 ## Performance
 
@@ -158,7 +165,7 @@ docs/         tutorial and language specification
 examples/     sample programs
 tests/        test runner and test programs
 benchmarks/   cross-language benchmark suite
-editors/      VS Code extension (syntax highlighting, snippets, icons)
+editors/      VS Code extension (highlighting, live diagnostics, sbc fmt, outline, hover, snippets)
 ```
 
 ## Status

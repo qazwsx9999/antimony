@@ -3052,6 +3052,158 @@ Test-CompileError "phase25_fs_priv_hidden"   "import `"std/fs.sb`"`nfn main() { 
 Test-CompileError "phase25_hash_priv_hidden" "import `"std/hash.sb`"`nfn main() { print(rotr32(1, 1)) }"           "cannot access private"
 Test-CompileError "phase25_json_priv_hidden" "import `"std/json.sb`"`nfn main() { print(JSON_MAX_DEPTH) }"         "cannot access private"
 
+# 35. Phase 26: CLI Tooling (--version, build, run, check, fmt)
+if (Should-RunTest "phase26_cli_tooling") {
+    # --version / -V / --help
+    $ver = (& $sbc --version 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $ver -notmatch '^sbc \d+\.\d+\.\d+') {
+        throw "FAIL [phase26_cli_version]: unexpected --version output: $ver"
+    }
+    $help = (& $sbc --help 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $help -notmatch 'sbc fmt' -or $help -notmatch 'sbc check') {
+        throw "FAIL [phase26_cli_help]: unexpected --help output: $help"
+    }
+
+    # sbc check & sbc check --lib
+    $chkLib = Join-Path $root "std\json.sb"
+    $null = & $sbc check --lib $chkLib 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_cli_check]: sbc check --lib std/json.sb failed" }
+    $null = & $sbc check $chkLib 2>&1
+    if ($LASTEXITCODE -eq 0) { throw "FAIL [phase26_cli_check]: sbc check without --lib should fail on library file" }
+
+    # sbc build & sbc run
+    $cliSb = Join-Path $tmp "phase26_cli_hello.sb"
+    $cliExe = Join-Path $tmp "phase26_cli_hello.exe"
+    Set-Content -Path $cliSb -Value "fn main() {`n    print(42)`n}`n" -NoNewline -Encoding UTF8
+    $null = & $sbc check $cliSb 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_cli_check]: sbc check failed on valid program" }
+    $null = & $sbc build $cliSb -o $cliExe 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_cli_build]: sbc build failed" }
+    $runOut = ((& $sbc run $cliSb 2>$null) -join "`n").Trim()
+    if ($LASTEXITCODE -ne 0 -or $runOut -ne "42") { throw "FAIL [phase26_cli_run]: expected '42', got '$runOut'" }
+
+    $script:PassedCount++
+    Write-Host "PASS [cli]           phase26_cli_tooling"
+}
+
+if (Should-RunTest "phase26_sbc_fmt") {
+    $uglyPath = Join-Path $tmp "phase26_ugly.sb"
+    $uglyCode = @"
+import   "std/core.sb"
+
+
+struct   Point{
+x:i32
+  y:i32
+}
+
+fn ( p : *Point ) move ( dx:i32,dy:i32 ) {
+p.x+=dx
+p.y+=dy   // shift y
+}
+
+fn  main( ){
+var   pt=Point{x:1,y:-2}
+pt.move(3,4)
+var  arr[3]:i32=[10,20,30]
+var s[]:const i32=arr[0..3]
+var f:fn(i32,i32):bool=fn(a:i32,b:i32):bool{return a<b}
+if  pt.x>0&&!f(5,2){
+print("ok={}",s[1])
+}else{
+print("no")
+}
+loop var i=0;i<3;i+=1{
+print(i)
+}
+}
+"@
+    $expectedFmt = @(
+        'import "std/core.sb"'
+        ''
+        'struct Point {'
+        '    x: i32'
+        '    y: i32'
+        '}'
+        ''
+        'fn (p: *Point) move(dx: i32, dy: i32) {'
+        '    p.x += dx'
+        '    p.y += dy // shift y'
+        '}'
+        ''
+        'fn main() {'
+        '    var pt = Point { x: 1, y: -2 }'
+        '    pt.move(3, 4)'
+        '    var arr[3]: i32 = [10, 20, 30]'
+        '    var s[]: const i32 = arr[0..3]'
+        '    var f: fn(i32, i32): bool = fn(a: i32, b: i32): bool { return a < b }'
+        '    if pt.x > 0 && !f(5, 2) {'
+        '        print("ok={}", s[1])'
+        '    } else {'
+        '        print("no")'
+        '    }'
+        '    loop var i = 0; i < 3; i += 1 {'
+        '        print(i)'
+        '    }'
+        '}'
+    ) -join "`n"
+    Set-Content -Path $uglyPath -Value $uglyCode -Encoding UTF8
+
+    # --check must fail on unformatted code
+    $null = & $sbc fmt --check $uglyPath 2>&1
+    if ($LASTEXITCODE -eq 0) { throw "FAIL [phase26_sbc_fmt]: --check should exit non-zero on unformatted file" }
+
+    # -w formats in place
+    $null = & $sbc fmt -w $uglyPath 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_sbc_fmt]: fmt -w failed" }
+    $actualFmt = (Get-Content -Path $uglyPath -Raw).Replace("`r`n", "`n").TrimEnd("`n")
+    if ($actualFmt -ne $expectedFmt) {
+        throw "FAIL [phase26_sbc_fmt]: formatted output mismatch:`n--- EXPECTED ---`n$expectedFmt`n--- ACTUAL ---`n$actualFmt"
+    }
+
+    # --check must now succeed (idempotence)
+    $null = & $sbc fmt --check $uglyPath 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_sbc_fmt]: --check failed after fmt -w (not idempotent)" }
+
+    # Formatted code compiles and runs identically
+    $fmtExe = Join-Path $tmp "phase26_ugly.exe"
+    $null = & $sbc $uglyPath -o $fmtExe 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_sbc_fmt]: formatted code failed to compile" }
+    $fmtRun = ((& $fmtExe) -join "`n").Replace("`r`n", "`n").Trim()
+    if ($LASTEXITCODE -ne 0 -or $fmtRun -ne "ok=20`n0`n1`n2") {
+        throw "FAIL [phase26_sbc_fmt]: formatted executable wrong output: $fmtRun"
+    }
+
+    # --stdin mode
+    $stdinOut = (($uglyCode | & $sbc fmt --stdin) -join "`n").Replace("`r`n", "`n").TrimEnd("`n")
+    if ($LASTEXITCODE -ne 0 -or $stdinOut -ne $expectedFmt) {
+        throw "FAIL [phase26_sbc_fmt]: --stdin output mismatch"
+    }
+
+    # Invalid syntax must be rejected by sbc fmt
+    $badPath = Join-Path $tmp "phase26_bad_syntax.sb"
+    Set-Content -Path $badPath -Value "fn main( { var x = 1 }" -Encoding UTF8
+    $null = & $sbc fmt --check $badPath 2>&1
+    if ($LASTEXITCODE -eq 0) { throw "FAIL [phase26_sbc_fmt]: fmt should reject syntax errors" }
+
+    # Stress-test: every std/*.sb file formats idempotently and passes `sbc check --lib`
+    $stdFmtDir = Join-Path $tmp "phase26_std_fmt"
+    New-Item -ItemType Directory -Force -Path $stdFmtDir | Out-Null
+    foreach ($sf in (Get-ChildItem (Join-Path $root "std\*.sb"))) {
+        $dst = Join-Path $stdFmtDir $sf.Name
+        Copy-Item $sf.FullName $dst -Force
+        $null = & $sbc fmt -w $dst 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_sbc_fmt]: fmt failed on $($sf.Name)" }
+        $null = & $sbc fmt --check $dst 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_sbc_fmt]: fmt not idempotent on $($sf.Name)" }
+        $null = & $sbc check --lib $dst 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "FAIL [phase26_sbc_fmt]: formatted $($sf.Name) failed sbc check --lib" }
+    }
+
+    $script:PassedCount++
+    Write-Host "PASS [fmt]           phase26_sbc_fmt"
+}
+
 if ($script:SkippedCount -gt 0) {
     Write-Host "`nAll $($script:PassedCount) selected tests passed ($($script:SkippedCount) skipped)."
 } else {

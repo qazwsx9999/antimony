@@ -15,7 +15,7 @@ jobs:
       - name: Build sbc (MinGW-w64 GCC, warnings as errors)
         shell: cmd
         run: |
-          gcc -std=c11 -O2 -Wall -Wextra -Werror src\util.c src\lexer.c src\parser.c src\check.c src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\main.c -o sbc.exe
+          gcc -std=c11 -O2 -Wall -Wextra -Werror src\util.c src\lexer.c src\parser.c src\check.c src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\fmt.c src\main.c -o sbc.exe
 
       - name: Run full test suite (Native x64 & LLVM -O3)
         shell: pwsh

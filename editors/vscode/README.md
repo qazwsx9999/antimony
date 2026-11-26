@@ -16,14 +16,16 @@ Language support for the **Antimony** programming language in Visual Studio Code
 - **Snippets**: Quick templates for `main`, `fn`, `fnm`, `struct`, `enum`, `type`, `match`, `loop`, `loopr`, `loopfor`, `if`, `ife`, `var`, `const`, `defer`, `import`, `extern`, `print`.
 - **Outline & Breadcrumbs (`Ctrl+Shift+O`)**: Symbol navigation for functions, methods, structs (with fields), enums (with variants), type aliases, constants, variables, and `extern` declarations.
 - **Hover Documentation**: Quick descriptions for Antimony keywords, scalar types, and built-in functions.
-- **Compile & Run Commands**: Use the editor title ▶ button or Command Palette (`Antimony: Compile & Run Current File` / `Antimony: Compile Current File`). Uses `sbc.exe` in the workspace root, `antimony.compilerPath`, or `sbc` on `PATH`.
+- **Live Compiler Diagnostics**: Automatically runs `sbc check --lib` on open and save to highlight compile errors and hints inline (toggle with `antimony.enableDiagnostics`).
+- **Canonical Formatting (`Shift+Alt+F` / Format on Save)**: Uses `sbc fmt --stdin` to format Antimony source files cleanly without modifying disk until saved.
+- **Compile, Check & Run Commands**: Use the editor title ▶ button or Command Palette (`Antimony: Compile & Run Current File`, `Antimony: Compile Current File`, `Antimony: Type-Check Current File`, `Antimony: Format Current File (sbc fmt)`). Uses `sbc.exe` in the workspace root, `antimony.compilerPath`, or `sbc` on `PATH`.
 
 ## Local Installation
 
 Copy (or symlink) this directory to your VS Code extensions folder:
 
 ```powershell
-Copy-Item -Recurse -Force editors\vscode "$env:USERPROFILE\.vscode\extensions\antimony-lang.antimony-0.1.0"
+Copy-Item -Recurse -Force editors\vscode "$env:USERPROFILE\.vscode\extensions\antimony-lang.antimony-0.2.0"
 ```
 
 Then reload VS Code (`Developer: Reload Window`).
