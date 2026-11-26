@@ -1034,7 +1034,7 @@ fn main() {
 ```
 
 ### 15.3 Standard Library Modules (`std/`)
-Antimony ships with 23 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
+Antimony ships with 24 native, encapsulated (`pub`/`priv`) standard library modules in `std/` that you can import from any directory:
 - `import "std/core.sb"` — Canonical `Option[T]`, `Result[T, E]`, `Ordering`, `panic`, `assert`, and `swap[T]`.
 - `import "std/mem.sb"` — Win32 process heap (`alloc`, `alloc_uninit`, `alloc_typed`, `realloc_mem`, `free_mem`, `copy_mem`, `move_mem`, `set_mem`, `cmp_mem`, `eq_mem`) and fast bump-pointer `Arena`.
 - `import "std/vec.sb"` — Generic dynamic array `Vec[T]` (`init`, `reserve`, `push`, `extend_slice`, `pop`, `try_pop`, `get`, `try_get`, `get_ptr`, `set`, `first`, `last`, `insert`, `remove`, `swap_remove`, `shrink_to_fit`, `as_slice`, `as_const_slice`, `clear`, `free`).
@@ -1053,6 +1053,7 @@ Antimony ships with 23 native, encapsulated (`pub`/`priv`) standard library modu
 - `import "std/rand.sb"` — Deterministic xoshiro256++ PRNG (`Rng`, `rng_from_seed`, `rng_from_os`, `next_u64`, `next_u32`, `next_f64`, `range_i64`, `next_bool`, `rng_shuffle[T]`) and OS CSPRNG (`os_random_bytes`, `os_random_u64` via `bcrypt.dll`).
 - `import "std/process.sb"` — Native Win32 child process management (`Child`, `process_spawn`, `process_run`, `process_capture`, `wait`, `try_wait`, `kill`, `current_pid`).
 - `import "std/net.sb"` — Native Winsock2 (`ws2_32.dll`) IPv4 networking (`Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `TcpListener`, `TcpStream`, `UdpSocket`, `NetError`, `tcp_bind`, `tcp_connect`, `udp_bind`).
+- `import "std/http.sb"` — Zero-dependency HTTP/1.1 client & server (`http_get`, `http_post`, `http_request`, `http_read_request`, `http_write_response`, `HttpRequest`, `HttpResponse`, `HttpClientResponse`, `http_parse_url`, `http_decode_chunked`, `http_mime_type`).
 - `import "std/encoding.sb"` — RFC 4648 Hexadecimal (`hex_encode`, `hex_decode`) and Base64 (`base64_encode`, `base64_url_encode`, `base64_decode`).
 - `import "std/hash.sb"` — FNV-1a 32/64, incremental IEEE CRC32 (`crc32`, `crc32_update`), and FIPS 180-4 SHA-256 (`Sha256`, `Sha256Digest`, `sha256`, `sha256_str`).
 - `import "std/json.sb"` — RFC 8259 arena-backed JSON parser, DOM builder, and compact/pretty serializer (`JsonDoc`, `json_parse`, `stringify`, `stringify_pretty`, `JsonError`).
@@ -1120,7 +1121,16 @@ fn main() {
 
 ## 17. Complete Example Programs
 
-See [demo.sb](../examples/demo.sb) for a runnable tour of Antimony language features, and [sbwc.sb](../examples/sbwc.sb) for a complete real-world CLI word/line/byte counter and substring search utility built using `std/mem`, `std/str`, `std/io`, `std/os`, and `std/time`:
+See [demo.sb](../examples/demo.sb) for a runnable tour of Antimony language features, [sbwc.sb](../examples/sbwc.sb) for a CLI word/line/byte counter and substring search utility, and [sbhttpd.sb](../examples/sbhttpd.sb) for a multithreaded HTTP/1.1 static-file and JSON API server built with `std/http`, `std/net`, `std/thread`, `std/fs`, and `std/json`:
+
+```powershell
+# Run sbhttpd's built-in loopback self-test (6 HTTP/1.1 requests)
+.\sbc.exe run examples\sbhttpd.sb
+
+# Start a live local HTTP server on http://127.0.0.1:8080
+.\sbc.exe build examples\sbhttpd.sb --llvm -o sbhttpd.exe
+.\sbhttpd.exe --serve --port 8080 --root .
+```
 
 ```powershell
 # Self-test mode (scans benchmarks/README.md and benchmarks/bench.sb for "fn")

@@ -1,0 +1,737 @@
+// =============================================================================
+// Antimony Standard Library: std/http.sb
+// Zero-dependency HTTP/1.1 client and server built on `std/net.sb`:
+// URL parsing, RFC 9110 header lookup, status codes, MIME types,
+// `HttpRequest` / `HttpResponse`, and `http_get` / `http_post` / `http_request`.
+// =============================================================================
+
+import "std/core.sb"
+import "std/str.sb"
+import "std/vec.sb"
+import "std/net.sb"
+
+const HTTP_MAX_HEADER_BYTES: i64 = 65536
+const HTTP_MAX_BODY_BYTES: i64   = 16777216
+const HTTP_DEFAULT_TIMEOUT_MS: u32 = 10000
+
+// -----------------------------------------------------------------------------
+// Errors, Headers, Status Text, MIME Types, and URL Parsing
+// -----------------------------------------------------------------------------
+
+pub enum HttpError {
+    Net(NetError)
+    MalformedRequest
+    MalformedResponse
+    InvalidUrl
+    HeaderTooLarge
+    BodyTooLarge
+    UnexpectedEof
+}
+
+pub fn (e: HttpError) message(): str {
+    match e {
+        .Net(ne)           { return ne.message() }
+        .MalformedRequest  { return "malformed HTTP request" }
+        .MalformedResponse { return "malformed HTTP response" }
+        .InvalidUrl        { return "invalid HTTP URL" }
+        .HeaderTooLarge    { return "HTTP headers exceed limit" }
+        .BodyTooLarge      { return "HTTP body exceeds limit" }
+        .UnexpectedEof     { return "unexpected end of HTTP stream" }
+    }
+}
+
+pub struct HttpHeader {
+    name: str
+    value: str
+}
+
+pub fn http_status_text(code: i32): str {
+    match code {
+        200 { return "OK" }
+        201 { return "Created" }
+        204 { return "No Content" }
+        301 { return "Moved Permanently" }
+        302 { return "Found" }
+        304 { return "Not Modified" }
+        400 { return "Bad Request" }
+        401 { return "Unauthorized" }
+        403 { return "Forbidden" }
+        404 { return "Not Found" }
+        405 { return "Method Not Allowed" }
+        413 { return "Payload Too Large" }
+        500 { return "Internal Server Error" }
+        502 { return "Bad Gateway" }
+        503 { return "Service Unavailable" }
+        else { return "Unknown" }
+    }
+}
+
+pub fn http_mime_type(ext: str): str {
+    if str_eq_ignore_ascii_case(ext, ".html") || str_eq_ignore_ascii_case(ext, ".htm") {
+        return "text/html; charset=utf-8"
+    }
+    if str_eq_ignore_ascii_case(ext, ".css") { return "text/css; charset=utf-8" }
+    if str_eq_ignore_ascii_case(ext, ".js")  { return "application/javascript; charset=utf-8" }
+    if str_eq_ignore_ascii_case(ext, ".json") { return "application/json; charset=utf-8" }
+    if str_eq_ignore_ascii_case(ext, ".txt") || str_eq_ignore_ascii_case(ext, ".sb") ||
+       str_eq_ignore_ascii_case(ext, ".md") || str_eq_ignore_ascii_case(ext, ".c") ||
+       str_eq_ignore_ascii_case(ext, ".h") {
+        return "text/plain; charset=utf-8"
+    }
+    if str_eq_ignore_ascii_case(ext, ".svg")  { return "image/svg+xml" }
+    if str_eq_ignore_ascii_case(ext, ".png")  { return "image/png" }
+    if str_eq_ignore_ascii_case(ext, ".jpg") || str_eq_ignore_ascii_case(ext, ".jpeg") {
+        return "image/jpeg"
+    }
+    if str_eq_ignore_ascii_case(ext, ".ico")  { return "image/x-icon" }
+    if str_eq_ignore_ascii_case(ext, ".wasm") { return "application/wasm" }
+    return "application/octet-stream"
+}
+
+pub struct HttpUrl {
+    host: str
+    port: u16
+    path: str
+}
+
+// Parses an `http://host[:port][/path[?query]]` URL.
+pub fn http_parse_url(url: str): Result[HttpUrl, HttpError] {
+    if !str_starts_with(url, "http://") {
+        return .Err(.InvalidUrl)
+    }
+    var rest = url[7..len(url)]
+    if len(rest) == 0 {
+        return .Err(.InvalidUrl)
+    }
+    var slash = str_find_byte(rest, '/')
+    var authority = rest
+    var path = "/"
+    if slash >= 0 {
+        authority = rest[0..slash]
+        path = rest[slash..len(rest)]
+    }
+    if len(authority) == 0 {
+        return .Err(.InvalidUrl)
+    }
+    var host = authority
+    var port: u16 = 80
+    var colon = str_rfind_byte(authority, ':')
+    if colon >= 0 {
+        host = authority[0..colon]
+        var pstr = authority[colon + 1..len(authority)]
+        if len(host) == 0 || len(pstr) == 0 {
+            return .Err(.InvalidUrl)
+        }
+        match try_parse_u64(pstr) {
+            .Ok(pv) {
+                if pv == 0 || pv > 65535 {
+                    return .Err(.InvalidUrl)
+                }
+                port = u16(pv)
+            }
+            .Err(_) {
+                return .Err(.InvalidUrl)
+            }
+        }
+    }
+    return .Ok(HttpUrl { host: host, port: port, path: path })
+}
+
+priv fn find_header_value(headers: *const Vec[HttpHeader], name: str): Option[str] {
+    loop i in 0..headers.len {
+        var h = headers.get(i)
+        if str_eq_ignore_ascii_case(h.name, name) {
+            return .Some(h.value)
+        }
+    }
+    return .None
+}
+
+// Reads from `stream` into `raw` until `\r\n\r\n` is found.
+// Returns the byte offset of `\r\n\r\n`, or `-1` on clean EOF before any bytes.
+priv fn read_until_header_end(stream: *TcpStream, raw: *StringBuilder): Result[i64, HttpError] {
+    var chunk[4096]: u8
+    loop {
+        var cur = raw.as_str()
+        var idx = str_find(cur, "\r\n\r\n")
+        if idx >= 0 {
+            return .Ok(idx)
+        }
+        if i64(raw.len) > HTTP_MAX_HEADER_BYTES {
+            return .Err(.HeaderTooLarge)
+        }
+        match stream.read(chunk) {
+            .Ok(n) {
+                if n == 0 {
+                    if raw.len == 0 {
+                        return .Ok(-1)
+                    }
+                    return .Err(.UnexpectedEof)
+                }
+                raw.append_bytes(chunk[0..n])
+            }
+            .Err(ne) {
+                return .Err(.Net(ne))
+            }
+        }
+    }
+}
+
+// Extracts `Content-Length` from raw header text before final slicing so we can read the full body
+// before creating any `str` slices into `raw` (preventing dangling slices on buffer reallocation).
+priv fn scan_content_length(header_block: str): Result[i64, HttpError] {
+    var cur = header_block
+    // Skip first line (request/status line).
+    var nl = str_find(cur, "\r\n")
+    if nl < 0 {
+        return .Ok(-1)
+    }
+    cur = cur[nl + 2..len(cur)]
+    loop len(cur) > 0 {
+        var end = str_find(cur, "\r\n")
+        var line = cur
+        if end >= 0 {
+            line = cur[0..end]
+            cur = cur[end + 2..len(cur)]
+        } else {
+            cur = ""
+        }
+        var colon = str_find_byte(line, ':')
+        if colon > 0 {
+            var name = str_trim(line[0..colon])
+            if str_eq_ignore_ascii_case(name, "Content-Length") {
+                var val_str = str_trim(line[colon + 1..len(line)])
+                match try_parse_i64(val_str) {
+                    .Ok(cl) {
+                        if cl < 0 {
+                            return .Err(.MalformedRequest)
+                        }
+                        if cl > HTTP_MAX_BODY_BYTES {
+                            return .Err(.BodyTooLarge)
+                        }
+                        return .Ok(cl)
+                    }
+                    .Err(_) {
+                        return .Err(.MalformedRequest)
+                    }
+                }
+            }
+        }
+    }
+    return .Ok(-1)
+}
+
+priv fn scan_is_chunked(header_block: str): bool {
+    var cur = header_block
+    var nl = str_find(cur, "\r\n")
+    if nl < 0 {
+        return false
+    }
+    cur = cur[nl + 2..len(cur)]
+    loop len(cur) > 0 {
+        var end = str_find(cur, "\r\n")
+        var line = cur
+        if end >= 0 {
+            line = cur[0..end]
+            cur = cur[end + 2..len(cur)]
+        } else {
+            cur = ""
+        }
+        var colon = str_find_byte(line, ':')
+        if colon > 0 {
+            var name = str_trim(line[0..colon])
+            if str_eq_ignore_ascii_case(name, "Transfer-Encoding") {
+                var val_str = str_trim(line[colon + 1..len(line)])
+                if str_contains(val_str, "chunked") || str_contains(val_str, "Chunked") {
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+priv fn parse_headers_into(header_lines: str, out: *Vec[HttpHeader]) {
+    out.clear()
+    var cur = header_lines
+    loop len(cur) > 0 {
+        var end = str_find(cur, "\r\n")
+        var line = cur
+        if end >= 0 {
+            line = cur[0..end]
+            cur = cur[end + 2..len(cur)]
+        } else {
+            cur = ""
+        }
+        var colon = str_find_byte(line, ':')
+        if colon > 0 {
+            out.push(HttpHeader {
+                name: str_trim(line[0..colon]),
+                value: str_trim(line[colon + 1..len(line)])
+            })
+        }
+    }
+}
+
+priv fn read_exact_more(stream: *TcpStream, raw: *StringBuilder, target_total: i64): Result[bool, HttpError] {
+    if i64(raw.len) >= target_total {
+        return .Ok(true)
+    }
+    raw.ensure(usize(target_total - i64(raw.len)))
+    var chunk[4096]: u8
+    loop i64(raw.len) < target_total {
+        var remain = target_total - i64(raw.len)
+        var want: i64 = 4096
+        if remain < want {
+            want = remain
+        }
+        match stream.read(chunk[0..want]) {
+            .Ok(n) {
+                if n == 0 {
+                    return .Err(.UnexpectedEof)
+                }
+                raw.append_bytes(chunk[0..n])
+            }
+            .Err(ne) {
+                return .Err(.Net(ne))
+            }
+        }
+    }
+    return .Ok(true)
+}
+
+priv fn read_until_eof(stream: *TcpStream, raw: *StringBuilder): Result[bool, HttpError] {
+    var chunk[4096]: u8
+    loop {
+        if i64(raw.len) > HTTP_MAX_HEADER_BYTES + HTTP_MAX_BODY_BYTES {
+            return .Err(.BodyTooLarge)
+        }
+        match stream.read(chunk) {
+            .Ok(n) {
+                if n == 0 {
+                    return .Ok(true)
+                }
+                raw.append_bytes(chunk[0..n])
+            }
+            .Err(ne) {
+                return .Err(.Net(ne))
+            }
+        }
+    }
+}
+
+priv fn parse_hex_size(s: str): Result[i64, HttpError] {
+    var t = str_trim(s)
+    // Strip optional chunk extensions `;...`
+    var semi = str_find_byte(t, ';')
+    if semi >= 0 {
+        t = str_trim(t[0..semi])
+    }
+    if len(t) == 0 {
+        return .Err(.MalformedResponse)
+    }
+    var acc: i64 = 0
+    loop i in 0..len(t) {
+        var c = t[i]
+        var d: i64 = -1
+        if c >= '0' && c <= '9' {
+            d = i64(c - '0')
+        } else if c >= 'a' && c <= 'f' {
+            d = i64(c - 'a') + 10
+        } else if c >= 'A' && c <= 'F' {
+            d = i64(c - 'A') + 10
+        }
+        if d < 0 {
+            return .Err(.MalformedResponse)
+        }
+        acc = (acc << 4) | d
+        if acc > HTTP_MAX_BODY_BYTES {
+            return .Err(.BodyTooLarge)
+        }
+    }
+    return .Ok(acc)
+}
+
+// Decodes an RFC 9112 chunked transfer body into `out`.
+pub fn http_decode_chunked(encoded: str, out: *StringBuilder): Result[i64, HttpError] {
+    var start_len = i64(out.len)
+    var cur = encoded
+    loop {
+        var crlf = str_find(cur, "\r\n")
+        if crlf < 0 {
+            return .Err(.MalformedResponse)
+        }
+        var sz = parse_hex_size(cur[0..crlf])?
+        cur = cur[crlf + 2..len(cur)]
+        if sz == 0 {
+            return .Ok(i64(out.len) - start_len)
+        }
+        if len(cur) < sz + 2 {
+            return .Err(.UnexpectedEof)
+        }
+        out.append(cur[0..sz])
+        if cur[sz] != '\r' || cur[sz + 1] != '\n' {
+            return .Err(.MalformedResponse)
+        }
+        cur = cur[sz + 2..len(cur)]
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Server-Side `HttpRequest` & `HttpResponse`
+// -----------------------------------------------------------------------------
+
+pub struct HttpRequest {
+    raw: StringBuilder
+    method: str
+    target: str
+    path: str
+    query: str
+    version: str
+    headers: Vec[HttpHeader]
+    body: str
+}
+
+pub fn (req: *HttpRequest) init() {
+    req.raw.init(1024)
+    req.headers.init(16)
+    req.method = ""
+    req.target = ""
+    req.path = ""
+    req.query = ""
+    req.version = ""
+    req.body = ""
+}
+
+pub fn (req: *HttpRequest) clear() {
+    req.raw.clear()
+    req.headers.clear()
+    req.method = ""
+    req.target = ""
+    req.path = ""
+    req.query = ""
+    req.version = ""
+    req.body = ""
+}
+
+pub fn (req: *HttpRequest) free() {
+    req.raw.free()
+    req.headers.free()
+}
+
+pub fn (req: *const HttpRequest) header(name: str): Option[str] {
+    return find_header_value(&req.headers, name)
+}
+
+// Reads and parses a single HTTP/1.1 request from `stream` into `out`.
+// Returns `.Ok(true)` on a parsed request, or `.Ok(false)` on clean EOF before any bytes.
+pub fn http_read_request(stream: *TcpStream, out: *HttpRequest): Result[bool, HttpError] {
+    out.clear()
+    var hdr_end = read_until_header_end(stream, &out.raw)?
+    if hdr_end < 0 {
+        return .Ok(false)
+    }
+
+    var body_start = hdr_end + 4
+    var cl = scan_content_length(out.raw.as_str()[0..hdr_end])?
+    if cl > 0 {
+        read_exact_more(stream, &out.raw, body_start + cl)?
+    }
+
+    // All bytes are now resident in `out.raw` (no further reallocations), so slicing is safe.
+    var full = out.raw.as_str()
+    var hdr_block = full[0..hdr_end]
+    var first_nl = str_find(hdr_block, "\r\n")
+    var req_line = hdr_block
+    var hdr_rest = ""
+    if first_nl >= 0 {
+        req_line = hdr_block[0..first_nl]
+        hdr_rest = hdr_block[first_nl + 2..len(hdr_block)]
+    }
+
+    var sp1 = str_find_byte(req_line, ' ')
+    if sp1 <= 0 {
+        return .Err(.MalformedRequest)
+    }
+    var after1 = req_line[sp1 + 1..len(req_line)]
+    var sp2 = str_find_byte(after1, ' ')
+    if sp2 <= 0 {
+        return .Err(.MalformedRequest)
+    }
+    out.method  = req_line[0..sp1]
+    out.target  = after1[0..sp2]
+    out.version = after1[sp2 + 1..len(after1)]
+
+    var qidx = str_find_byte(out.target, '?')
+    if qidx >= 0 {
+        out.path  = out.target[0..qidx]
+        out.query = out.target[qidx + 1..len(out.target)]
+    } else {
+        out.path  = out.target
+        out.query = ""
+    }
+
+    parse_headers_into(hdr_rest, &out.headers)
+
+    if cl > 0 {
+        out.body = full[body_start..body_start + cl]
+    } else {
+        out.body = ""
+    }
+    return .Ok(true)
+}
+
+pub struct HttpResponse {
+    status: i32
+    content_type: str
+    headers_buf: StringBuilder
+    body: StringBuilder
+}
+
+pub fn (res: *HttpResponse) init(status: i32) {
+    res.status = status
+    res.content_type = "text/plain; charset=utf-8"
+    res.headers_buf.init(128)
+    res.body.init(256)
+}
+
+pub fn (res: *HttpResponse) free() {
+    res.headers_buf.free()
+    res.body.free()
+}
+
+pub fn (res: *HttpResponse) set_status(code: i32) {
+    res.status = code
+}
+
+pub fn (res: *HttpResponse) set_content_type(ct: str) {
+    res.content_type = ct
+}
+
+pub fn (res: *HttpResponse) add_header(name: str, value: str) {
+    res.headers_buf.append(name)
+    res.headers_buf.append(": ")
+    res.headers_buf.append(value)
+    res.headers_buf.append("\r\n")
+}
+
+pub fn (res: *HttpResponse) set_text(text: str) {
+    res.content_type = "text/plain; charset=utf-8"
+    res.body.clear()
+    res.body.append(text)
+}
+
+pub fn (res: *HttpResponse) set_json(json_str: str) {
+    res.content_type = "application/json; charset=utf-8"
+    res.body.clear()
+    res.body.append(json_str)
+}
+
+pub fn (res: *HttpResponse) set_bytes(data[]: const u8, content_type: str) {
+    res.content_type = content_type
+    res.body.clear()
+    res.body.append_bytes(data)
+}
+
+// Serializes and writes an HTTP/1.1 response to `stream`.
+pub fn http_write_response(stream: *TcpStream, res: *const HttpResponse): Result[i64, HttpError] {
+    var head: StringBuilder
+    head.init(256)
+    defer head.free()
+
+    head.append("HTTP/1.1 ")
+    head.append_i64(i64(res.status))
+    head.append_byte(' ')
+    head.append(http_status_text(res.status))
+    head.append("\r\nContent-Type: ")
+    head.append(res.content_type)
+    head.append("\r\nContent-Length: ")
+    head.append_u64(u64(res.body.len))
+    head.append("\r\nConnection: close\r\n")
+    if res.headers_buf.len > 0 {
+        head.append(res.headers_buf.as_str())
+    }
+    head.append("\r\n")
+
+    var sent1: i64 = 0
+    match stream.write_all(head.as_bytes()) {
+        .Ok(n)   { sent1 = n }
+        .Err(ne) { return .Err(.Net(ne)) }
+    }
+    var sent2: i64 = 0
+    if res.body.len > 0 {
+        match stream.write_all(res.body.as_bytes()) {
+            .Ok(n)   { sent2 = n }
+            .Err(ne) { return .Err(.Net(ne)) }
+        }
+    }
+    return .Ok(sent1 + sent2)
+}
+
+// -----------------------------------------------------------------------------
+// Client-Side `HttpClientResponse`, `http_request`, `http_get`, `http_post`
+// -----------------------------------------------------------------------------
+
+pub struct HttpClientResponse {
+    raw: StringBuilder
+    decoded_body: StringBuilder
+    status: i32
+    reason: str
+    headers: Vec[HttpHeader]
+    body: str
+}
+
+pub fn (r: *HttpClientResponse) init() {
+    r.raw.init(1024)
+    r.decoded_body.init(64)
+    r.headers.init(16)
+    r.status = 0
+    r.reason = ""
+    r.body = ""
+}
+
+pub fn (r: *HttpClientResponse) clear() {
+    r.raw.clear()
+    r.decoded_body.clear()
+    r.headers.clear()
+    r.status = 0
+    r.reason = ""
+    r.body = ""
+}
+
+pub fn (r: *HttpClientResponse) free() {
+    r.raw.free()
+    r.decoded_body.free()
+    r.headers.free()
+}
+
+pub fn (r: *const HttpClientResponse) header(name: str): Option[str] {
+    return find_header_value(&r.headers, name)
+}
+
+// Performs an HTTP/1.1 request to `url`, populating `out` and returning the HTTP status code.
+pub fn http_request(method: str, url: str, content_type: str, body: str, out: *HttpClientResponse): Result[i32, HttpError] {
+    out.clear()
+    var parsed = http_parse_url(url)?
+
+    var stream: TcpStream
+    match tcp_connect_host(parsed.host, parsed.port) {
+        .Ok(s)   { stream = s }
+        .Err(ne) { return .Err(.Net(ne)) }
+    }
+    defer stream.close()
+    match stream.set_read_timeout(HTTP_DEFAULT_TIMEOUT_MS) {
+        .Ok(_)   { }
+        .Err(ne) { return .Err(.Net(ne)) }
+    }
+    match stream.set_write_timeout(HTTP_DEFAULT_TIMEOUT_MS) {
+        .Ok(_)   { }
+        .Err(ne) { return .Err(.Net(ne)) }
+    }
+
+    var req_buf: StringBuilder
+    req_buf.init(256 + usize(len(body)))
+    defer req_buf.free()
+
+    req_buf.append(method)
+    req_buf.append_byte(' ')
+    req_buf.append(parsed.path)
+    req_buf.append(" HTTP/1.1\r\nHost: ")
+    req_buf.append(parsed.host)
+    if parsed.port != 80 {
+        req_buf.append_byte(':')
+        req_buf.append_u64(u64(parsed.port))
+    }
+    req_buf.append("\r\nUser-Agent: antimony-http/1.0\r\nConnection: close\r\n")
+    if len(body) > 0 || len(content_type) > 0 {
+        if len(content_type) > 0 {
+            req_buf.append("Content-Type: ")
+            req_buf.append(content_type)
+            req_buf.append("\r\n")
+        }
+        req_buf.append("Content-Length: ")
+        req_buf.append_i64(len(body))
+        req_buf.append("\r\n")
+    }
+    req_buf.append("\r\n")
+    if len(body) > 0 {
+        req_buf.append(body)
+    }
+
+    match stream.write_all(req_buf.as_bytes()) {
+        .Ok(_)   { }
+        .Err(ne) { return .Err(.Net(ne)) }
+    }
+
+    var hdr_end = read_until_header_end(&stream, &out.raw)?
+    if hdr_end < 0 {
+        return .Err(.UnexpectedEof)
+    }
+
+    var body_start = hdr_end + 4
+    var is_chunked = scan_is_chunked(out.raw.as_str()[0..hdr_end])
+    var cl = scan_content_length(out.raw.as_str()[0..hdr_end])?
+    if !is_chunked && cl >= 0 {
+        if cl > 0 {
+            read_exact_more(&stream, &out.raw, body_start + cl)?
+        }
+    } else {
+        read_until_eof(&stream, &out.raw)?
+    }
+
+    var full = out.raw.as_str()
+    var hdr_block = full[0..hdr_end]
+    var first_nl = str_find(hdr_block, "\r\n")
+    var status_line = hdr_block
+    var hdr_rest = ""
+    if first_nl >= 0 {
+        status_line = hdr_block[0..first_nl]
+        hdr_rest = hdr_block[first_nl + 2..len(hdr_block)]
+    }
+
+    // Parse `HTTP/1.1 200 OK`
+    var sp1 = str_find_byte(status_line, ' ')
+    if sp1 <= 0 {
+        return .Err(.MalformedResponse)
+    }
+    var after1 = status_line[sp1 + 1..len(status_line)]
+    var sp2 = str_find_byte(after1, ' ')
+    var code_str = after1
+    var reason = ""
+    if sp2 >= 0 {
+        code_str = after1[0..sp2]
+        reason = after1[sp2 + 1..len(after1)]
+    }
+    match try_parse_i64(code_str) {
+        .Ok(code) {
+            if code < 100 || code > 599 {
+                return .Err(.MalformedResponse)
+            }
+            out.status = i32(code)
+            out.reason = reason
+        }
+        .Err(_) {
+            return .Err(.MalformedResponse)
+        }
+    }
+
+    parse_headers_into(hdr_rest, &out.headers)
+
+    if is_chunked {
+        http_decode_chunked(full[body_start..len(full)], &out.decoded_body)?
+        out.body = out.decoded_body.as_str()
+    } else if cl >= 0 {
+        out.body = full[body_start..body_start + cl]
+    } else {
+        out.body = full[body_start..len(full)]
+    }
+    return .Ok(out.status)
+}
+
+pub fn http_get(url: str, out: *HttpClientResponse): Result[i32, HttpError] {
+    return http_request("GET", url, "", "", out)
+}
+
+pub fn http_post(url: str, content_type: str, body: str, out: *HttpClientResponse): Result[i32, HttpError] {
+    return http_request("POST", url, content_type, body, out)
+}

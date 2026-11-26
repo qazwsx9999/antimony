@@ -132,6 +132,7 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/rand.sb` | Deterministic PRNG (`Rng`, xoshiro256++), `rng_shuffle`, OS CSPRNG (`os_random_bytes` via `bcrypt.dll`) |
 | `std/process.sb` | Child process spawning, `wait`/`try_wait`/`kill`, stdout/stderr pipe capture (`process_capture`), `current_pid` |
 | `std/net.sb` | Winsock2 IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `NetError`) |
+| `std/http.sb` | HTTP/1.1 client & server (`http_get`, `http_post`, `http_request`, `HttpRequest`, `HttpResponse`, `http_parse_url`, `http_decode_chunked`, `http_mime_type`) |
 | `std/encoding.sb` | RFC 4648 Hexadecimal and Base64 (standard & URL-safe) encoding and decoding |
 | `std/hash.sb` | FNV-1a 32/64, IEEE CRC32, and FIPS 180-4 SHA-256 (streaming & one-shot) |
 | `std/json.sb` | RFC 8259 arena-backed JSON parser, DOM builder, and compact/pretty serializer (`JsonDoc`) |
@@ -141,7 +142,7 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 
 - [Tutorial](docs/tutorial.md) — a guided tour of the language and standard library.
 - [Language specification](docs/spec.md) — the normative definition of the language, including the grammar and decision log.
-- [Examples](examples/) — [`demo.sb`](examples/demo.sb), a feature tour, and [`sbwc.sb`](examples/sbwc.sb), a word-count and search CLI tool.
+- [Examples](examples/) — [`demo.sb`](examples/demo.sb) (feature tour), [`sbwc.sb`](examples/sbwc.sb) (word-count & search CLI), and [`sbhttpd.sb`](examples/sbhttpd.sb) (multithreaded HTTP/1.1 static-file & JSON API server).
 
 ## Testing
 

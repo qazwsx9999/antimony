@@ -3330,6 +3330,144 @@ fn main() {
 Test-RunOk   "phase27_nested_generic_infer"      $phase27_nested_gen "4200000000 77 99 nested 12345678901 2 500"
 Test-RunLlvm "phase27_nested_generic_infer_llvm" $phase27_nested_gen "4200000000 77 99 nested 12345678901 2 500"
 
+# 37. Phase 28: std/http.sb (HTTP/1.1 Client & Server) and examples/sbhttpd.sb
+$phase28_http_code = @'
+import "std/core.sb"
+import "std/str.sb"
+import "std/net.sb"
+import "std/thread.sb"
+import "std/http.sb"
+
+struct MiniHttpSrv {
+    listener: TcpListener
+}
+
+fn mini_http_worker(raw: *u8): u32 {
+    var srv = ptr_cast(*MiniHttpSrv, raw)
+    loop i in 0..2 {
+        match srv.listener.accept() {
+            .Ok(conn) {
+                var s = conn
+                defer s.close()
+                var req: HttpRequest
+                req.init()
+                defer req.free()
+                match http_read_request(&s, &req) {
+                    .Ok(got) {
+                        if !got { continue }
+                        var res: HttpResponse
+                        res.init(200)
+                        defer res.free()
+                        if req.method == "GET" && req.path == "/ping" {
+                            res.add_header("X-Query", req.query)
+                            res.set_text("pong")
+                        } else if req.method == "POST" && req.path == "/upper" {
+                            var ub: StringBuilder
+                            ub.init(32)
+                            defer ub.free()
+                            ub.append_upper(req.body)
+                            res.set_text(ub.as_str())
+                        } else {
+                            res.set_status(404)
+                            res.set_text("nope")
+                        }
+                        http_write_response(&s, &res)
+                    }
+                    .Err(_) { }
+                }
+            }
+            .Err(_) { break }
+        }
+    }
+    return 0
+}
+
+fn main() {
+    // 1. URL parsing & MIME types & chunked decoding
+    var u1 = http_parse_url("http://example.com:8080/a/b?k=1").unwrap_or(HttpUrl {})
+    var u2 = http_parse_url("http://localhost").unwrap_or(HttpUrl {})
+    var bad_u = http_parse_url("ftp://example.com").is_err()
+    var dec: StringBuilder
+    dec.init(32)
+    defer dec.free()
+    var cn = http_decode_chunked("5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n", &dec).unwrap_or(-1)
+    print("url={} {} {} {} {} {} {} {}",
+          u1.host, u1.port, u1.path, u2.port, u2.path, bad_u,
+          http_mime_type(".json") == "application/json; charset=utf-8",
+          cn == 11 && dec.as_str() == "Hello World")
+
+    // 2. Live loopback HTTP/1.1 GET (with query + custom header) and POST
+    var listener = tcp_bind(socket_addr(ipv4_localhost(), 0)).unwrap_or(TcpListener {})
+    var port = listener.local_addr().unwrap_or(socket_addr(ipv4_localhost(), 0)).port
+    var srv = MiniHttpSrv { listener: listener }
+    var th = spawn(mini_http_worker, ptr_cast(*u8, &srv))
+
+    var ub: StringBuilder
+    ub.init(64)
+    defer ub.free()
+    var resp: HttpClientResponse
+    resp.init()
+    defer resp.free()
+
+    ub.append("http://127.0.0.1:")
+    ub.append_u64(u64(port))
+    ub.append("/ping?x=42")
+    var s1 = http_get(ub.as_str(), &resp).unwrap_or(-1)
+    var qh = resp.header("x-query").unwrap_or("")
+    var b1_ok = resp.body == "pong" && qh == "x=42"
+
+    ub.clear()
+    ub.append("http://127.0.0.1:")
+    ub.append_u64(u64(port))
+    ub.append("/upper")
+    var s2 = http_post(ub.as_str(), "text/plain", "antimony", &resp).unwrap_or(-1)
+    var b2_ok = resp.body == "ANTIMONY"
+
+    th.join()
+    srv.listener.close()
+    print("http={} {} {} {}", s1, b1_ok, s2, b2_ok)
+}
+'@
+$phase28_http_expected = @(
+    "url=example.com 8080 /a/b?k=1 80 / true true true"
+    "http=200 true 200 true"
+) -join "`n"
+Test-RunOk   "phase28_http_client_server"      $phase28_http_code $phase28_http_expected
+Test-RunLlvm "phase28_http_client_server_llvm" $phase28_http_code $phase28_http_expected
+
+Test-CompileError "phase28_http_priv_hidden" "import `"std/http.sb`"`nfn main() { print(HTTP_MAX_HEADER_BYTES) }" "cannot access private"
+
+# End-to-end test for flagship examples/sbhttpd.sb (native x64 and --llvm)
+$sbhttpdSrc    = Join-Path $root "examples\sbhttpd.sb"
+$sbhttpdNative = Join-Path $tmp "sbhttpd_native.exe"
+$sbhttpdLlvm   = Join-Path $tmp "sbhttpd_llvm.exe"
+if (Should-RunTest "phase28_sbhttpd_native") {
+    $comp = (& $sbc $sbhttpdSrc -o $sbhttpdNative 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase28_sbhttpd_native]: compile failed:`n$comp" }
+    Push-Location $root
+    try {
+        $out = ((& $sbhttpdNative --selftest) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0 -or $out -notmatch '^sbhttpd selftest passed: requests=6 statuses=200,200,400,200,403,404 elapsed_us=\d+$') {
+            throw "FAIL [phase28_sbhttpd_native]: unexpected output: $out"
+        }
+    } finally { Pop-Location }
+    $script:PassedCount++
+    Write-Host "PASS [e2e]           phase28_sbhttpd_native"
+}
+if (Should-RunTest "phase28_sbhttpd_llvm" $true) {
+    $comp = (& $sbc $sbhttpdSrc --llvm -o $sbhttpdLlvm 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "FAIL [phase28_sbhttpd_llvm]: compile failed:`n$comp" }
+    Push-Location $root
+    try {
+        $out = ((& $sbhttpdLlvm --selftest) -join "`n").Trim()
+        if ($LASTEXITCODE -ne 0 -or $out -notmatch '^sbhttpd selftest passed: requests=6 statuses=200,200,400,200,403,404 elapsed_us=\d+$') {
+            throw "FAIL [phase28_sbhttpd_llvm]: unexpected output: $out"
+        }
+    } finally { Pop-Location }
+    $script:PassedCount++
+    Write-Host "PASS [e2e]           phase28_sbhttpd_llvm"
+}
+
 if ($script:SkippedCount -gt 0) {
     Write-Host "`nAll $($script:PassedCount) selected tests passed ($($script:SkippedCount) skipped)."
 } else {

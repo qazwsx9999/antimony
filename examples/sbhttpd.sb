@@ -1,0 +1,379 @@
+// =============================================================================
+// examples/sbhttpd.sb - Multithreaded HTTP/1.1 Static File & JSON API Server
+//
+// Usage:
+//   sbhttpd                              # runs built-in loopback self-test
+//   sbhttpd --selftest                   # runs built-in loopback self-test
+//   sbhttpd --serve [--port 8080] [--root .]
+//
+// Routes:
+//   GET  /health         -> JSON server health & atomic request counter
+//   POST /api/echo       -> validates & echoes JSON payload via std/json.sb
+//   GET  /files/<path>   -> serves static files with MIME detection & traversal guard
+// =============================================================================
+
+import "std/core.sb"
+import "std/mem.sb"
+import "std/str.sb"
+import "std/io.sb"
+import "std/fs.sb"
+import "std/path.sb"
+import "std/os.sb"
+import "std/time.sb"
+import "std/net.sb"
+import "std/thread.sb"
+import "std/json.sb"
+import "std/http.sb"
+
+struct ServerConfig {
+    root_dir: str
+    req_count: AtomicI64
+}
+
+struct ConnJob {
+    stream: TcpStream
+    cfg: *ServerConfig
+}
+
+fn is_safe_rel_path(rel: str): bool {
+    if len(rel) == 0 {
+        return false
+    }
+    if rel[0] == '/' || rel[0] == '\\' {
+        return false
+    }
+    if str_contains(rel, "..") || str_find_byte(rel, ':') >= 0 {
+        return false
+    }
+    return true
+}
+
+fn handle_health(cfg: *ServerConfig, res: *HttpResponse) {
+    var count = cfg.req_count.load()
+    var doc: JsonDoc
+    doc.init()
+    defer doc.free()
+
+    var obj = doc.new_object()
+    doc.object_set(obj, "status", doc.new_str("ok"))
+    doc.object_set(obj, "server", doc.new_str("sbhttpd"))
+    doc.object_set(obj, "requests", doc.new_i64(count))
+
+    var out: StringBuilder
+    out.init(128)
+    defer out.free()
+    doc.stringify(obj, &out)
+
+    res.set_status(200)
+    res.add_header("X-Powered-By", "Antimony")
+    res.set_json(out.as_str())
+}
+
+fn handle_echo(req: *const HttpRequest, res: *HttpResponse) {
+    var in_doc: JsonDoc
+    in_doc.init()
+    defer in_doc.free()
+
+    var parsed_root: i64 = -1
+    match json_parse(req.body, &in_doc) {
+        .Ok(r) {
+            parsed_root = r
+        }
+        .Err(_) {
+            res.set_status(400)
+            res.set_json(`{"ok":false,"error":"invalid json"}`)
+            return
+        }
+    }
+
+    var echoed: StringBuilder
+    echoed.init(128)
+    defer echoed.free()
+    in_doc.stringify(parsed_root, &echoed)
+
+    var resp_body: StringBuilder
+    resp_body.init(echoed.len + 32)
+    defer resp_body.free()
+    resp_body.append(`{"ok":true,"echo":`)
+    resp_body.append(echoed.as_str())
+    resp_body.append_byte('}')
+
+    res.set_status(200)
+    res.set_json(resp_body.as_str())
+}
+
+fn handle_static_file(cfg: *ServerConfig, rel: str, res: *HttpResponse) {
+    if !is_safe_rel_path(rel) {
+        res.set_status(403)
+        res.set_json(`{"error":"forbidden"}`)
+        return
+    }
+
+    var full_sb: StringBuilder
+    full_sb.init(128)
+    defer full_sb.free()
+    var full = path_join(cfg.root_dir, rel, &full_sb)
+
+    if !fs_is_file(full) {
+        res.set_status(404)
+        res.set_json(`{"error":"file not found"}`)
+        return
+    }
+
+    var content: StringBuilder
+    content.init(1024)
+    defer content.free()
+    match read_file_all(full, &content) {
+        .Ok(_) {
+            var mime = http_mime_type(path_extension(full))
+            res.set_status(200)
+            res.set_bytes(content.as_bytes(), mime)
+        }
+        .Err(_) {
+            res.set_status(500)
+            res.set_json(`{"error":"failed to read file"}`)
+        }
+    }
+}
+
+fn route_request(cfg: *ServerConfig, req: *const HttpRequest, res: *HttpResponse) {
+    cfg.req_count.fetch_add(1)
+    if req.method == "GET" && req.path == "/health" {
+        handle_health(cfg, res)
+        return
+    }
+    if req.method == "POST" && req.path == "/api/echo" {
+        handle_echo(req, res)
+        return
+    }
+    if req.method == "GET" && str_starts_with(req.path, "/files/") {
+        handle_static_file(cfg, req.path[7..len(req.path)], res)
+        return
+    }
+
+    var doc: JsonDoc
+    doc.init()
+    defer doc.free()
+    var obj = doc.new_object()
+    doc.object_set(obj, "error", doc.new_str("not found"))
+    doc.object_set(obj, "path", doc.new_str(req.path))
+    var out: StringBuilder
+    out.init(64)
+    defer out.free()
+    doc.stringify(obj, &out)
+    res.set_status(404)
+    res.set_json(out.as_str())
+}
+
+fn serve_one_connection(stream: *TcpStream, cfg: *ServerConfig) {
+    stream.set_read_timeout(5000)
+    stream.set_write_timeout(5000)
+
+    var req: HttpRequest
+    req.init()
+    defer req.free()
+
+    match http_read_request(stream, &req) {
+        .Ok(got) {
+            if !got {
+                return
+            }
+            var res: HttpResponse
+            res.init(200)
+            defer res.free()
+            route_request(cfg, &req, &res)
+            http_write_response(stream, &res)
+        }
+        .Err(_) {
+            var res: HttpResponse
+            res.init(400)
+            defer res.free()
+            res.set_json(`{"error":"bad request"}`)
+            http_write_response(stream, &res)
+        }
+    }
+}
+
+fn conn_worker(raw: *u8): u32 {
+    var job = ptr_cast(*ConnJob, raw)
+    var s = job.stream
+    var cfg = job.cfg
+    free_mem(raw)
+    defer s.close()
+    serve_one_connection(&s, cfg)
+    return 0
+}
+
+// -----------------------------------------------------------------------------
+// Self-Test Harness (loopback multithreaded HTTP/1.1 end-to-end verification)
+// -----------------------------------------------------------------------------
+
+struct SelfTestServer {
+    listener: TcpListener
+    cfg: ServerConfig
+    expected_conns: i32
+}
+
+fn selftest_server_loop(raw: *u8): u32 {
+    var st = ptr_cast(*SelfTestServer, raw)
+    loop i in 0..st.expected_conns {
+        match st.listener.accept() {
+            .Ok(conn) {
+                var job = ptr_cast(*ConnJob, alloc(sizeof(ConnJob)))
+                job.stream = conn
+                job.cfg = &st.cfg
+                var t = spawn(conn_worker, ptr_cast(*u8, job))
+                t.join()
+            }
+            .Err(_) {
+                break
+            }
+        }
+    }
+    return 0
+}
+
+fn make_url(port: u16, path: str, out: *StringBuilder): str {
+    out.clear()
+    out.append("http://127.0.0.1:")
+    out.append_u64(u64(port))
+    out.append(path)
+    return out.as_str()
+}
+
+fn run_selftest(): i32 {
+    var sw = stopwatch_start()
+    var listener: TcpListener
+    match tcp_bind(socket_addr(ipv4_localhost(), 0)) {
+        .Ok(l)  { listener = l }
+        .Err(_) {
+            eprint("sbhttpd selftest: failed to bind loopback socket")
+            return 1
+        }
+    }
+    var addr = listener.local_addr().unwrap_or(socket_addr(ipv4_localhost(), 0))
+    var port = addr.port
+
+    var st = SelfTestServer {
+        listener: listener,
+        cfg: ServerConfig { root_dir: "." },
+        expected_conns: 6
+    }
+    st.cfg.req_count.init(0)
+
+    var srv_th = spawn(selftest_server_loop, ptr_cast(*u8, &st))
+
+    var ub: StringBuilder
+    ub.init(128)
+    defer ub.free()
+
+    var resp: HttpClientResponse
+    resp.init()
+    defer resp.free()
+
+    // 1. GET /health
+    var c1 = http_get(make_url(port, "/health", &ub), &resp).unwrap_or(-1)
+    assert(c1 == 200, "health status")
+    assert(resp.header("x-powered-by").unwrap_or("") == "Antimony", "health header")
+    var jdoc: JsonDoc
+    jdoc.init()
+    defer jdoc.free()
+    var jr1 = json_parse(resp.body, &jdoc).unwrap_or(-1)
+    assert(jdoc.as_str(jdoc.get(jr1, "server").unwrap_or(-1)).unwrap_or("") == "sbhttpd", "health json")
+
+    // 2. POST /api/echo (valid JSON)
+    var c2 = http_post(make_url(port, "/api/echo", &ub), "application/json", `{"lang":"antimony","phase":28}`, &resp).unwrap_or(-1)
+    assert(c2 == 200, "echo status")
+    var jr2 = json_parse(resp.body, &jdoc).unwrap_or(-1)
+    assert(jdoc.as_bool(jdoc.get(jr2, "ok").unwrap_or(-1)).unwrap_or(false), "echo ok")
+    var echo_obj = jdoc.get(jr2, "echo").unwrap_or(-1)
+    assert(jdoc.as_i64(jdoc.get(echo_obj, "phase").unwrap_or(-1)).unwrap_or(0) == 28, "echo phase")
+
+    // 3. POST /api/echo (invalid JSON -> 400)
+    var c3 = http_post(make_url(port, "/api/echo", &ub), "application/json", `{broken`, &resp).unwrap_or(-1)
+    assert(c3 == 400, "invalid json status")
+
+    // 4. GET /files/README.md (static file)
+    var c4 = http_get(make_url(port, "/files/README.md", &ub), &resp).unwrap_or(-1)
+    assert(c4 == 200 && str_contains(resp.body, "Antimony"), "static README.md")
+
+    // 5. GET /files/../secret (traversal protection -> 403)
+    var c5 = http_get(make_url(port, "/files/../secret", &ub), &resp).unwrap_or(-1)
+    assert(c5 == 403, "traversal blocked")
+
+    // 6. GET /does-not-exist (-> 404)
+    var c6 = http_get(make_url(port, "/does-not-exist", &ub), &resp).unwrap_or(-1)
+    assert(c6 == 404, "not found status")
+
+    srv_th.join()
+    st.listener.close()
+
+    print("sbhttpd selftest passed: requests={} statuses={},{},{},{},{},{} elapsed_us={}",
+          st.cfg.req_count.load(), c1, c2, c3, c4, c5, c6, sw.elapsed_us())
+    return 0
+}
+
+fn run_live_server(port: u16, root_dir: str): i32 {
+    var listener: TcpListener
+    match tcp_bind(socket_addr(ipv4_localhost(), port)) {
+        .Ok(l) { listener = l }
+        .Err(e) {
+            eprint(e.message())
+            return 1
+        }
+    }
+    defer listener.close()
+
+    var cfg = ServerConfig { root_dir: root_dir }
+    cfg.req_count.init(0)
+
+    print("sbhttpd listening on http://127.0.0.1:{} (root='{}')", port, root_dir)
+    loop {
+        match listener.accept() {
+            .Ok(conn) {
+                var job = ptr_cast(*ConnJob, alloc(sizeof(ConnJob)))
+                job.stream = conn
+                job.cfg = &cfg
+                var th = spawn(conn_worker, ptr_cast(*u8, job))
+                th.detach()
+            }
+            .Err(_) {
+                break
+            }
+        }
+    }
+    return 0
+}
+
+fn main() {
+    var argc = arg_count()
+    var serve_mode = false
+    var port: u16 = 8080
+    var root_dir = "."
+
+    var i: i32 = 1
+    loop i < argc {
+        var a = arg_at(i)
+        if a == "--serve" {
+            serve_mode = true
+        } else if a == "--port" && i + 1 < argc {
+            i += 1
+            var pv = try_parse_u64(arg_at(i)).unwrap_or(8080)
+            if pv > 0 && pv <= 65535 {
+                port = u16(pv)
+            }
+        } else if a == "--root" && i + 1 < argc {
+            i += 1
+            root_dir = arg_at(i)
+        } else if a == "-h" || a == "--help" {
+            print("Usage: sbhttpd [--selftest | --serve [--port 8080] [--root .]]")
+            return
+        }
+        i += 1
+    }
+
+    if serve_mode {
+        exit(run_live_server(port, root_dir))
+    }
+    exit(run_selftest())
+}

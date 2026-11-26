@@ -25,5 +25,6 @@ jobs:
       - name: Run example programs
         shell: pwsh
         run: |
-          .\sbc.exe examples\demo.sb --run
-          .\sbc.exe examples\sbwc.sb --run
+          .\sbc.exe run examples\demo.sb
+          .\sbc.exe run examples\sbwc.sb
+          .\sbc.exe run examples\sbhttpd.sb
