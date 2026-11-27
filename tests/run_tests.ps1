@@ -3589,7 +3589,7 @@ if (Should-RunTest "phase31_linux_target_ir") {
     # Verify cross-platform tests/linux_test.sb runs cleanly via `sbc test` on Windows too
     $linuxUnit = Join-Path $root "tests\linux_test.sb"
     $tout = (& $sbc test $linuxUnit 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 6 passed; 0 failed') {
+    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 7 passed; 0 failed') {
         throw "FAIL [phase31_linux_target_ir]: tests/linux_test.sb failed:`n$tout"
     }
 
@@ -3697,13 +3697,126 @@ fn main() {
     if (!$Quick -and $clangExe) {
         $linuxUnit = Join-Path $root "tests\linux_test.sb"
         $lout = (& $sbc test $linuxUnit --llvm 2>&1) -join "`n"
-        if ($LASTEXITCODE -ne 0 -or $lout -notmatch 'test result: ok\. 6 passed; 0 failed') {
+        if ($LASTEXITCODE -ne 0 -or $lout -notmatch 'test result: ok\. 7 passed; 0 failed') {
             throw "FAIL [phase32_linux_stdlib_pal]: tests/linux_test.sb --llvm failed:`n$lout"
         }
     }
 
     $script:PassedCount++
     Write-Host "PASS [linux-pal]     phase32_linux_stdlib_pal"
+}
+
+# 41. Phase 33: Cross-Platform I/O, BufIO, FS, and OS PAL (21 std/ modules + examples/sbwc.sb on Linux x64)
+if (Should-RunTest "phase33_linux_io_fs_os_pal") {
+    $ioMods = @("io", "bufio", "fs", "os")
+    foreach ($m in $ioMods) {
+        $mp = Join-Path $root "std\$m.sb"
+        $cout = (& $sbc check --lib --target linux-x64 $mp 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "FAIL [phase33_linux_io_fs_os_pal]: sbc check --lib --target linux-x64 std/$m.sb failed:`n$cout"
+        }
+    }
+
+    # Emit Linux x64 LLVM IR for real CLI app examples/sbwc.sb
+    $sbwcPath = Join-Path $root "examples\sbwc.sb"
+    $sbwcLl   = Join-Path $tmp "phase33_sbwc_linux.ll"
+    $compOut = (& $sbc build $sbwcPath --target linux-x64 --emit-llvm -o $sbwcLl 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $sbwcLl)) {
+        throw "FAIL [phase33_linux_io_fs_os_pal]: Linux LLVM IR emission for examples/sbwc.sb failed:`n$compOut"
+    }
+    $ll = Get-Content -Path $sbwcLl -Raw
+    if ($ll -notmatch 'target triple = "x86_64-pc-linux-gnu"' -or $ll -notmatch 'libc\.so\.6') {
+        throw "FAIL [phase33_linux_io_fs_os_pal]: sbwc Linux IR missing x86_64-pc-linux-gnu / libc.so.6"
+    }
+    if ($ll -match 'kernel32\.dll|msvcrt\.dll|bcrypt\.dll|LoadLibraryA|GetProcAddress') {
+        throw "FAIL [phase33_linux_io_fs_os_pal]: sbwc Linux IR leaked Windows DLL symbols"
+    }
+
+    # Emit Linux x64 LLVM IR exercising io, bufio, fs (incl. fs_read_dir), and os
+    $p33Src = Join-Path $tmp "phase33_linux_fs_os.sb"
+    $p33Ll  = Join-Path $tmp "phase33_linux_fs_os.ll"
+    $p33Code = @'
+import "std/io.sb"
+import "std/bufio.sb"
+import "std/fs.sb"
+import "std/os.sb"
+
+fn main() {
+    var buf[256]: u8 = []
+    var c = cwd_into(buf)
+    var g = getenv_str("PATH", buf)
+    var ac = arg_count()
+    var a0 = arg_at(0)
+    var r1 = fs_mkdir("/tmp/sb_p33")
+    var r2 = write_file_all("/tmp/sb_p33/a.txt", "hi\n")
+    var r3 = fs_copy("/tmp/sb_p33/a.txt", "/tmp/sb_p33/b.txt")
+    var r4 = fs_rename("/tmp/sb_p33/b.txt", "/tmp/sb_p33/c.txt")
+    match fs_read_dir("/tmp/sb_p33") {
+        .Ok(it) {
+            var iter = it
+            var e = DirEntry {}
+            var rn = iter.next(&e)
+            iter.close()
+        }
+        .Err(_) { }
+    }
+    match file_open("/tmp/sb_p33/a.txt") {
+        .Ok(f) {
+            var rf = f
+            var br: BufReader
+            br.init(&rf, 16)
+            var line: StringBuilder
+            line.init(16)
+            var rl = br.read_line(&line)
+            line.free()
+            br.free()
+            rf.close()
+        }
+        .Err(_) { }
+    }
+    var r5 = fs_remove_file("/tmp/sb_p33/a.txt")
+    var r6 = fs_remove_file("/tmp/sb_p33/c.txt")
+    var r7 = fs_rmdir("/tmp/sb_p33")
+    print("{} {}", ac, len(a0))
+}
+'@
+    Set-Content -Path $p33Src -Value $p33Code -Encoding UTF8
+    $comp2 = (& $sbc build $p33Src --target linux-x64 --emit-llvm -o $p33Ll 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $p33Ll)) {
+        throw "FAIL [phase33_linux_io_fs_os_pal]: Linux IR emission for io/bufio/fs/os failed:`n$comp2"
+    }
+    $ll2 = Get-Content -Path $p33Ll -Raw
+    if ($ll2 -notmatch 'libc\.so\.6' -or $ll2 -notmatch 'opendir' -or $ll2 -notmatch 'readdir') {
+        throw "FAIL [phase33_linux_io_fs_os_pal]: emitted Linux IR missing expected POSIX fs/os symbols"
+    }
+    if ($ll2 -match 'kernel32\.dll|msvcrt\.dll|FindFirstFileA|CreateFileA|GetEnvironmentVariableA') {
+        throw "FAIL [phase33_linux_io_fs_os_pal]: emitted Linux IR leaked Windows API symbols"
+    }
+
+    # Cross-compile both Linux IR files to ELF64 object files if Clang is available
+    $clangExe = $null
+    if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+        $clangExe = "C:\Program Files\LLVM\bin\clang.exe"
+    } else {
+        $cmd = Get-Command clang -ErrorAction SilentlyContinue
+        if ($cmd) { $clangExe = $cmd.Source }
+    }
+    if ($clangExe) {
+        foreach ($irFile in @($sbwcLl, $p33Ll)) {
+            $objFile = [System.IO.Path]::ChangeExtension($irFile, ".o")
+            $clOut = (& $clangExe -O3 -c --target=x86_64-pc-linux-gnu $irFile -o $objFile 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $objFile)) {
+                throw "FAIL [phase33_linux_io_fs_os_pal]: clang cross-compile failed for ${irFile}:`n$clOut"
+            }
+            $hdr = [System.IO.File]::ReadAllBytes($objFile)
+            if ($hdr.Length -lt 4 -or $hdr[0] -ne 0x7F -or $hdr[1] -ne 0x45 -or $hdr[2] -ne 0x4C -or $hdr[3] -ne 0x46) {
+                throw "FAIL [phase33_linux_io_fs_os_pal]: output $objFile does not have ELF magic bytes"
+            }
+        }
+    }
+
+    $script:PassedCount++
+    Write-Host "PASS [linux-io]      phase33_linux_io_fs_os_pal"
 }
 
 if ($script:SkippedCount -gt 0) {

@@ -59,11 +59,12 @@ jobs:
       - name: Build sbc on Linux x64 (warnings as errors)
         run: make CFLAGS="-std=c11 -O2 -Wall -Wextra -Werror"
 
-      - name: Run Linux x64 cross-platform stdlib & FFI tests
+      - name: Run Linux x64 cross-platform stdlib, CLI & FFI tests
         run: |
           ./sbc --version
           ./sbc test tests/linux_test.sb
           ./sbc test tests/linux_test.sb --release
+          ./sbc run examples/sbwc.sb
           out=$(./sbc run tests/linux_ffi_test.sb)
           test "$out" = "linux_ffi_ok=12 14"
 

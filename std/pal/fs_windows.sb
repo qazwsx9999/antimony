@@ -1,0 +1,165 @@
+// =============================================================================
+// Antimony PAL: std/pal/fs_windows.sb
+// Win32 filesystem metadata, directory manipulation, and FindFirstFileA iteration.
+// =============================================================================
+
+import "std/mem.sb"
+import "std/str.sb"
+
+const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10
+const INVALID_FIND_HANDLE: isize = -1
+const WIN32_ERR_NO_MORE_FILES: u32 = 18
+const MOVEFILE_REPLACE_EXISTING: u32 = 1
+
+priv struct Win32FindDataA {
+    file_attributes: u32
+    creation_lo: u32
+    creation_hi: u32
+    access_lo: u32
+    access_hi: u32
+    write_lo: u32
+    write_hi: u32
+    file_size_high: u32
+    file_size_low: u32
+    reserved0: u32
+    reserved1: u32
+    file_name[260]: u8
+    alt_name[14]: u8
+    _pad[2]: u8
+}
+
+priv extern "kernel32.dll" {
+    fn GetFileAttributesA(lpFileName: *const u8): u32
+    fn CreateDirectoryA(lpPathName: *const u8, lpSecurityAttributes: usize): i32
+    fn RemoveDirectoryA(lpPathName: *const u8): i32
+    fn DeleteFileA(lpFileName: *const u8): i32
+    fn MoveFileExA(lpExistingFileName: *const u8, lpNewFileName: *const u8, dwFlags: u32): i32
+    fn CopyFileA(lpExistingFileName: *const u8, lpNewFileName: *const u8, bFailIfExists: i32): i32
+    fn FindFirstFileA(lpFileName: *const u8, lpFindFileData: *u8): isize
+    fn FindNextFileA(hFindFile: isize, lpFindFileData: *u8): i32
+    fn FindClose(hFindFile: isize): i32
+    fn GetLastError(): u32
+}
+
+pub const PAL_INVALID_DIR_HANDLE: isize = -1
+
+pub fn pal_fs_exists(path: *const u8): bool {
+    return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES
+}
+
+pub fn pal_fs_is_dir(path: *const u8): bool {
+    var attrs = GetFileAttributesA(path)
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+}
+
+pub fn pal_fs_is_file(path: *const u8): bool {
+    var attrs = GetFileAttributesA(path)
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0
+}
+
+pub fn pal_fs_mkdir(path: *const u8): bool {
+    return CreateDirectoryA(path, 0) != 0
+}
+
+pub fn pal_fs_rmdir(path: *const u8): bool {
+    return RemoveDirectoryA(path) != 0
+}
+
+pub fn pal_fs_remove_file(path: *const u8): bool {
+    return DeleteFileA(path) != 0
+}
+
+pub fn pal_fs_rename(src: *const u8, dst: *const u8): bool {
+    return MoveFileExA(src, dst, MOVEFILE_REPLACE_EXISTING) != 0
+}
+
+pub fn pal_fs_copy(src: *const u8, dst: *const u8): bool {
+    return CopyFileA(src, dst, 0) != 0
+}
+
+// Opens a directory search handle; writes `out_has_pending` = true if first entry is buffered in `raw_buf`.
+// Returns 0 on success, -1 on error (use pal_last_os_error()). If empty, sets `*out_handle = PAL_INVALID_DIR_HANDLE` and returns 0.
+pub fn pal_dir_open(path: str, raw_buf: *u8, out_handle: *isize, out_has_pending: *bool): i32 {
+    var pat: StringBuilder
+    pat.init(usize(len(path)) + 4)
+    defer pat.free()
+    pat.append(path)
+    var last = path[len(path) - 1]
+    if last != '\\' && last != '/' {
+        pat.append_byte('\\')
+    }
+    pat.append_byte('*')
+
+    var h = FindFirstFileA(pat.cstr(), raw_buf)
+    if h == INVALID_FIND_HANDLE {
+        var err = GetLastError()
+        if err == WIN32_ERR_NO_MORE_FILES {
+            *out_handle = INVALID_FIND_HANDLE
+            *out_has_pending = false
+            return 0
+        }
+        return -1
+    }
+    *out_handle = h
+    *out_has_pending = true
+    return 0
+}
+
+// Advances directory iterator:
+// returns 1 if an entry was written, 0 at end-of-directory, -1 on error.
+pub fn pal_dir_next(
+    handle: *isize,
+    raw_buf: *u8,
+    has_pending: *bool,
+    dir_path: *const u8,
+    dir_path_len: i64,
+    out_name: *u8,
+    out_name_len: *i64,
+    out_size: *i64,
+    out_is_dir: *bool
+): i32 {
+    var _unused_p = dir_path
+    var _unused_l = dir_path_len
+    if *handle == INVALID_FIND_HANDLE || *handle == 0 {
+        return 0
+    }
+    loop {
+        if !(*has_pending) {
+            if FindNextFileA(*handle, raw_buf) == 0 {
+                var err = GetLastError()
+                pal_dir_close(handle, has_pending)
+                if err == WIN32_ERR_NO_MORE_FILES {
+                    return 0
+                }
+                return -1
+            }
+        }
+        *has_pending = false
+        var fd = ptr_cast(*const Win32FindDataA, raw_buf)
+        var nm = cstr_to_str(&fd.file_name[0])
+        if nm == "." || nm == ".." {
+            continue
+        }
+        var n = i64(cstr_len(&fd.file_name[0]))
+        if n > 259 {
+            n = 259
+        }
+        if n > 0 {
+            copy_mem(out_name, &fd.file_name[0], usize(n))
+        }
+        out_name[n] = 0
+        *out_name_len = n
+        *out_size = i64((u64(fd.file_size_high) << 32) | u64(fd.file_size_low))
+        *out_is_dir = (fd.file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        return 1
+    }
+}
+
+pub fn pal_dir_close(handle: *isize, has_pending: *bool) {
+    if *handle != INVALID_FIND_HANDLE && *handle != 0 {
+        FindClose(*handle)
+        *handle = INVALID_FIND_HANDLE
+    }
+    *has_pending = false
+}

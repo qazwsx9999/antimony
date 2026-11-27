@@ -49,7 +49,7 @@ fn main() {
 
 ### Requirements
 
-- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend + full 25-module `std/`) or **Linux x64** (LLVM x86-64 ELF backend + 17 cross-platform `std/` modules via `std/pal/` + cross-compilation to Windows PE32+ `.exe`).
+- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend + full 25-module `std/`) or **Linux x64** (LLVM x86-64 ELF backend + 21 cross-platform `std/` modules via `std/pal/` + cross-compilation to Windows PE32+ `.exe`).
 - A C11 compiler to build `sbc` — tested with **MinGW-w64 GCC 13** (Windows) and **GCC / Clang** (Linux).
 - *Optional on Windows, required on Linux:* **LLVM/Clang** (`clang`). On Windows, `sbc` looks for `clang.exe` in `C:\Program Files\LLVM\bin`, `C:\msys64\clang64\bin`, `C:\msys64\mingw64\bin`, and on `PATH`.
 
@@ -190,7 +190,7 @@ editors/      VS Code extension (highlighting, live diagnostics, sbc fmt, outlin
 
 ## Status
 
-The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3` + full 25-module `std/`) and **Linux x64** (LLVM x86-64 System V ELF backend + 17 cross-platform `std/` modules via OS-aware `std/pal/` imports + POSIX FFI via `dlopen`/`dlsym` + Windows cross-compilation) are supported and tested in CI. Planned work — including a POSIX `std/` I/O/networking layer, macOS target, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
+The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3` + full 25-module `std/`) and **Linux x64** (LLVM x86-64 System V ELF backend + 21 cross-platform `std/` modules including file I/O, buffered I/O, filesystem, and OS via `std/pal/` + POSIX FFI via `dlopen`/`dlsym` + Windows cross-compilation) are supported and tested in CI. Planned work — including POSIX threads/process/networking PALs, macOS target, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
 
 ## License
 

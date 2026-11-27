@@ -1,0 +1,144 @@
+// =============================================================================
+// Antimony PAL: std/pal/io_windows.sb
+// Win32 file handle I/O primitives.
+// =============================================================================
+
+const GENERIC_READ: u32 = 0x80000000
+const GENERIC_WRITE: u32 = 0x40000000
+const FILE_APPEND_DATA: u32 = 0x00000004
+const FILE_SHARE_READ: u32 = 1
+const FILE_SHARE_WRITE: u32 = 2
+const CREATE_ALWAYS: u32 = 2
+const OPEN_EXISTING: u32 = 3
+const OPEN_ALWAYS: u32 = 4
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80
+const INVALID_HANDLE_VALUE: isize = -1
+
+const FILE_BEGIN: u32 = 0
+const FILE_CURRENT: u32 = 1
+const FILE_END: u32 = 2
+
+const PAL_WIN32_ERR_FILE_NOT_FOUND: u32 = 2
+const PAL_WIN32_ERR_PATH_NOT_FOUND: u32 = 3
+const PAL_WIN32_ERR_ACCESS_DENIED: u32 = 5
+const PAL_WIN32_ERR_FILE_EXISTS: u32 = 80
+const PAL_WIN32_ERR_BROKEN_PIPE: u32 = 109
+const PAL_WIN32_ERR_ALREADY_EXISTS: u32 = 183
+
+priv extern "kernel32.dll" {
+    fn CreateFileA(
+        lpFileName: *const u8,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: usize,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: usize
+    ): isize
+    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
+    fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
+    fn GetFileSizeEx(hFile: isize, lpFileSize: *i64): i32
+    fn SetFilePointerEx(hFile: isize, liDistanceToMove: i64, lpNewFilePointer: *i64, dwMoveMethod: u32): i32
+    fn FlushFileBuffers(hFile: isize): i32
+    fn CloseHandle(hObject: isize): i32
+    fn DeleteFileA(lpFileName: *const u8): i32
+    fn GetLastError(): u32
+}
+
+pub const PAL_INVALID_HANDLE: isize = -1
+
+// Open modes shared across PAL implementations:
+// 0 = read existing, 1 = create/truncate write, 2 = append (create if missing), 3 = read/write (create if missing)
+pub fn pal_file_open(path: *const u8, mode: i32): isize {
+    if mode == 0 {
+        return CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
+    }
+    if mode == 1 {
+        return CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    }
+    if mode == 2 {
+        return CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+    }
+    return CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, 0, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
+}
+
+pub fn pal_file_is_open(handle: isize): bool {
+    return handle != INVALID_HANDLE_VALUE && handle != 0
+}
+
+pub fn pal_file_read(handle: isize, buf: *u8, count: usize): i64 {
+    var chunk = count
+    if chunk > 0x7FFF_FFFF {
+        chunk = 0x7FFF_FFFF
+    }
+    var nread: u32 = 0
+    if ReadFile(handle, buf, u32(chunk), &nread, 0) == 0 {
+        return -1
+    }
+    return i64(nread)
+}
+
+pub fn pal_file_write(handle: isize, data: *const u8, count: usize): i64 {
+    var chunk = count
+    if chunk > 0x7FFF_FFFF {
+        chunk = 0x7FFF_FFFF
+    }
+    var written: u32 = 0
+    if WriteFile(handle, data, u32(chunk), &written, 0) == 0 {
+        return -1
+    }
+    return i64(written)
+}
+
+// whence: 0 = Start, 1 = Current, 2 = End
+pub fn pal_file_seek(handle: isize, offset: i64, whence: i32): i64 {
+    var method = FILE_BEGIN
+    if whence == 1 {
+        method = FILE_CURRENT
+    } else if whence == 2 {
+        method = FILE_END
+    }
+    var new_pos: i64 = 0
+    if SetFilePointerEx(handle, offset, &new_pos, method) == 0 {
+        return -1
+    }
+    return new_pos
+}
+
+pub fn pal_file_size(handle: isize): i64 {
+    var sz: i64 = 0
+    if GetFileSizeEx(handle, &sz) == 0 {
+        return -1
+    }
+    return sz
+}
+
+pub fn pal_file_flush(handle: isize): bool {
+    return FlushFileBuffers(handle) != 0
+}
+
+pub fn pal_file_close(handle: isize) {
+    if pal_file_is_open(handle) {
+        CloseHandle(handle)
+    }
+}
+
+pub fn pal_delete_file(path: *const u8): bool {
+    return DeleteFileA(path) != 0
+}
+
+pub fn pal_last_os_error(): u32 {
+    return GetLastError()
+}
+
+// Maps OS error code to portable IoError tag:
+// 1 = NotFound, 2 = PermissionDenied, 3 = AlreadyExists, 4 = InvalidInput, 5 = BrokenPipe, 0 = OsError
+pub fn pal_classify_os_error(code: u32): i32 {
+    match code {
+        PAL_WIN32_ERR_FILE_NOT_FOUND, PAL_WIN32_ERR_PATH_NOT_FOUND { return 1 }
+        PAL_WIN32_ERR_ACCESS_DENIED { return 2 }
+        PAL_WIN32_ERR_FILE_EXISTS, PAL_WIN32_ERR_ALREADY_EXISTS { return 3 }
+        PAL_WIN32_ERR_BROKEN_PIPE { return 5 }
+        else { return 0 }
+    }
+}

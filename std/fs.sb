@@ -1,77 +1,49 @@
 // =============================================================================
 // Antimony Standard Library: std/fs.sb
-// Native Win32 filesystem operations (`exists`, `is_file`, `is_dir`, `mkdir`,
-// `rmdir`, `remove_file`, `rename`, `copy`) returning `Result[bool, IoError]`.
+// Cross-platform filesystem operations (`exists`, `is_file`, `is_dir`, `mkdir`,
+// `rmdir`, `remove_file`, `rename`, `copy`, `fs_read_dir`) returning `Result`.
 // =============================================================================
 
 import "std/core.sb"
 import "std/mem.sb"
 import "std/io.sb"
 import "std/str.sb"
+import "std/pal/fs.sb"
 
-const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10
-const INVALID_FIND_HANDLE: isize    = -1
-const WIN32_ERR_NO_MORE_FILES: u32  = 18
-
-priv struct Win32FindDataA {
-    file_attributes: u32
-    creation_lo: u32
-    creation_hi: u32
-    access_lo: u32
-    access_hi: u32
-    write_lo: u32
-    write_hi: u32
-    file_size_high: u32
-    file_size_low: u32
-    reserved0: u32
-    reserved1: u32
-    file_name[260]: u8
-    alt_name[14]: u8
-    _pad[2]: u8
-}
-
-priv extern "kernel32.dll" {
-    fn GetFileAttributesA(lpFileName: *const u8): u32
-    fn CreateDirectoryA(lpPathName: *const u8, lpSecurityAttributes: usize): i32
-    fn RemoveDirectoryA(lpPathName: *const u8): i32
-    fn DeleteFileA(lpFileName: *const u8): i32
-    fn MoveFileExA(lpExistingFileName: *const u8, lpNewFileName: *const u8, dwFlags: u32): i32
-    fn CopyFileA(lpExistingFileName: *const u8, lpNewFileName: *const u8, bFailIfExists: i32): i32
-    fn FindFirstFileA(lpFileName: *const u8, lpFindFileData: *u8): isize
-    fn FindNextFileA(hFindFile: isize, lpFindFileData: *u8): i32
-    fn FindClose(hFindFile: isize): i32
-    fn GetLastError(): u32
-}
-
-const MOVEFILE_REPLACE_EXISTING: u32 = 1
-
-priv fn get_attrs(path: str): u32 {
+// Returns true if a file or directory exists at `path`.
+pub fn fs_exists(path: str): bool {
     if len(path) == 0 {
-        return INVALID_FILE_ATTRIBUTES
+        return false
     }
     var pb: StringBuilder
     pb.init(usize(len(path)) + 1)
     defer pb.free()
     pb.append(path)
-    return GetFileAttributesA(pb.cstr())
-}
-
-// Returns true if a file or directory exists at `path`.
-pub fn fs_exists(path: str): bool {
-    return get_attrs(path) != INVALID_FILE_ATTRIBUTES
+    return pal_fs_exists(pb.cstr())
 }
 
 // Returns true if `path` exists and is a directory.
 pub fn fs_is_dir(path: str): bool {
-    var attrs = get_attrs(path)
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0
+    if len(path) == 0 {
+        return false
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    return pal_fs_is_dir(pb.cstr())
 }
 
 // Returns true if `path` exists and is a regular (non-directory) file.
 pub fn fs_is_file(path: str): bool {
-    var attrs = get_attrs(path)
-    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0
+    if len(path) == 0 {
+        return false
+    }
+    var pb: StringBuilder
+    pb.init(usize(len(path)) + 1)
+    defer pb.free()
+    pb.append(path)
+    return pal_fs_is_file(pb.cstr())
 }
 
 // Creates a single directory at `path`.
@@ -83,8 +55,8 @@ pub fn fs_mkdir(path: str): Result[bool, IoError] {
     pb.init(usize(len(path)) + 1)
     defer pb.free()
     pb.append(path)
-    if CreateDirectoryA(pb.cstr(), 0) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_fs_mkdir(pb.cstr()) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
@@ -98,8 +70,8 @@ pub fn fs_rmdir(path: str): Result[bool, IoError] {
     pb.init(usize(len(path)) + 1)
     defer pb.free()
     pb.append(path)
-    if RemoveDirectoryA(pb.cstr()) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_fs_rmdir(pb.cstr()) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
@@ -113,8 +85,8 @@ pub fn fs_remove_file(path: str): Result[bool, IoError] {
     pb.init(usize(len(path)) + 1)
     defer pb.free()
     pb.append(path)
-    if DeleteFileA(pb.cstr()) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_fs_remove_file(pb.cstr()) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
@@ -134,8 +106,8 @@ pub fn fs_rename(src: str, dst: str): Result[bool, IoError] {
     defer sb2.free()
     sb2.append(dst)
 
-    if MoveFileExA(sb1.cstr(), sb2.cstr(), MOVEFILE_REPLACE_EXISTING) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_fs_rename(sb1.cstr(), sb2.cstr()) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
@@ -155,8 +127,8 @@ pub fn fs_copy(src: str, dst: str): Result[bool, IoError] {
     defer sb2.free()
     sb2.append(dst)
 
-    if CopyFileA(sb1.cstr(), sb2.cstr(), 0) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_fs_copy(sb1.cstr(), sb2.cstr()) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
@@ -183,21 +155,9 @@ pub fn (e: *DirEntry) name(): str {
 pub struct DirIter {
     handle: isize
     raw_find[320]: u8
+    dir_path[512]: u8
+    dir_path_len: i64
     has_pending: bool
-}
-
-priv fn fill_dir_entry(fd: *const Win32FindDataA, out: *DirEntry) {
-    var n = i64(cstr_len(&fd.file_name[0]))
-    if n > 259 {
-        n = 259
-    }
-    if n > 0 {
-        copy_mem(&out.name_buf[0], &fd.file_name[0], usize(n))
-    }
-    out.name_buf[n] = 0
-    out.name_len = n
-    out.size = i64((u64(fd.file_size_high) << 32) | u64(fd.file_size_low))
-    out.is_dir = (fd.file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0
 }
 
 // Opens a directory iterator over all entries in `path` (automatically skipping "." and "..").
@@ -205,62 +165,43 @@ pub fn fs_read_dir(path: str): Result[DirIter, IoError] {
     if len(path) == 0 {
         return .Err(.InvalidInput)
     }
-    var pat: StringBuilder
-    pat.init(usize(len(path)) + 4)
-    defer pat.free()
-    pat.append(path)
-    var last = path[len(path) - 1]
-    if last != '\\' && last != '/' {
-        pat.append_byte('\\')
+    var it = DirIter { handle: PAL_INVALID_DIR_HANDLE, dir_path_len: 0, has_pending: false }
+    var plen = len(path)
+    if plen > 511 {
+        plen = 511
     }
-    pat.append_byte('*')
+    if plen > 0 {
+        copy_mem(&it.dir_path[0], ptr_cast(*const u8, path), usize(plen))
+    }
+    it.dir_path[plen] = 0
+    it.dir_path_len = plen
 
-    var it = DirIter { handle: INVALID_FIND_HANDLE, has_pending: false }
-    var h = FindFirstFileA(pat.cstr(), &it.raw_find[0])
-    if h == INVALID_FIND_HANDLE {
-        var err = GetLastError()
-        if err == WIN32_ERR_NO_MORE_FILES {
-            return .Ok(it)
-        }
-        return .Err(io_error_from_win32(err))
+    if pal_dir_open(path, &it.raw_find[0], &it.handle, &it.has_pending) != 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    it.handle = h
-    it.has_pending = true
     return .Ok(it)
 }
 
 // Advances the iterator, populating `out` with the next entry.
 // Returns `.Ok(true)` if an entry was produced, or `.Ok(false)` when finished.
 pub fn (it: *DirIter) next(out: *DirEntry): Result[bool, IoError] {
-    if it.handle == INVALID_FIND_HANDLE {
-        return .Ok(false)
+    var rc = pal_dir_next(
+        &it.handle,
+        &it.raw_find[0],
+        &it.has_pending,
+        &it.dir_path[0],
+        it.dir_path_len,
+        &out.name_buf[0],
+        &out.name_len,
+        &out.size,
+        &out.is_dir
+    )
+    if rc < 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    loop {
-        if !it.has_pending {
-            if FindNextFileA(it.handle, &it.raw_find[0]) == 0 {
-                var err = GetLastError()
-                it.close()
-                if err == WIN32_ERR_NO_MORE_FILES {
-                    return .Ok(false)
-                }
-                return .Err(io_error_from_win32(err))
-            }
-        }
-        it.has_pending = false
-        var fd = ptr_cast(*const Win32FindDataA, &it.raw_find[0])
-        var nm = cstr_to_str(&fd.file_name[0])
-        if nm == "." || nm == ".." {
-            continue
-        }
-        fill_dir_entry(fd, out)
-        return .Ok(true)
-    }
+    return .Ok(rc > 0)
 }
 
 pub fn (it: *DirIter) close() {
-    if it.handle != INVALID_FIND_HANDLE && it.handle != 0 {
-        FindClose(it.handle)
-        it.handle = INVALID_FIND_HANDLE
-    }
-    it.has_pending = false
+    pal_dir_close(&it.handle, &it.has_pending)
 }

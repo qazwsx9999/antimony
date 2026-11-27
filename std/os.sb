@@ -1,33 +1,19 @@
 // =============================================================================
 // Antimony Standard Library: std/os.sb
-// Native Win32 console streams (stdin/stdout/stderr), command-line arguments,
+// Cross-platform console streams (stdin/stdout/stderr), command-line arguments,
 // environment variables, and working directory utilities.
 // =============================================================================
 
 import "std/core.sb"
 import "std/str.sb"
-
-const STD_INPUT_HANDLE_ID: u32  = 0xFFFFFFF6
-const STD_OUTPUT_HANDLE_ID: u32 = 0xFFFFFFF5
-const STD_ERROR_HANDLE_ID: u32  = 0xFFFFFFF4
-
-priv extern "kernel32.dll" {
-    fn GetStdHandle(nStdHandle: u32): isize
-    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
-    fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
-    fn GetCommandLineA(): *const u8
-    fn GetEnvironmentVariableA(lpName: *const u8, lpBuffer: *u8, nSize: u32): u32
-    fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: *u8): u32
-}
+import "std/pal/os.sb"
 
 // Writes `s` to stdout without appending a trailing newline.
 pub fn print_raw(s: str) {
     if len(s) == 0 {
         return
     }
-    var h = GetStdHandle(STD_OUTPUT_HANDLE_ID)
-    var written: u32 = 0
-    WriteFile(h, ptr_cast(*const u8, s), u32(len(s)), &written, 0)
+    pal_write_stdout(ptr_cast(*const u8, s), usize(len(s)))
 }
 
 // Writes `s` to stderr without appending a trailing newline.
@@ -35,9 +21,7 @@ pub fn eprint_raw(s: str) {
     if len(s) == 0 {
         return
     }
-    var h = GetStdHandle(STD_ERROR_HANDLE_ID)
-    var written: u32 = 0
-    WriteFile(h, ptr_cast(*const u8, s), u32(len(s)), &written, 0)
+    pal_write_stderr(ptr_cast(*const u8, s), usize(len(s)))
 }
 
 // Writes `s` followed by '\n' to stderr.
@@ -51,17 +35,12 @@ pub fn read_stdin(buf[]: u8): i64 {
     if len(buf) == 0 {
         return 0
     }
-    var h = GetStdHandle(STD_INPUT_HANDLE_ID)
-    var nread: u32 = 0
-    if ReadFile(h, &buf[0], u32(len(buf)), &nread, 0) == 0 {
-        return -1
-    }
-    return i64(nread)
+    return pal_read_stdin(&buf[0], usize(len(buf)))
 }
 
 // Returns the raw command line of the current process as a `str`.
 pub fn cmd_line(): str {
-    return cstr_to_str(GetCommandLineA())
+    return pal_cmd_line()
 }
 
 // Returns the number of whitespace/quote-delimited arguments in `line`.
@@ -134,12 +113,18 @@ pub fn parse_arg_at(line: str, index: i32): str {
 
 // Returns the number of command-line arguments passed to the current process.
 pub fn arg_count(): i32 {
-    return parse_arg_count(cmd_line())
+    if pal_use_parsed_args() {
+        return parse_arg_count(cmd_line())
+    }
+    return pal_arg_count()
 }
 
 // Returns the `index`-th command-line argument of the current process.
 pub fn arg_at(index: i32): str {
-    return parse_arg_at(cmd_line(), index)
+    if pal_use_parsed_args() {
+        return parse_arg_at(cmd_line(), index)
+    }
+    return pal_arg_at(index)
 }
 
 // Reads environment variable `name` into `buf[]` and returns the populated `str` slice (or "" if unset).
@@ -147,11 +132,11 @@ pub fn getenv_into(name: *const u8, buf[]: u8): str {
     if len(buf) == 0 {
         return ""
     }
-    var n = GetEnvironmentVariableA(name, &buf[0], u32(len(buf)))
-    if n == 0 || i64(n) >= len(buf) {
+    var n = pal_getenv_into(name, &buf[0], usize(len(buf)))
+    if n <= 0 || n >= len(buf) {
         return ""
     }
-    return str(buf[0..i64(n)])
+    return str(buf[0..n])
 }
 
 // Reads environment variable `name` (Antimony `str`) into `buf[]`.
@@ -163,11 +148,11 @@ pub fn getenv_str(name: str, buf[]: u8): Option[str] {
     nb.init(usize(len(name)) + 1)
     defer nb.free()
     nb.append(name)
-    var n = GetEnvironmentVariableA(nb.cstr(), &buf[0], u32(len(buf)))
-    if n == 0 || i64(n) >= len(buf) {
+    var n = pal_getenv_into(nb.cstr(), &buf[0], usize(len(buf)))
+    if n < 0 || n >= len(buf) {
         return .None
     }
-    return .Some(str(buf[0..i64(n)]))
+    return .Some(str(buf[0..n]))
 }
 
 // Reads the current working directory into `buf[]`.
@@ -175,9 +160,9 @@ pub fn cwd_into(buf[]: u8): Option[str] {
     if len(buf) == 0 {
         return .None
     }
-    var n = GetCurrentDirectoryA(u32(len(buf)), &buf[0])
-    if n == 0 || i64(n) >= len(buf) {
+    var n = pal_cwd_into(&buf[0], usize(len(buf)))
+    if n <= 0 || n >= len(buf) {
         return .None
     }
-    return .Some(str(buf[0..i64(n)]))
+    return .Some(str(buf[0..n]))
 }

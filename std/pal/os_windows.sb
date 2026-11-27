@@ -1,0 +1,75 @@
+// =============================================================================
+// Antimony PAL: std/pal/os_windows.sb
+// Win32 console streams, command line, environment variables, and working dir.
+// =============================================================================
+
+import "std/str.sb"
+
+const STD_INPUT_HANDLE_ID: u32 = 0xFFFFFFF6
+const STD_OUTPUT_HANDLE_ID: u32 = 0xFFFFFFF5
+const STD_ERROR_HANDLE_ID: u32 = 0xFFFFFFF4
+
+priv extern "kernel32.dll" {
+    fn GetStdHandle(nStdHandle: u32): isize
+    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
+    fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
+    fn GetCommandLineA(): *const u8
+    fn GetEnvironmentVariableA(lpName: *const u8, lpBuffer: *u8, nSize: u32): u32
+    fn GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: *u8): u32
+}
+
+pub fn pal_write_stdout(data: *const u8, n: usize) {
+    var h = GetStdHandle(STD_OUTPUT_HANDLE_ID)
+    var written: u32 = 0
+    WriteFile(h, data, u32(n), &written, 0)
+}
+
+pub fn pal_write_stderr(data: *const u8, n: usize) {
+    var h = GetStdHandle(STD_ERROR_HANDLE_ID)
+    var written: u32 = 0
+    WriteFile(h, data, u32(n), &written, 0)
+}
+
+pub fn pal_read_stdin(buf: *u8, n: usize): i64 {
+    var h = GetStdHandle(STD_INPUT_HANDLE_ID)
+    var nread: u32 = 0
+    if ReadFile(h, buf, u32(n), &nread, 0) == 0 {
+        return -1
+    }
+    return i64(nread)
+}
+
+pub fn pal_cmd_line(): str {
+    return cstr_to_str(GetCommandLineA())
+}
+
+pub fn pal_use_parsed_args(): bool {
+    return true
+}
+
+pub fn pal_arg_count(): i32 {
+    return 0
+}
+
+pub fn pal_arg_at(index: i32): str {
+    var _i = index
+    return ""
+}
+
+// Writes env var value into `buf[0..cap]`. Returns byte length on success, or -1 if unset / too small.
+pub fn pal_getenv_into(name: *const u8, buf: *u8, cap: usize): i64 {
+    var n = GetEnvironmentVariableA(name, buf, u32(cap))
+    if n == 0 || usize(n) >= cap {
+        return -1
+    }
+    return i64(n)
+}
+
+// Writes current working directory into `buf[0..cap]`. Returns byte length on success, or -1 on error.
+pub fn pal_cwd_into(buf: *u8, cap: usize): i64 {
+    var n = GetCurrentDirectoryA(u32(cap), buf)
+    if n == 0 || usize(n) >= cap {
+        return -1
+    }
+    return i64(n)
+}

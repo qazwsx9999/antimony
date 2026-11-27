@@ -1,0 +1,187 @@
+// =============================================================================
+// Antimony PAL: std/pal/os_linux.sb
+// Linux POSIX console streams, /proc/self/cmdline argv, getenv, and getcwd.
+// =============================================================================
+
+import "std/mem.sb"
+import "std/str.sb"
+
+const PAL_OS_STDIN_FD: i32 = 0
+const PAL_OS_STDOUT_FD: i32 = 1
+const PAL_OS_STDERR_FD: i32 = 2
+const PAL_OS_O_RDONLY: i32 = 0
+
+priv extern "libc.so.6" {
+    fn open(path: *const u8, flags: i32, mode: u32): i32
+    fn read(fd: i32, buf: *u8, count: usize): isize
+    fn write(fd: i32, buf: *const u8, count: usize): isize
+    fn close(fd: i32): i32
+    fn getenv(name: *const u8): *const u8
+    fn getcwd(buf: *u8, size: usize): *u8
+}
+
+priv var g_linux_cmdline_raw: *u8 = null
+priv var g_linux_cmdline_len: i64 = -1
+priv var g_linux_cmdline_str: *u8 = null
+priv var g_linux_cmdline_str_len: i64 = 0
+
+priv fn ensure_linux_cmdline() {
+    if g_linux_cmdline_len >= 0 {
+        return
+    }
+    g_linux_cmdline_len = 0
+    g_linux_cmdline_str_len = 0
+
+    var p: StringBuilder
+    p.init(24)
+    defer p.free()
+    p.append("/proc/self/cmdline")
+
+    var fd = open(p.cstr(), PAL_OS_O_RDONLY, 0)
+    if fd < 0 {
+        return
+    }
+    defer close(fd)
+
+    var cap: usize = 4096
+    var raw = alloc(cap)
+    if raw == null {
+        return
+    }
+    var total: i64 = 0
+    loop total < i64(cap - 1) {
+        var n = read(fd, raw + usize(total), cap - 1 - usize(total))
+        if n <= 0 {
+            break
+        }
+        total += i64(n)
+    }
+    g_linux_cmdline_raw = raw
+    g_linux_cmdline_len = total
+
+    var joined = alloc(cap)
+    if joined == null {
+        return
+    }
+    var jlen: i64 = 0
+    var i: i64 = 0
+    loop i < total {
+        var b = raw[i]
+        if b == 0 {
+            if i + 1 < total {
+                joined[jlen] = ' '
+                jlen += 1
+            }
+        } else {
+            joined[jlen] = b
+            jlen += 1
+        }
+        i += 1
+    }
+    joined[jlen] = 0
+    g_linux_cmdline_str = joined
+    g_linux_cmdline_str_len = jlen
+}
+
+pub fn pal_write_stdout(data: *const u8, n: usize) {
+    var off: usize = 0
+    loop off < n {
+        var w = write(PAL_OS_STDOUT_FD, data + off, n - off)
+        if w <= 0 {
+            return
+        }
+        off += usize(w)
+    }
+}
+
+pub fn pal_write_stderr(data: *const u8, n: usize) {
+    var off: usize = 0
+    loop off < n {
+        var w = write(PAL_OS_STDERR_FD, data + off, n - off)
+        if w <= 0 {
+            return
+        }
+        off += usize(w)
+    }
+}
+
+pub fn pal_read_stdin(buf: *u8, n: usize): i64 {
+    var r = read(PAL_OS_STDIN_FD, buf, n)
+    if r < 0 {
+        return -1
+    }
+    return i64(r)
+}
+
+pub fn pal_cmd_line(): str {
+    ensure_linux_cmdline()
+    if g_linux_cmdline_str == null || g_linux_cmdline_str_len <= 0 {
+        return ""
+    }
+    return str_from_ptr(g_linux_cmdline_str, usize(g_linux_cmdline_str_len))
+}
+
+pub fn pal_use_parsed_args(): bool {
+    return false
+}
+
+pub fn pal_arg_count(): i32 {
+    ensure_linux_cmdline()
+    if g_linux_cmdline_raw == null || g_linux_cmdline_len <= 0 {
+        return 0
+    }
+    var count: i32 = 0
+    var i: i64 = 0
+    loop i < g_linux_cmdline_len {
+        count += 1
+        loop i < g_linux_cmdline_len && g_linux_cmdline_raw[i] != 0 {
+            i += 1
+        }
+        i += 1
+    }
+    return count
+}
+
+pub fn pal_arg_at(index: i32): str {
+    ensure_linux_cmdline()
+    if index < 0 || g_linux_cmdline_raw == null || g_linux_cmdline_len <= 0 {
+        return ""
+    }
+    var cur: i32 = 0
+    var i: i64 = 0
+    loop i < g_linux_cmdline_len {
+        var start = i
+        loop i < g_linux_cmdline_len && g_linux_cmdline_raw[i] != 0 {
+            i += 1
+        }
+        if cur == index {
+            return str_from_ptr(g_linux_cmdline_raw + usize(start), usize(i - start))
+        }
+        cur += 1
+        i += 1
+    }
+    return ""
+}
+
+pub fn pal_getenv_into(name: *const u8, buf: *u8, cap: usize): i64 {
+    var val = getenv(name)
+    if val == null {
+        return -1
+    }
+    var n = cstr_len(val)
+    if n >= cap {
+        return -1
+    }
+    if n > 0 {
+        copy_mem(buf, val, n)
+    }
+    buf[n] = 0
+    return i64(n)
+}
+
+pub fn pal_cwd_into(buf: *u8, cap: usize): i64 {
+    if getcwd(buf, cap) == null {
+        return -1
+    }
+    return i64(cstr_len(buf))
+}

@@ -1,0 +1,145 @@
+// =============================================================================
+// Antimony PAL: std/pal/io_linux.sb
+// Linux POSIX file descriptor I/O primitives via libc.so.6.
+// Valid handles are stored as `fd + 1` so zero-initialized `File {}` is closed
+// while still supporting fd 0 cleanly.
+// =============================================================================
+
+const O_RDONLY: i32 = 0
+const O_WRONLY: i32 = 1
+const O_RDWR: i32 = 2
+const O_CREAT: i32 = 0x40
+const O_TRUNC: i32 = 0x200
+const O_APPEND: i32 = 0x400
+
+const SEEK_SET: i32 = 0
+const SEEK_CUR: i32 = 1
+const SEEK_END: i32 = 2
+
+const ERRNO_EPERM: u32 = 1
+const ERRNO_ENOENT: u32 = 2
+const ERRNO_EINTR: i32 = 4
+const ERRNO_EACCES: u32 = 13
+const ERRNO_EEXIST: u32 = 17
+const ERRNO_EINVAL: u32 = 22
+const ERRNO_EPIPE: u32 = 32
+
+priv extern "libc.so.6" {
+    fn open(path: *const u8, flags: i32, mode: u32): i32
+    fn read(fd: i32, buf: *u8, count: usize): isize
+    fn write(fd: i32, buf: *const u8, count: usize): isize
+    fn lseek(fd: i32, offset: i64, whence: i32): i64
+    fn fsync(fd: i32): i32
+    fn close(fd: i32): i32
+    fn unlink(path: *const u8): i32
+    fn __errno_location(): *i32
+}
+
+pub const PAL_INVALID_HANDLE: isize = -1
+
+pub fn pal_file_open(path: *const u8, mode: i32): isize {
+    var flags = O_RDONLY
+    if mode == 1 {
+        flags = O_WRONLY | O_CREAT | O_TRUNC
+    } else if mode == 2 {
+        flags = O_WRONLY | O_CREAT | O_APPEND
+    } else if mode == 3 {
+        flags = O_RDWR | O_CREAT
+    }
+    var fd = open(path, flags, 0x1A4)
+    if fd < 0 {
+        return PAL_INVALID_HANDLE
+    }
+    return isize(fd) + 1
+}
+
+pub fn pal_file_is_open(handle: isize): bool {
+    return handle > 0
+}
+
+pub fn pal_file_read(handle: isize, buf: *u8, count: usize): i64 {
+    var fd = i32(handle - 1)
+    loop {
+        var n = read(fd, buf, count)
+        if n < 0 {
+            if *__errno_location() == ERRNO_EINTR {
+                continue
+            }
+            return -1
+        }
+        return i64(n)
+    }
+}
+
+pub fn pal_file_write(handle: isize, data: *const u8, count: usize): i64 {
+    var fd = i32(handle - 1)
+    loop {
+        var n = write(fd, data, count)
+        if n < 0 {
+            if *__errno_location() == ERRNO_EINTR {
+                continue
+            }
+            return -1
+        }
+        return i64(n)
+    }
+}
+
+pub fn pal_file_seek(handle: isize, offset: i64, whence: i32): i64 {
+    var fd = i32(handle - 1)
+    var w = SEEK_SET
+    if whence == 1 {
+        w = SEEK_CUR
+    } else if whence == 2 {
+        w = SEEK_END
+    }
+    return lseek(fd, offset, w)
+}
+
+pub fn pal_file_size(handle: isize): i64 {
+    var fd = i32(handle - 1)
+    var cur = lseek(fd, 0, SEEK_CUR)
+    if cur < 0 {
+        return -1
+    }
+    var end = lseek(fd, 0, SEEK_END)
+    if end < 0 {
+        return -1
+    }
+    lseek(fd, cur, SEEK_SET)
+    return end
+}
+
+pub fn pal_file_flush(handle: isize): bool {
+    var fd = i32(handle - 1)
+    return fsync(fd) == 0
+}
+
+pub fn pal_file_close(handle: isize) {
+    if handle > 0 {
+        close(i32(handle - 1))
+    }
+}
+
+pub fn pal_delete_file(path: *const u8): bool {
+    return unlink(path) == 0
+}
+
+pub fn pal_last_os_error(): u32 {
+    var e = *__errno_location()
+    if e < 0 {
+        return 0
+    }
+    return u32(e)
+}
+
+pub fn pal_classify_os_error(code: u32): i32 {
+    match code {
+        ERRNO_ENOENT { return 1 }
+        ERRNO_EACCES, ERRNO_EPERM { return 2 }
+        ERRNO_EEXIST { return 3 }
+        ERRNO_EINVAL { return 4 }
+        ERRNO_EPIPE { return 5 }
+        else { return 0 }
+    }
+}

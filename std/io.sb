@@ -1,54 +1,20 @@
 // =============================================================================
 // Antimony Standard Library: std/io.sb
-// Native Win32 file I/O (`File`, `IoError`, `SeekFrom`, `Result`-based APIs,
+// Cross-platform file I/O (`File`, `IoError`, `SeekFrom`, `Result`-based APIs,
 // plus zero-overhead low-level helpers).
 // =============================================================================
 
 import "std/core.sb"
 import "std/mem.sb"
 import "std/str.sb"
+import "std/pal/io.sb"
 
-const GENERIC_READ: u32          = 0x80000000
-const GENERIC_WRITE: u32         = 0x40000000
-const FILE_APPEND_DATA: u32      = 0x00000004
-const FILE_SHARE_READ: u32       = 1
-const FILE_SHARE_WRITE: u32      = 2
-const CREATE_ALWAYS: u32         = 2
-const OPEN_EXISTING: u32         = 3
-const OPEN_ALWAYS: u32           = 4
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80
-const INVALID_HANDLE_VALUE: isize = -1
-
-const FILE_BEGIN: u32   = 0
-const FILE_CURRENT: u32 = 1
-const FILE_END: u32     = 2
-
-const WIN32_ERR_FILE_NOT_FOUND: u32  = 2
-const WIN32_ERR_PATH_NOT_FOUND: u32  = 3
-const WIN32_ERR_ACCESS_DENIED: u32   = 5
-const WIN32_ERR_FILE_EXISTS: u32     = 80
-const WIN32_ERR_BROKEN_PIPE: u32     = 109
-const WIN32_ERR_ALREADY_EXISTS: u32  = 183
-
-priv extern "kernel32.dll" {
-    fn CreateFileA(
-        lpFileName: *const u8,
-        dwDesiredAccess: u32,
-        dwShareMode: u32,
-        lpSecurityAttributes: usize,
-        dwCreationDisposition: u32,
-        dwFlagsAndAttributes: u32,
-        hTemplateFile: usize
-    ): isize
-    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
-    fn WriteFile(hFile: isize, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *u32, lpOverlapped: usize): i32
-    fn GetFileSizeEx(hFile: isize, lpFileSize: *i64): i32
-    fn SetFilePointerEx(hFile: isize, liDistanceToMove: i64, lpNewFilePointer: *i64, dwMoveMethod: u32): i32
-    fn FlushFileBuffers(hFile: isize): i32
-    fn CloseHandle(hObject: isize): i32
-    fn DeleteFileA(lpFileName: *const u8): i32
-    fn GetLastError(): u32
-}
+const WIN32_ERR_FILE_NOT_FOUND: u32 = 2
+const WIN32_ERR_PATH_NOT_FOUND: u32 = 3
+const WIN32_ERR_ACCESS_DENIED: u32 = 5
+const WIN32_ERR_FILE_EXISTS: u32 = 80
+const WIN32_ERR_BROKEN_PIPE: u32 = 109
+const WIN32_ERR_ALREADY_EXISTS: u32 = 183
 
 // -----------------------------------------------------------------------------
 // Structured I/O Error & Seek Types
@@ -67,22 +33,33 @@ pub enum IoError {
 pub fn io_error_from_win32(code: u32): IoError {
     match code {
         WIN32_ERR_FILE_NOT_FOUND, WIN32_ERR_PATH_NOT_FOUND { return .NotFound }
-        WIN32_ERR_ACCESS_DENIED                            { return .PermissionDenied }
-        WIN32_ERR_FILE_EXISTS, WIN32_ERR_ALREADY_EXISTS    { return .AlreadyExists }
-        WIN32_ERR_BROKEN_PIPE                              { return .BrokenPipe }
-        else                                               { return .OsError(code) }
+        WIN32_ERR_ACCESS_DENIED { return .PermissionDenied }
+        WIN32_ERR_FILE_EXISTS, WIN32_ERR_ALREADY_EXISTS { return .AlreadyExists }
+        WIN32_ERR_BROKEN_PIPE { return .BrokenPipe }
+        else { return .OsError(code) }
+    }
+}
+
+pub fn io_error_from_os(code: u32): IoError {
+    match pal_classify_os_error(code) {
+        1 { return .NotFound }
+        2 { return .PermissionDenied }
+        3 { return .AlreadyExists }
+        4 { return .InvalidInput }
+        5 { return .BrokenPipe }
+        else { return .OsError(code) }
     }
 }
 
 pub fn (e: IoError) message(): str {
     match e {
-        .NotFound         { return "file or path not found" }
+        .NotFound { return "file or path not found" }
         .PermissionDenied { return "permission denied" }
-        .AlreadyExists    { return "already exists" }
-        .InvalidInput     { return "invalid input" }
-        .BrokenPipe       { return "broken pipe" }
-        .UnexpectedEof    { return "unexpected end of file" }
-        .OsError(_)       { return "OS I/O error" }
+        .AlreadyExists { return "already exists" }
+        .InvalidInput { return "invalid input" }
+        .BrokenPipe { return "broken pipe" }
+        .UnexpectedEof { return "unexpected end of file" }
+        .OsError(_) { return "OS I/O error" }
     }
 }
 
@@ -100,7 +77,7 @@ pub struct File {
     handle: isize
 }
 
-priv fn open_win32_file(path: str, access: u32, share: u32, disposition: u32): Result[File, IoError] {
+priv fn open_file_mode(path: str, mode: i32): Result[File, IoError] {
     if len(path) == 0 {
         return .Err(.InvalidInput)
     }
@@ -108,35 +85,35 @@ priv fn open_win32_file(path: str, access: u32, share: u32, disposition: u32): R
     pb.init(usize(len(path)) + 1)
     defer pb.free()
     pb.append(path)
-    var h = CreateFileA(pb.cstr(), access, share, 0, disposition, FILE_ATTRIBUTE_NORMAL, 0)
-    if h == INVALID_HANDLE_VALUE {
-        return .Err(io_error_from_win32(GetLastError()))
+    var h = pal_file_open(pb.cstr(), mode)
+    if !pal_file_is_open(h) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(File { handle: h })
 }
 
 // Opens an existing file for reading.
 pub fn file_open(path: str): Result[File, IoError] {
-    return open_win32_file(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING)
+    return open_file_mode(path, 0)
 }
 
 // Creates a new file (or truncates an existing one) for writing.
 pub fn file_create(path: str): Result[File, IoError] {
-    return open_win32_file(path, GENERIC_WRITE, FILE_SHARE_READ, CREATE_ALWAYS)
+    return open_file_mode(path, 1)
 }
 
 // Opens a file for appending (creating it if it does not exist).
 pub fn file_open_append(path: str): Result[File, IoError] {
-    return open_win32_file(path, FILE_APPEND_DATA, FILE_SHARE_READ, OPEN_ALWAYS)
+    return open_file_mode(path, 2)
 }
 
 // Opens a file for reading and writing (creating it if it does not exist).
 pub fn file_open_rw(path: str): Result[File, IoError] {
-    return open_win32_file(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, OPEN_ALWAYS)
+    return open_file_mode(path, 3)
 }
 
 pub fn (f: *File) is_open(): bool {
-    return f.handle != INVALID_HANDLE_VALUE && f.handle != 0
+    return pal_file_is_open(f.handle)
 }
 
 pub fn (f: *File) read(buf[]: u8): Result[i64, IoError] {
@@ -146,15 +123,11 @@ pub fn (f: *File) read(buf[]: u8): Result[i64, IoError] {
     if len(buf) == 0 {
         return .Ok(0)
     }
-    var chunk = len(buf)
-    if chunk > 0x7FFF_FFFF {
-        chunk = 0x7FFF_FFFF
+    var nread = pal_file_read(f.handle, &buf[0], usize(len(buf)))
+    if nread < 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    var nread: u32 = 0
-    if ReadFile(f.handle, &buf[0], u32(chunk), &nread, 0) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
-    }
-    return .Ok(i64(nread))
+    return .Ok(nread)
 }
 
 pub fn (f: *File) write(data[]: const u8): Result[i64, IoError] {
@@ -164,15 +137,11 @@ pub fn (f: *File) write(data[]: const u8): Result[i64, IoError] {
     if len(data) == 0 {
         return .Ok(0)
     }
-    var chunk = len(data)
-    if chunk > 0x7FFF_FFFF {
-        chunk = 0x7FFF_FFFF
+    var written = pal_file_write(f.handle, &data[0], usize(len(data)))
+    if written < 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    var written: u32 = 0
-    if WriteFile(f.handle, &data[0], u32(chunk), &written, 0) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
-    }
-    return .Ok(i64(written))
+    return .Ok(written)
 }
 
 pub fn (f: *File) write_all(data[]: const u8): Result[i64, IoError] {
@@ -201,24 +170,24 @@ pub fn (f: *File) seek(pos: SeekFrom): Result[i64, IoError] {
         return .Err(.InvalidInput)
     }
     var dist: i64 = 0
-    var method: u32 = FILE_BEGIN
+    var whence: i32 = 0
     match pos {
         .Start(o) {
             dist = o
-            method = FILE_BEGIN
+            whence = 0
         }
         .Current(o) {
             dist = o
-            method = FILE_CURRENT
+            whence = 1
         }
         .End(o) {
             dist = o
-            method = FILE_END
+            whence = 2
         }
     }
-    var new_pos: i64 = 0
-    if SetFilePointerEx(f.handle, dist, &new_pos, method) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    var new_pos = pal_file_seek(f.handle, dist, whence)
+    if new_pos < 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(new_pos)
 }
@@ -227,9 +196,9 @@ pub fn (f: *File) size(): Result[i64, IoError] {
     if !f.is_open() {
         return .Err(.InvalidInput)
     }
-    var sz: i64 = 0
-    if GetFileSizeEx(f.handle, &sz) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    var sz = pal_file_size(f.handle)
+    if sz < 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(sz)
 }
@@ -238,16 +207,16 @@ pub fn (f: *File) flush(): Result[bool, IoError] {
     if !f.is_open() {
         return .Err(.InvalidInput)
     }
-    if FlushFileBuffers(f.handle) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_file_flush(f.handle) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
 
 pub fn (f: *File) close() {
     if f.is_open() {
-        CloseHandle(f.handle)
-        f.handle = INVALID_HANDLE_VALUE
+        pal_file_close(f.handle)
+        f.handle = PAL_INVALID_HANDLE
     }
 }
 
@@ -291,14 +260,24 @@ pub fn write_file_all(path: str, content: str): Result[i64, IoError] {
 
 // Writes `n` bytes from `data` to `path` (creating or overwriting the file).
 pub fn write_file_ptr(path: *const u8, data: *const u8, n: u32): bool {
-    var h = CreateFileA(path, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0)
-    if h == INVALID_HANDLE_VALUE {
+    var h = pal_file_open(path, 1)
+    if !pal_file_is_open(h) {
         return false
     }
-    defer CloseHandle(h)
-    var written: u32 = 0
-    var ok = WriteFile(h, data, n, &written, 0)
-    return ok != 0 && written == n
+    defer pal_file_close(h)
+    if n == 0 {
+        return true
+    }
+    var off: usize = 0
+    var total = usize(n)
+    loop off < total {
+        var w = pal_file_write(h, data + off, total - off)
+        if w <= 0 {
+            return false
+        }
+        off += usize(w)
+    }
+    return true
 }
 
 // Writes a byte slice `data[]` to `path`.
@@ -319,16 +298,12 @@ pub fn write_file_str(path: *const u8, content: str): bool {
 
 // Returns the size in bytes of `path`, or -1 if the file cannot be opened.
 pub fn file_size(path: *const u8): i64 {
-    var h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
-    if h == INVALID_HANDLE_VALUE {
+    var h = pal_file_open(path, 0)
+    if !pal_file_is_open(h) {
         return -1
     }
-    defer CloseHandle(h)
-    var sz: i64 = 0
-    if GetFileSizeEx(h, &sz) == 0 {
-        return -1
-    }
-    return sz
+    defer pal_file_close(h)
+    return pal_file_size(h)
 }
 
 // Reads up to `len(buf)` bytes from `path` into `buf[]`. Returns bytes read, or -1 on error.
@@ -336,19 +311,15 @@ pub fn read_file_into(path: *const u8, buf[]: u8): i64 {
     if len(buf) == 0 {
         return 0
     }
-    var h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0)
-    if h == INVALID_HANDLE_VALUE {
+    var h = pal_file_open(path, 0)
+    if !pal_file_is_open(h) {
         return -1
     }
-    defer CloseHandle(h)
-    var nread: u32 = 0
-    if ReadFile(h, &buf[0], u32(len(buf)), &nread, 0) == 0 {
-        return -1
-    }
-    return i64(nread)
+    defer pal_file_close(h)
+    return pal_file_read(h, &buf[0], usize(len(buf)))
 }
 
 // Deletes the file at `path`; returns true on success.
 pub fn delete_file(path: *const u8): bool {
-    return DeleteFileA(path) != 0
+    return pal_delete_file(path)
 }

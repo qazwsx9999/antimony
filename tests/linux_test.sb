@@ -1,9 +1,9 @@
 // =============================================================================
 // tests/linux_test.sb - Cross-Platform Language & Standard Library Unit Tests
-// Exercises all 17 cross-platform std/ modules identically on Linux x64 and
+// Exercises all 21 cross-platform std/ modules identically on Linux x64 and
 // Windows x64:
 //   core, mem, vec, map, set, deque, heap, sort, str, path, math, time,
-//   rand, encoding, hash, json, testing
+//   rand, encoding, hash, json, io, bufio, fs, os, testing
 //
 // Run with:
 //   sbc test tests/linux_test.sb
@@ -26,6 +26,10 @@ import "std/rand.sb"
 import "std/encoding.sb"
 import "std/hash.sb"
 import "std/json.sb"
+import "std/io.sb"
+import "std/bufio.sb"
+import "std/fs.sb"
+import "std/os.sb"
 import "std/testing.sb"
 
 struct Vec2 {
@@ -320,4 +324,130 @@ fn test_encoding_hash_and_json() {
     doc.stringify(root, &out)
     assert_eq(out.as_str(), `{"os":"linux-x64","ok":true,"nums":[1,2,3]}`, "json stringify")
     assert_err(json_parse(`{"bad": }`, &doc), "malformed json")
+}
+
+fn test_io_bufio_fs_and_os() {
+    // OS: cwd, args, env
+    var cwd_buf[512]: u8 = []
+    var cwd = assert_some(cwd_into(cwd_buf), "cwd_into")
+    assert_true(len(cwd) > 0, "cwd non-empty")
+    assert_true(arg_count() >= 1, "arg_count >= 1")
+    assert_true(len(arg_at(0)) > 0, "arg_at(0) non-empty")
+    assert_true(len(cmd_line()) > 0, "cmd_line non-empty")
+
+    var env_buf[4096]: u8 = []
+    var path_env = assert_some(getenv_str("PATH", env_buf), "getenv PATH")
+    assert_true(len(path_env) > 0, "PATH non-empty")
+    assert_none(getenv_str("__ANTIMONY_DEFINITELY_UNSET_99__", env_buf), "unset env")
+
+    // FS + IO: mkdir, write, read, seek, append, copy, rename, read_dir, remove
+    var dir = "sb_cross_io_tmp"
+    var f1 = "sb_cross_io_tmp/a.txt"
+    var f2 = "sb_cross_io_tmp/b.txt"
+    var f3 = "sb_cross_io_tmp/c.txt"
+    var f4 = "sb_cross_io_tmp/lines.txt"
+
+    if !fs_exists(dir) {
+        assert_ok(fs_mkdir(dir), "fs_mkdir")
+    }
+    assert_true(fs_exists(dir), "dir exists")
+    assert_true(fs_is_dir(dir), "dir is_dir")
+    assert_false(fs_is_file(dir), "dir not is_file")
+
+    assert_ok(write_file_all(f1, "hello cross-platform\n"), "write_file_all")
+    assert_true(fs_is_file(f1), "f1 is_file")
+    assert_false(fs_is_dir(f1), "f1 not is_dir")
+
+    var af = assert_ok(file_open_append(f1), "file_open_append")
+    assert_ok(af.write_str("second line\n"), "append write")
+    assert_ok(af.flush(), "file flush")
+    af.close()
+
+    var content: StringBuilder
+    content.init(64)
+    defer content.free()
+    var nread = assert_ok(read_file_all(f1, &content), "read_file_all")
+    assert_eq(nread, i64(33), "read_file_all len")
+    assert_eq(content.as_str(), "hello cross-platform\nsecond line\n", "read_file_all text")
+
+    var rf = assert_ok(file_open(f1), "file_open")
+    assert_eq(assert_ok(rf.size(), "file size"), i64(33), "file size val")
+    assert_eq(assert_ok(rf.seek(.Start(6)), "seek start"), i64(6), "seek pos")
+    var slice_buf[5]: u8 = []
+    assert_eq(assert_ok(rf.read(slice_buf), "read 5"), i64(5), "read 5 len")
+    assert_eq(str(slice_buf), "cross", "seek+read text")
+    rf.close()
+
+    assert_ok(fs_copy(f1, f2), "fs_copy")
+    assert_true(fs_exists(f2), "f2 exists after copy")
+    assert_ok(fs_rename(f2, f3), "fs_rename")
+    assert_false(fs_exists(f2), "f2 gone after rename")
+    assert_true(fs_exists(f3), "f3 exists after rename")
+
+    // Missing file returns .Err(.NotFound)
+    match file_open("sb_cross_io_tmp/does_not_exist.txt") {
+        .Ok(_) { assert_true(false, "expected NotFound error") }
+        .Err(e) {
+            match e {
+                .NotFound {}
+                else { assert_true(false, "expected IoError.NotFound") }
+            }
+        }
+    }
+
+    // BufWriter + BufReader
+    var bwf = assert_ok(file_create(f4), "bufio file_create")
+    var bw: BufWriter
+    bw.init(&bwf, 16)
+    defer bw.free()
+    assert_ok(bw.write_str("one\r\ntwo\nthree"), "bw write")
+    assert_ok(bw.flush(), "bw flush")
+    bwf.close()
+
+    var brf = assert_ok(file_open(f4), "bufio file_open")
+    var br: BufReader
+    br.init(&brf, 16)
+    defer br.free()
+    var line: StringBuilder
+    line.init(32)
+    defer line.free()
+    assert_true(assert_ok(br.read_line(&line), "line 1"), "has line 1")
+    assert_eq(line.as_str(), "one", "line 1 val")
+    assert_true(assert_ok(br.read_line(&line), "line 2"), "has line 2")
+    assert_eq(line.as_str(), "two", "line 2 val")
+    assert_true(assert_ok(br.read_line(&line), "line 3"), "has line 3")
+    assert_eq(line.as_str(), "three", "line 3 val")
+    assert_false(assert_ok(br.read_line(&line), "eof"), "at eof")
+    brf.close()
+
+    // Directory iteration
+    var it = assert_ok(fs_read_dir(dir), "fs_read_dir")
+    var entry = DirEntry {}
+    var seen_a = false
+    var seen_c = false
+    var seen_lines = false
+    var count: i64 = 0
+    loop assert_ok(it.next(&entry), "dir next") {
+        count += 1
+        var nm = entry.name()
+        if nm == "a.txt" {
+            seen_a = true
+            assert_false(entry.is_dir, "a.txt not dir")
+            assert_eq(entry.size, i64(33), "a.txt size")
+        } else if nm == "c.txt" {
+            seen_c = true
+        } else if nm == "lines.txt" {
+            seen_lines = true
+        }
+    }
+    it.close()
+    assert_eq(count, i64(3), "dir entry count")
+    assert_true(seen_a && seen_c && seen_lines, "dir entries found")
+
+    // Cleanup
+    assert_ok(fs_remove_file(f1), "rm f1")
+    assert_ok(fs_remove_file(f3), "rm f3")
+    assert_ok(fs_remove_file(f4), "rm f4")
+    assert_ok(fs_rmdir(dir), "rmdir")
+    assert_false(fs_exists(dir), "dir cleaned up")
 }
