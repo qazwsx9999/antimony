@@ -7,11 +7,6 @@
 import "std/core.sb"
 import "std/mem.sb"
 
-priv extern "msvcrt.dll" {
-    fn strlen(s: *const u8): usize
-    fn strcmp(a: *const u8, b: *const u8): i32
-}
-
 pub enum ParseError {
     Empty
     InvalidDigit
@@ -31,7 +26,7 @@ pub fn cstr_to_str(s: *const u8): str {
     if s == null {
         return ""
     }
-    var n = strlen(s)
+    var n = cstr_len(s)
     if n == 0 {
         return ""
     }
@@ -42,7 +37,11 @@ pub fn cstr_len(s: *const u8): usize {
     if s == null {
         return 0
     }
-    return strlen(s)
+    var n: usize = 0
+    loop s[n] != 0 {
+        n += 1
+    }
+    return n
 }
 
 pub fn cstr_eq(a: *const u8, b: *const u8): bool {
@@ -52,7 +51,14 @@ pub fn cstr_eq(a: *const u8, b: *const u8): bool {
     if a == null || b == null {
         return false
     }
-    return strcmp(a, b) == 0
+    var i: usize = 0
+    loop a[i] == b[i] {
+        if a[i] == 0 {
+            return true
+        }
+        i += 1
+    }
+    return false
 }
 
 // -----------------------------------------------------------------------------
@@ -288,8 +294,8 @@ pub fn str_split_once(s: str, sep: str): Option[SplitPair] {
         return .None
     }
     return .Some(SplitPair {
-        before: s[0..idx],
-        after: s[idx + len(sep)..len(s)]
+            before: s[0..idx],
+            after: s[idx + len(sep)..len(s)]
     })
 }
 

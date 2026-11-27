@@ -1,0 +1,20 @@
+// =============================================================================
+// Antimony PAL: std/pal/rand_linux.sb
+// Linux glibc getrandom(2) CSPRNG primitive.
+// =============================================================================
+
+priv extern "libc.so.6" {
+    fn getrandom(buf: *u8, buflen: usize, flags: u32): isize
+}
+
+pub fn pal_os_random_bytes(buf: *u8, n: usize): bool {
+    var done: usize = 0
+    loop done < n {
+        var got = getrandom(buf + done, n - done, 0)
+        if got <= 0 {
+            return false
+        }
+        done += usize(got)
+    }
+    return true
+}

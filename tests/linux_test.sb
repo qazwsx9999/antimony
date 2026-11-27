@@ -1,11 +1,32 @@
 // =============================================================================
-// tests/linux_test.sb - Cross-platform core language & stdlib unit tests
-// Runs identically on both Linux x64 (`sbc test tests/linux_test.sb`) and
-// Windows x64 (`sbc test tests\linux_test.sb`).
+// tests/linux_test.sb - Cross-Platform Language & Standard Library Unit Tests
+// Exercises all 17 cross-platform std/ modules identically on Linux x64 and
+// Windows x64:
+//   core, mem, vec, map, set, deque, heap, sort, str, path, math, time,
+//   rand, encoding, hash, json, testing
+//
+// Run with:
+//   sbc test tests/linux_test.sb
+//   sbc test tests/linux_test.sb --release
 // =============================================================================
 
 import "std/core.sb"
+import "std/mem.sb"
+import "std/vec.sb"
+import "std/map.sb"
+import "std/set.sb"
+import "std/deque.sb"
+import "std/heap.sb"
 import "std/sort.sb"
+import "std/str.sb"
+import "std/path.sb"
+import "std/math.sb"
+import "std/time.sb"
+import "std/rand.sb"
+import "std/encoding.sb"
+import "std/hash.sb"
+import "std/json.sb"
+import "std/testing.sb"
 
 struct Vec2 {
     x: i64
@@ -41,54 +62,262 @@ fn apply_op(a: i32, b: i32, op: fn(i32, i32): i32): i32 {
     return op(a, b)
 }
 
-fn test_structs_methods_and_swap() {
+fn test_core_language_and_try() {
     var p = Vec2 { x: 3, y: 4 }
     p.add(1, 2)
-    assert(p.x == 4 && p.y == 6, "Vec2.add")
-    assert(p.dot(Vec2 { x: 2, y: 3 }) == 26, "Vec2.dot")
+    assert_eq(p.x, i64(4), "Vec2.x")
+    assert_eq(p.y, i64(6), "Vec2.y")
+    assert_eq(p.dot(Vec2 { x: 2, y: 3 }), i64(26), "Vec2.dot")
 
     var a: i64 = 100
     var b: i64 = 200
     swap(&a, &b)
-    assert(a == 200 && b == 100, "swap")
-}
+    assert_eq(a, i64(200), "swap a")
+    assert_eq(b, i64(100), "swap b")
 
-fn test_result_option_and_try() {
-    var ok_v = compute_ratio(20, 4).unwrap_or(-1)
-    var err_v = compute_ratio(20, 0).unwrap_or(-1)
-    assert(ok_v == 10 && err_v == -1, "Result ? propagation")
+    assert_eq(assert_ok(compute_ratio(20, 4), "ratio ok"), i64(10), "ratio val")
+    assert_err(compute_ratio(20, 0), "ratio div0")
 
     var o1: Option[str] = .Some("linux-and-windows")
     var o2: Option[str] = .None
-    assert(o1.is_some() && o1.unwrap_or("") == "linux-and-windows", "Option Some")
-    assert(o2.is_none() && o2.unwrap_or("def") == "def", "Option None")
-}
-
-fn test_generics_sort_and_closures() {
-    var arr[7]: i32 = [9, 1, 5, 3, 5, 8, 2]
-    sort(arr)
-    assert(is_sorted(arr), "sort ascending")
-    assert(lower_bound(arr, 5) == 3 && upper_bound(arr, 5) == 5, "bounds")
-    assert(binary_search(arr, 8) == 5, "binary_search")
-
-    sort_desc(arr)
-    assert(arr[0] == 9 && arr[6] == 1, "sort_desc")
+    assert_eq(assert_some(o1, "opt some"), "linux-and-windows", "opt val")
+    assert_none(o2, "opt none")
 
     var res = apply_op(6, 7, fn(x: i32, y: i32): i32 { return x * y })
-    assert(res == 42, "anonymous fn ptr")
-}
+    assert_eq(res, 42, "anonymous fn ptr")
 
-fn test_atomics_and_defer() {
     var counter: i64 = 10
     var prev = atomic_add(&counter, 5)
-    assert(prev == 10 && atomic_load(&counter) == 15, "atomic_add")
-    var cas_prev = atomic_cas(&counter, 15, 99)
-    assert(cas_prev == 15 && atomic_load(&counter) == 99, "atomic_cas")
+    assert_eq(prev, i64(10), "atomic_add prev")
+    assert_eq(atomic_load(&counter), i64(15), "atomic_load")
+    assert_eq(atomic_cas(&counter, 15, 99), i64(15), "atomic_cas prev")
+    assert_eq(atomic_load(&counter), i64(99), "atomic_cas val")
 
     var log: i32 = 0
     if true {
         defer { log = log * 10 + 1 }
         defer { log = log * 10 + 2 }
     }
-    assert(log == 21, "defer LIFO")
+    assert_eq(log, 21, "defer LIFO")
+}
+
+fn test_mem_and_arena() {
+    var buf = alloc(32)
+    assert_true(buf != null, "alloc non-null")
+    defer free_mem(buf)
+    assert_eq(buf[0], u8(0), "alloc zero-init 0")
+    assert_eq(buf[31], u8(0), "alloc zero-init 31")
+
+    set_mem(buf, 0x5A, 16)
+    assert_eq(buf[0], u8(0x5A), "set_mem 0")
+    assert_eq(buf[15], u8(0x5A), "set_mem 15")
+    assert_eq(buf[16], u8(0), "set_mem 16 untouched")
+
+    copy_mem(buf + 16, buf, 16)
+    assert_true(eq_mem(buf, buf + 16, 16), "copy_mem + eq_mem")
+
+    var resized = realloc_mem(buf, 64)
+    assert_true(resized != null, "realloc_mem")
+    buf = resized
+    assert_eq(buf[0], u8(0x5A), "realloc preserves prefix")
+
+    var arena: Arena
+    arena.init(256)
+    defer arena.free()
+    var p1 = arena.alloc(24, 8)
+    var p2 = arena.alloc(40, 16)
+    assert_true(p1 != null && p2 != null, "arena allocs")
+    assert_true(arena.remaining() < 256, "arena remaining decreased")
+}
+
+fn test_collections_and_sort() {
+    // Vec
+    var v: Vec[i32]
+    v.init(2)
+    defer v.free()
+    var seed[3]: i32 = [10, 20, 30]
+    v.extend_slice(seed)
+    v.insert(1, 15)
+    assert_eq(v.remove(1), 15, "vec remove")
+    assert_eq(v.swap_remove(0), 10, "vec swap_remove")
+    assert_eq(v.len, i64(2), "vec len")
+    assert_none(v.try_get(99), "vec oob")
+
+    // HashMap
+    var m: HashMap[str, i64]
+    m.init(8)
+    defer m.free()
+    m.put("alpha", 1)
+    m.put("beta", 2)
+    assert_eq(assert_some(m.get("beta"), "map get"), i64(2), "map val")
+    var ptr = m.get_ptr("alpha")
+    *ptr = 99
+    assert_eq(assert_some(m.take("alpha"), "map take"), i64(99), "map take val")
+    assert_false(m.contains("alpha"), "map removed")
+
+    // HashSet
+    var hs: HashSet[i32]
+    hs.init(8)
+    defer hs.free()
+    assert_true(hs.insert(5), "set insert")
+    assert_false(hs.insert(5), "set dup")
+    assert_true(hs.contains(5), "set contains")
+    assert_true(hs.remove(5), "set remove")
+
+    // Deque
+    var dq: Deque[i32]
+    dq.init(4)
+    defer dq.free()
+    dq.push_back(2)
+    dq.push_front(1)
+    dq.push_back(3)
+    assert_eq(assert_some(dq.pop_front(), "dq front"), 1, "dq front val")
+    assert_eq(assert_some(dq.pop_back(), "dq back"), 3, "dq back val")
+
+    // BinaryHeap & MinHeap
+    var maxh: BinaryHeap[i32]
+    maxh.init(4)
+    defer maxh.free()
+    var minh: MinHeap[i32]
+    minh.init(4)
+    defer minh.free()
+    var nums[5]: i32 = [4, 1, 9, 2, 7]
+    loop x in nums {
+        maxh.push(x)
+        minh.push(x)
+    }
+    assert_eq(assert_some(maxh.pop(), "maxh"), 9, "maxh top")
+    assert_eq(assert_some(minh.pop(), "minh"), 1, "minh top")
+
+    // Sort & binary search
+    var arr[7]: i32 = [9, 1, 5, 3, 5, 8, 2]
+    sort(arr)
+    assert_true(is_sorted(arr), "sort ascending")
+    assert_eq(lower_bound(arr, 5), i64(3), "lower_bound")
+    assert_eq(upper_bound(arr, 5), i64(5), "upper_bound")
+    assert_eq(binary_search(arr, 8), i64(5), "binary_search")
+    sort_desc(arr)
+    assert_eq(arr[0], 9, "sort_desc first")
+    assert_eq(arr[6], 1, "sort_desc last")
+}
+
+fn test_str_and_path() {
+    assert_true(str_contains("antimony-cross", "cross"), "str_contains")
+    assert_str_contains("antimony-linux-x64", "linux", "assert_str_contains")
+    assert_eq(str_count("ababa", "ab"), i64(2), "str_count")
+    assert_true(str_eq_ignore_ascii_case("SbLang", "sblang"), "ignore_case")
+    assert_eq(assert_ok(try_parse_i64(" -9223372036854775808 "), "i64 min"), -9223372036854775808, "i64 min val")
+    assert_err(try_parse_u64("18446744073709551616"), "u64 overflow")
+    assert_approx(assert_ok(try_parse_f64("-3.25e2"), "f64"), -325.0, 1.0e-9, "f64 val")
+
+    var sb: StringBuilder
+    sb.init(32)
+    defer sb.free()
+    sb.append_replace("a-b-c", "-", "::")
+    sb.append(" 0x")
+    sb.append_hex(255)
+    assert_eq(sb.as_str(), "a::b::c 0xff", "sb replace+hex")
+
+    // Pure-Antimony C-string helpers (zero FFI)
+    var cs = sb.cstr()
+    assert_eq(cstr_len(cs), usize(12), "cstr_len")
+    assert_eq(cstr_to_str(cs), "a::b::c 0xff", "cstr_to_str")
+    var sb2: StringBuilder
+    sb2.init(16)
+    defer sb2.free()
+    sb2.append("a::b::c 0xff")
+    assert_true(cstr_eq(cs, sb2.cstr()), "cstr_eq true")
+    sb2.append("!")
+    assert_false(cstr_eq(cs, sb2.cstr()), "cstr_eq false")
+
+    // Path helpers
+    assert_eq(path_basename("/usr/local/bin/sbc"), "sbc", "posix basename")
+    assert_eq(path_dirname("/usr/local/bin/sbc"), "/usr/local/bin", "posix dirname")
+    assert_eq(path_extension("/src/main.sb"), ".sb", "extension")
+    assert_eq(path_stem("/src/main.sb"), "main", "stem")
+    assert_true(path_is_abs("/usr/bin"), "posix abs")
+    assert_false(path_is_abs("std/mem.sb"), "rel path")
+}
+
+fn test_math_time_and_rand() {
+    // Math (msvcrt.dll on Windows, libm.so.6 on Linux)
+    assert_approx(sqrt(144.0), 12.0, 1.0e-12, "sqrt")
+    assert_approx(sin(HALF_PI), 1.0, 1.0e-12, "sin")
+    assert_approx(cos(PI), -1.0, 1.0e-12, "cos")
+    assert_approx(pow(2.0, 10.0), 1024.0, 1.0e-12, "pow")
+    assert_approx(hypot(3.0, 4.0), 5.0, 1.0e-12, "hypot")
+    assert_approx(copysign(3.5, -1.0), -3.5, 1.0e-12, "copysign")
+    assert_approx(cbrt(-27.0), -3.0, 1.0e-12, "cbrt")
+    assert_true(is_nan(NAN), "is_nan")
+    assert_false(is_finite(INF), "is_finite INF")
+    assert_true(is_inf(NEG_INF), "is_inf NEG_INF")
+    assert_true(is_finite(42.0), "is_finite 42")
+    assert_eq(gcd(48, -18), i64(6), "gcd")
+    assert_eq(lcm(12, 18), i64(36), "lcm")
+    assert_eq(next_pow2(1000), u64(1024), "next_pow2")
+    assert_eq(ilog2(1024), 10, "ilog2")
+
+    // Time (QueryPerformanceCounter on Windows, clock_gettime on Linux)
+    assert_true(perf_freq() > 0, "perf_freq > 0")
+    var t0 = ticks_ms()
+    var sw = stopwatch_start()
+    sleep_ms(10)
+    var dt_us = sw.elapsed_us()
+    var dt_ms = sw.elapsed_ms()
+    var t1 = ticks_ms()
+    assert_true(dt_us >= 1000, "elapsed_us >= 1ms")
+    assert_true(dt_ms >= 1.0, "elapsed_ms >= 1.0")
+    assert_true(t1 >= t0, "ticks_ms monotonic")
+
+    // Rand (BCryptGenRandom on Windows, getrandom on Linux)
+    var r1 = rng_from_seed(777)
+    var r2 = rng_from_seed(777)
+    assert_eq(r1.next_u64(), r2.next_u64(), "rng deterministic")
+    var ri = r1.range_i64(10, 20)
+    assert_true(ri >= 10 && ri < 20, "rng range")
+    var rbytes[16]: u8 = []
+    assert_true(os_random_bytes(rbytes), "os csprng")
+    var os_rng = rng_from_os()
+    assert_ne(os_rng.next_u64(), u64(0), "rng_from_os")
+}
+
+fn test_encoding_hash_and_json() {
+    // Hex & Base64
+    var hb: StringBuilder
+    hb.init(32)
+    defer hb.free()
+    hex_encode_str("Hi!", &hb)
+    assert_eq(hb.as_str(), "486921", "hex encode")
+
+    var b64: StringBuilder
+    b64.init(32)
+    defer b64.free()
+    base64_encode_str("foobar", &b64)
+    assert_eq(b64.as_str(), "Zm9vYmFy", "base64 encode")
+
+    // CRC32 & SHA-256
+    assert_eq(crc32_str("123456789"), u32(0xCBF43926), "crc32 vector")
+    var dig = sha256_str("abc")
+    var sh: StringBuilder
+    sh.init(64)
+    defer sh.free()
+    dig.to_hex(&sh)
+    assert_eq(sh.as_str(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 abc")
+
+    // JSON parse & stringify round-trip
+    var doc: JsonDoc
+    doc.init()
+    defer doc.free()
+    var root = assert_ok(json_parse(`{"os":"linux-x64","ok":true,"nums":[1,2,3]}`, &doc), "json parse")
+    assert_eq(assert_some(doc.as_str(assert_some(doc.get(root, "os"), "os key")), "os str"), "linux-x64", "json os")
+    assert_true(assert_some(doc.as_bool(assert_some(doc.get(root, "ok"), "ok key")), "ok bool"), "json ok")
+    var arr = assert_some(doc.get(root, "nums"), "nums key")
+    assert_eq(assert_some(doc.as_i64(assert_some(doc.at(arr, 2), "nums[2]")), "nums[2] i64"), i64(3), "json nums[2]")
+
+    var out: StringBuilder
+    out.init(64)
+    defer out.free()
+    doc.stringify(root, &out)
+    assert_eq(out.as_str(), `{"os":"linux-x64","ok":true,"nums":[1,2,3]}`, "json stringify")
+    assert_err(json_parse(`{"bad": }`, &doc), "malformed json")
 }

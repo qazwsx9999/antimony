@@ -1,0 +1,52 @@
+// =============================================================================
+// Antimony PAL: std/pal/mem_windows.sb
+// Win32 process heap and CRT memory primitives.
+// =============================================================================
+
+const HEAP_ZERO_MEMORY: u32 = 8
+
+priv extern "kernel32.dll" {
+    fn GetProcessHeap(): usize
+    fn HeapAlloc(hHeap: usize, dwFlags: u32, dwBytes: usize): *u8
+    fn HeapReAlloc(hHeap: usize, dwFlags: u32, lpMem: *u8, dwBytes: usize): *u8
+    fn HeapFree(hHeap: usize, dwFlags: u32, lpMem: *u8): i32
+}
+
+priv extern "msvcrt.dll" {
+    fn memcpy(dst: *u8, src: *const u8, n: usize): *u8
+    fn memmove(dst: *u8, src: *const u8, n: usize): *u8
+    fn memset(dst: *u8, val: i32, n: usize): *u8
+    fn memcmp(a: *const u8, b: *const u8, n: usize): i32
+}
+
+pub fn pal_alloc(size: usize): *u8 {
+    return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size)
+}
+
+pub fn pal_alloc_uninit(size: usize): *u8 {
+    return HeapAlloc(GetProcessHeap(), 0, size)
+}
+
+pub fn pal_realloc(ptr: *u8, new_size: usize): *u8 {
+    return HeapReAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, ptr, new_size)
+}
+
+pub fn pal_free(ptr: *u8) {
+    HeapFree(GetProcessHeap(), 0, ptr)
+}
+
+pub fn pal_memcpy(dst: *u8, src: *const u8, n: usize) {
+    memcpy(dst, src, n)
+}
+
+pub fn pal_memmove(dst: *u8, src: *const u8, n: usize) {
+    memmove(dst, src, n)
+}
+
+pub fn pal_memset(dst: *u8, val: i32, n: usize) {
+    memset(dst, val, n)
+}
+
+pub fn pal_memcmp(a: *const u8, b: *const u8, n: usize): i32 {
+    return memcmp(a, b, n)
+}

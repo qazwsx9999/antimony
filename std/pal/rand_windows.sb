@@ -1,0 +1,15 @@
+// =============================================================================
+// Antimony PAL: std/pal/rand_windows.sb
+// Win32 BCryptGenRandom CSPRNG primitive.
+// =============================================================================
+
+const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002
+
+priv extern "bcrypt.dll" {
+    fn BCryptGenRandom(hAlgorithm: usize, pbBuffer: *u8, cbBuffer: u32, dwFlags: u32): i32
+}
+
+pub fn pal_os_random_bytes(buf: *u8, n: usize): bool {
+    var status = BCryptGenRandom(0, buf, u32(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG)
+    return status == 0
+}

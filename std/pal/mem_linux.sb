@@ -1,0 +1,47 @@
+// =============================================================================
+// Antimony PAL: std/pal/mem_linux.sb
+// Linux glibc heap allocation and memory primitives.
+// =============================================================================
+
+priv extern "libc.so.6" {
+    fn calloc(nmemb: usize, size: usize): *u8
+    fn malloc(size: usize): *u8
+    fn realloc(ptr: *u8, size: usize): *u8
+    fn free(ptr: *u8)
+    fn memcpy(dst: *u8, src: *const u8, n: usize): *u8
+    fn memmove(dst: *u8, src: *const u8, n: usize): *u8
+    fn memset(dst: *u8, val: i32, n: usize): *u8
+    fn memcmp(a: *const u8, b: *const u8, n: usize): i32
+}
+
+pub fn pal_alloc(size: usize): *u8 {
+    return calloc(1, size)
+}
+
+pub fn pal_alloc_uninit(size: usize): *u8 {
+    return malloc(size)
+}
+
+pub fn pal_realloc(ptr: *u8, new_size: usize): *u8 {
+    return realloc(ptr, new_size)
+}
+
+pub fn pal_free(ptr: *u8) {
+    free(ptr)
+}
+
+pub fn pal_memcpy(dst: *u8, src: *const u8, n: usize) {
+    memcpy(dst, src, n)
+}
+
+pub fn pal_memmove(dst: *u8, src: *const u8, n: usize) {
+    memmove(dst, src, n)
+}
+
+pub fn pal_memset(dst: *u8, val: i32, n: usize) {
+    memset(dst, val, n)
+}
+
+pub fn pal_memcmp(a: *const u8, b: *const u8, n: usize): i32 {
+    return memcmp(a, b, n)
+}

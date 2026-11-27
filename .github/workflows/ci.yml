@@ -21,7 +21,7 @@ jobs:
         shell: pwsh
         run: |
           .\sbc.exe --version
-          .\sbc.exe fmt --check tests\stdlib_test.sb tests\linux_test.sb
+          .\sbc.exe fmt --check tests\stdlib_test.sb tests\linux_test.sb std\pal\mem_windows.sb std\pal\mem_linux.sb std\pal\math_windows.sb std\pal\math_linux.sb std\pal\time_windows.sb std\pal\time_linux.sb std\pal\rand_windows.sb std\pal\rand_linux.sb
 
       - name: Run self-hosted unit tests (sbc test)
         shell: pwsh
@@ -56,11 +56,12 @@ jobs:
       - name: Verify CLI version, formatting, and cross-platform type-checking
         run: |
           ./sbc --version
-          ./sbc fmt --check tests/stdlib_test.sb tests/linux_test.sb
-          ./sbc check --lib std/core.sb
-          ./sbc check --lib std/sort.sb
+          ./sbc fmt --check tests/stdlib_test.sb tests/linux_test.sb std/pal/*.sb
+          for mod in core mem vec map set deque heap sort str path math time rand encoding hash json testing; do
+            ./sbc check --lib "std/${mod}.sb"
+          done
 
-      - name: Run Antimony unit tests on Linux x64 (debug & -O3 release)
+      - name: Run Antimony cross-platform stdlib tests on Linux x64 (debug & -O3 release)
         run: |
           ./sbc test tests/linux_test.sb
           ./sbc test tests/linux_test.sb --release

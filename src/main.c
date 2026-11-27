@@ -4,7 +4,7 @@
 //   sbc [build] <file.sb> [-o <out>] [--target windows-x64|linux-x64] [--release] [--llvm | -O3] [--emit-llvm] [--run]
 //   sbc run <file.sb> [--release] [--llvm | -O3]
 //   sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
-//   sbc check [--lib] <file.sb>
+//   sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>
 //   sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
 //   sbc --version
 #ifndef _WIN32
@@ -126,6 +126,7 @@ static bool write_entire_file(const char *path, const char *data, size_t len) {
 }
 
 static VEC(const char *) g_loaded_files;
+static TargetOs g_load_target = TARGET_WINDOWS_X64;
 
 static bool is_already_loaded(const char *canon) {
     for (int i = 0; i < g_loaded_files.len; i++) {
@@ -160,16 +161,33 @@ static char *try_open_module(const char *prefix, const char *raw_path, char *out
         snprintf(out_path, out_cap, "%s", raw_path);
     }
     char *src = read_entire_file_or_null(out_path);
-    if (!src) {
-        size_t clen = strlen(out_path);
-        if (clen < 3 || sb_stricmp(out_path + clen - 3, ".sb") != 0) {
-            char with_ext[1032];
-            snprintf(with_ext, sizeof(with_ext), "%s.sb", out_path);
-            src = read_entire_file_or_null(with_ext);
-            if (src) snprintf(out_path, out_cap, "%s", with_ext);
+    if (src) return src;
+
+    size_t clen = strlen(out_path);
+    bool has_sb_ext = (clen >= 3 && sb_stricmp(out_path + clen - 3, ".sb") == 0);
+    if (!has_sb_ext) {
+        char with_ext[1032];
+        snprintf(with_ext, sizeof(with_ext), "%s.sb", out_path);
+        src = read_entire_file_or_null(with_ext);
+        if (src) {
+            snprintf(out_path, out_cap, "%s", with_ext);
+            return src;
         }
     }
-    return src;
+
+    // Target-OS suffix fallback: e.g. `pal/mem.sb` -> `pal/mem_windows.sb` or `pal/mem_linux.sb`.
+    size_t stem_len = has_sb_ext ? (clen - 3) : clen;
+    if (stem_len > 0 && stem_len < 1000) {
+        const char *os_suffix = (g_load_target == TARGET_LINUX_X64) ? "_linux" : "_windows";
+        char os_path[1040];
+        snprintf(os_path, sizeof(os_path), "%.*s%s.sb", (int)stem_len, out_path, os_suffix);
+        src = read_entire_file_or_null(os_path);
+        if (src) {
+            snprintf(out_path, out_cap, "%s", os_path);
+            return src;
+        }
+    }
+    return NULL;
 }
 
 static void load_module_recursive(const char *raw_path, const char *base_dir,
@@ -286,7 +304,7 @@ static void usage(int exit_code) {
         "  sbc [build] <file.sb> [-o <out>] [--target windows-x64|linux-x64] [--release] [--llvm | -O3] [--emit-llvm] [--run]\n"
         "  sbc run <file.sb> [--release] [--llvm | -O3]\n"
         "  sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]\n"
-        "  sbc check [--lib] <file.sb>\n"
+        "  sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>\n"
         "  sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]\n"
         "  sbc --version | --help\n",
         SB_VERSION);
@@ -381,9 +399,13 @@ static int run_fmt_cmd(int argc, char **argv) {
 static int run_check_cmd(int argc, char **argv) {
     const char *input = NULL;
     bool allow_lib = false;
+    TargetOs target = default_host_target();
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--lib") == 0) {
             allow_lib = true;
+        } else if (strcmp(argv[i], "--target") == 0) {
+            if (++i >= argc) usage(1);
+            target = parse_target_os(argv[i]);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(0);
         } else if (argv[i][0] == '-') {
@@ -396,6 +418,7 @@ static int run_check_cmd(int argc, char **argv) {
     }
     if (!input) usage(1);
 
+    g_load_target = target;
     NodeVec decls = {0};
     Pos root_pos = {1, 1, 0};
     load_module_recursive(input, "", false, root_pos, &decls);
@@ -434,6 +457,7 @@ static int run_test_cmd(int argc, char **argv) {
 
     double t0 = now_ms();
 
+    g_load_target = target;
     NodeVec decls = {0};
     Pos root_pos = {1, 1, 0};
     load_module_recursive(input, "", false, root_pos, &decls);
@@ -622,6 +646,7 @@ int main(int argc, char **argv) {
 
     double t0 = now_ms();
 
+    g_load_target = target;
     NodeVec decls = {0};
     Pos root_pos = {1, 1, 0};
     load_module_recursive(input, "", false, root_pos, &decls);

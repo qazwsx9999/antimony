@@ -3589,12 +3589,121 @@ if (Should-RunTest "phase31_linux_target_ir") {
     # Verify cross-platform tests/linux_test.sb runs cleanly via `sbc test` on Windows too
     $linuxUnit = Join-Path $root "tests\linux_test.sb"
     $tout = (& $sbc test $linuxUnit 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 4 passed; 0 failed') {
+    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 6 passed; 0 failed') {
         throw "FAIL [phase31_linux_target_ir]: tests/linux_test.sb failed:`n$tout"
     }
 
     $script:PassedCount++
     Write-Host "PASS [cross-target]  phase31_linux_target_ir"
+}
+
+# 40. Phase 32: Cross-Platform Standard Library PAL (17 std/ modules on Linux x64)
+if (Should-RunTest "phase32_linux_stdlib_pal") {
+    $crossMods = @(
+        "core", "mem", "vec", "map", "set", "deque", "heap", "sort",
+        "str", "path", "math", "time", "rand", "encoding", "hash", "json", "testing"
+    )
+    foreach ($m in $crossMods) {
+        $mp = Join-Path $root "std\$m.sb"
+        $cout = (& $sbc check --lib --target linux-x64 $mp 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "FAIL [phase32_linux_stdlib_pal]: sbc check --lib --target linux-x64 std/$m.sb failed:`n$cout"
+        }
+    }
+
+    # Check formatting of all std/pal/*.sb files
+    $palFiles = Get-ChildItem -Path (Join-Path $root "std\pal") -Filter "*.sb" | ForEach-Object { $_.FullName }
+    $fout = (& $sbc fmt --check @palFiles 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "FAIL [phase32_linux_stdlib_pal]: sbc fmt --check std/pal/*.sb failed:`n$fout"
+    }
+
+    # Emit Linux x64 LLVM IR exercising mem, vec, map, str, path, math, time, rand, hash, json
+    $p32Src = Join-Path $tmp "phase32_linux_std.sb"
+    $p32Ll  = Join-Path $tmp "phase32_linux_std.ll"
+    $p32Code = @'
+import "std/core.sb"
+import "std/mem.sb"
+import "std/vec.sb"
+import "std/map.sb"
+import "std/set.sb"
+import "std/deque.sb"
+import "std/heap.sb"
+import "std/sort.sb"
+import "std/str.sb"
+import "std/path.sb"
+import "std/math.sb"
+import "std/time.sb"
+import "std/rand.sb"
+import "std/encoding.sb"
+import "std/hash.sb"
+import "std/json.sb"
+import "std/testing.sb"
+
+fn main() {
+    var v: Vec[i64]
+    v.init(4)
+    defer v.free()
+    v.push(i64(sqrt(144.0)))
+    v.push(i64(hypot(3.0, 4.0)))
+    var t0 = ticks_ms()
+    var sw = stopwatch_start()
+    var r = os_random_u64()
+    var dig = sha256_str("abc")
+    var doc: JsonDoc
+    doc.init()
+    defer doc.free()
+    var _ = json_parse(`{"ok":true}`, &doc)
+    var ok = !is_nan(1.0) && is_finite(1.0) && (sw.elapsed_us() >= 0) && (t0 >= 0)
+    print("{} {} {} {}", v.len, dig.bytes[0], r & 1, ok)
+}
+'@
+    Set-Content -Path $p32Src -Value $p32Code -Encoding UTF8
+    $compOut = (& $sbc build $p32Src --target linux-x64 --emit-llvm -o $p32Ll 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $p32Ll)) {
+        throw "FAIL [phase32_linux_stdlib_pal]: Linux LLVM IR emission failed:`n$compOut"
+    }
+    $ll = Get-Content -Path $p32Ll -Raw
+    if ($ll -notmatch 'target triple = "x86_64-pc-linux-gnu"' -or
+        $ll -notmatch 'libc\.so\.6' -or
+        $ll -notmatch 'libm\.so\.6') {
+        throw "FAIL [phase32_linux_stdlib_pal]: emitted Linux LLVM IR missing expected POSIX/glibc/libm targets"
+    }
+    if ($ll -match 'kernel32\.dll|msvcrt\.dll|bcrypt\.dll|LoadLibraryA|GetProcAddress') {
+        throw "FAIL [phase32_linux_stdlib_pal]: emitted Linux LLVM IR leaked Windows DLL symbols"
+    }
+
+    # If Clang is installed, cross-compile emitted Linux IR to an ELF64 object file and verify ELF magic
+    $clangExe = $null
+    if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+        $clangExe = "C:\Program Files\LLVM\bin\clang.exe"
+    } else {
+        $cmd = Get-Command clang -ErrorAction SilentlyContinue
+        if ($cmd) { $clangExe = $cmd.Source }
+    }
+    if ($clangExe) {
+        $p32Obj = Join-Path $tmp "phase32_linux_std.o"
+        $clOut = (& $clangExe -O3 -c --target=x86_64-pc-linux-gnu $p32Ll -o $p32Obj 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or !(Test-Path $p32Obj)) {
+            throw "FAIL [phase32_linux_stdlib_pal]: clang cross-compilation of Linux IR failed:`n$clOut"
+        }
+        $hdr = [System.IO.File]::ReadAllBytes($p32Obj)
+        if ($hdr.Length -lt 4 -or $hdr[0] -ne 0x7F -or $hdr[1] -ne 0x45 -or $hdr[2] -ne 0x4C -or $hdr[3] -ne 0x46) {
+            throw "FAIL [phase32_linux_stdlib_pal]: clang output does not have ELF magic bytes"
+        }
+    }
+
+    # Verify tests/linux_test.sb passes on Windows LLVM -O3 backend too
+    if (!$Quick -and $clangExe) {
+        $linuxUnit = Join-Path $root "tests\linux_test.sb"
+        $lout = (& $sbc test $linuxUnit --llvm 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $lout -notmatch 'test result: ok\. 6 passed; 0 failed') {
+            throw "FAIL [phase32_linux_stdlib_pal]: tests/linux_test.sb --llvm failed:`n$lout"
+        }
+    }
+
+    $script:PassedCount++
+    Write-Host "PASS [linux-pal]     phase32_linux_stdlib_pal"
 }
 
 if ($script:SkippedCount -gt 0) {

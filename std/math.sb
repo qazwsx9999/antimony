@@ -1,35 +1,37 @@
 // =============================================================================
 // Antimony Standard Library: std/math.sb
-// Mathematical constants, IEEE-754 float utilities, CRT hardware-backed
+// Cross-platform mathematical constants, IEEE-754 float utilities, hardware-backed
 // transcendental functions (f64 / f32), interpolation, and integer math.
 // =============================================================================
+
+import "std/pal/math.sb"
 
 // -----------------------------------------------------------------------------
 // Fundamental Constants (untyped float constants adapt to f32 or f64)
 // -----------------------------------------------------------------------------
 
-pub const PI         = 3.14159265358979323846
-pub const TAU        = 6.28318530717958647692
-pub const HALF_PI    = 1.57079632679489661923
+pub const PI = 3.14159265358979323846
+pub const TAU = 6.28318530717958647692
+pub const HALF_PI = 1.57079632679489661923
 pub const QUARTER_PI = 0.78539816339744830962
-pub const INV_PI     = 0.31830988618379067154
+pub const INV_PI = 0.31830988618379067154
 
-pub const E          = 2.71828182845904523536
-pub const LN2        = 0.69314718055994530942
-pub const LN10       = 2.30258509299404568402
-pub const LOG2E      = 1.44269504088896340736
-pub const LOG10E     = 0.43429448190325182765
+pub const E = 2.71828182845904523536
+pub const LN2 = 0.69314718055994530942
+pub const LN10 = 2.30258509299404568402
+pub const LOG2E = 1.44269504088896340736
+pub const LOG10E = 0.43429448190325182765
 
-pub const SQRT2      = 1.41421356237309504880
-pub const SQRT1_2    = 0.70710678118654752440
-pub const PHI        = 1.61803398874989484820
+pub const SQRT2 = 1.41421356237309504880
+pub const SQRT1_2 = 0.70710678118654752440
+pub const PHI = 1.61803398874989484820
 
 pub const DEG_TO_RAD = 0.01745329251994329577
 pub const RAD_TO_DEG = 57.29577951308232087680
 
-pub const INF        = 1.0 / 0.0
-pub const NEG_INF    = -1.0 / 0.0
-pub const NAN        = 0.0 / 0.0
+pub const INF = 1.0 / 0.0
+pub const NEG_INF = -1.0 / 0.0
+pub const NAN = 0.0 / 0.0
 
 pub const EPSILON_F64: f64 = 2.220446049250313e-16
 pub const EPSILON_F32: f32 = 1.1920929e-7
@@ -40,53 +42,6 @@ pub const U64_MAX: u64 = 18446744073709551615
 pub const I32_MAX: i32 = 2147483647
 pub const I32_MIN: i32 = -2147483648
 pub const U32_MAX: u32 = 4294967295
-
-// -----------------------------------------------------------------------------
-// Windows msvcrt.dll Math Bindings
-// -----------------------------------------------------------------------------
-
-pub extern "msvcrt.dll" {
-    // Double-precision (f64)
-    fn sqrt(x: f64): f64
-    fn sin(x: f64): f64
-    fn cos(x: f64): f64
-    fn tan(x: f64): f64
-    fn asin(x: f64): f64
-    fn acos(x: f64): f64
-    fn atan(x: f64): f64
-    fn atan2(y: f64, x: f64): f64
-    fn sinh(x: f64): f64
-    fn cosh(x: f64): f64
-    fn tanh(x: f64): f64
-    fn exp(x: f64): f64
-    fn log(x: f64): f64
-    fn log10(x: f64): f64
-    fn pow(base: f64, exp: f64): f64
-    fn floor(x: f64): f64
-    fn ceil(x: f64): f64
-    fn fmod(x: f64, y: f64): f64
-    fn fabs(x: f64): f64
-    fn ldexp(x: f64, exp: i32): f64
-    fn frexp(x: f64, exp: *i32): f64
-    fn modf(x: f64, iptr: *f64): f64
-
-    // Single-precision (f32)
-    fn sqrtf(x: f32): f32
-    fn sinf(x: f32): f32
-    fn cosf(x: f32): f32
-    fn tanf(x: f32): f32
-    fn powf(base: f32, exp: f32): f32
-    fn floorf(x: f32): f32
-    fn ceilf(x: f32): f32
-    fn fmodf(x: f32, y: f32): f32
-}
-
-priv extern "msvcrt.dll" {
-    fn _hypot(x: f64, y: f64): f64
-    fn _copysign(mag: f64, sgn: f64): f64
-    fn _isnan(x: f64): i32
-    fn _finite(x: f64): i32
-}
 
 // -----------------------------------------------------------------------------
 // Generic Comparison & Clamping Helpers
@@ -124,23 +79,15 @@ pub fn clamp[T](x: T, lo: T, hi: T): T {
 // -----------------------------------------------------------------------------
 
 pub fn is_nan(x: f64): bool {
-    return _isnan(x) != 0
+    return pal_is_nan(x)
 }
 
 pub fn is_finite(x: f64): bool {
-    return _finite(x) != 0
+    return pal_is_finite(x)
 }
 
 pub fn is_inf(x: f64): bool {
     return !is_nan(x) && !is_finite(x)
-}
-
-pub fn copysign(mag: f64, sgn: f64): f64 {
-    return _copysign(mag, sgn)
-}
-
-pub fn hypot(x: f64, y: f64): f64 {
-    return _hypot(x, y)
 }
 
 pub fn fabsf(x: f32): f32 {

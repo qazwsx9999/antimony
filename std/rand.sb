@@ -1,14 +1,10 @@
 // =============================================================================
 // Antimony Standard Library: std/rand.sb
-// Fast deterministic PRNG (`Rng` using xoshiro256++ seeded via SplitMix64) and
-// OS cryptographic random bytes (`os_random_bytes` via Win32 `bcrypt.dll`).
+// Cross-platform deterministic PRNG (`Rng` using xoshiro256++ seeded via
+// SplitMix64) and OS cryptographic random bytes (`os_random_bytes`).
 // =============================================================================
 
-const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x00000002
-
-priv extern "bcrypt.dll" {
-    fn BCryptGenRandom(hAlgorithm: usize, pbBuffer: *u8, cbBuffer: u32, dwFlags: u32): i32
-}
+import "std/pal/rand.sb"
 
 // Fills `buf[]` with cryptographically secure random bytes from the OS CSPRNG.
 // Returns `true` on success.
@@ -16,8 +12,7 @@ pub fn os_random_bytes(buf[]: u8): bool {
     if len(buf) == 0 {
         return true
     }
-    var status = BCryptGenRandom(0, &buf[0], u32(len(buf)), BCRYPT_USE_SYSTEM_PREFERRED_RNG)
-    return status == 0
+    return pal_os_random_bytes(&buf[0], usize(len(buf)))
 }
 
 // Returns a cryptographically secure random `u64` from the OS CSPRNG.

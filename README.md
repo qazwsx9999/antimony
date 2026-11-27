@@ -49,7 +49,7 @@ fn main() {
 
 ### Requirements
 
-- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend + full 25-module `std/`) or **Linux x64** (LLVM x86-64 ELF backend + cross-compilation to Windows PE32+ `.exe`).
+- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend + full 25-module `std/`) or **Linux x64** (LLVM x86-64 ELF backend + 17 cross-platform `std/` modules via `std/pal/` + cross-compilation to Windows PE32+ `.exe`).
 - A C11 compiler to build `sbc` — tested with **MinGW-w64 GCC 13** (Windows) and **GCC / Clang** (Linux).
 - *Optional on Windows, required on Linux:* **LLVM/Clang** (`clang`). On Windows, `sbc` looks for `clang.exe` in `C:\Program Files\LLVM\bin`, `C:\msys64\clang64\bin`, `C:\msys64\mingw64\bin`, and on `PATH`.
 
@@ -93,7 +93,7 @@ fn main() {
 sbc [build] <file.sb> [-o <out>] [--target windows-x64|linux-x64] [--release] [--llvm | -O3] [--emit-llvm] [--run]
 sbc run <file.sb> [--release] [--llvm | -O3]
 sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
-sbc check [--lib] <file.sb>
+sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>
 sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
 sbc --version | --help
 ```
@@ -104,7 +104,7 @@ sbc --version | --help
 | `--target <os>` | Select target platform: `windows-x64` or `linux-x64` (supports cross-compiling Windows PE32+ `.exe` directly from Linux, or emitting Linux LLVM IR from Windows). |
 | `sbc run <file.sb>` | Compile and execute immediately (equivalent to `--run` / `-r`). |
 | `sbc test <file.sb>` | Discover and run all `fn test_*()` unit tests in a file (supports `--filter`, `--release`, `--llvm`). |
-| `sbc check [--lib] <file.sb>` | Fast type-check only (no codegen, no output file). Pass `--lib` for library modules without `fn main()`. |
+| `sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>` | Fast type-check only (no codegen, no output file). Pass `--lib` for library modules without `fn main()`. |
 | `sbc fmt <file.sb>...` | Canonical 4-space source formatter (lossless, comment-preserving). Use `-w` to format in place, `--check` for CI, or `--stdin` for editors. |
 | `--release` | Release build: arithmetic wraps; bounds checks, division by zero, and `MIN / -1` still trap. |
 | `--llvm`, `-O3` | Compile through LLVM (`clang -O3 -march=native`); implies `--release`. |
@@ -142,7 +142,7 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/path.sb` | Path utilities (`path_basename`, `path_dirname`, `path_extension`, `path_stem`, `path_is_abs`, `path_join`) |
 | `std/os.sb` | Console streams (`stdin`/`stdout`/`stderr`), command-line arguments, environment variables, `cwd_into` |
 | `std/time.sb` | High-resolution timers, `Stopwatch`, `sleep_ms` |
-| `std/rand.sb` | Deterministic PRNG (`Rng`, xoshiro256++), `rng_shuffle`, OS CSPRNG (`os_random_bytes` via `bcrypt.dll`) |
+| `std/rand.sb` | Deterministic PRNG (`Rng`, xoshiro256++), `rng_shuffle`, OS CSPRNG (`os_random_bytes` via `BCryptGenRandom` / `getrandom`) |
 | `std/process.sb` | Child process spawning, `wait`/`try_wait`/`kill`, stdout/stderr pipe capture (`process_capture`), `current_pid` |
 | `std/net.sb` | Winsock2 IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `NetError`) |
 | `std/http.sb` | HTTP/1.1 client & server (`http_get`, `http_post`, `http_request`, `HttpRequest`, `HttpResponse`, `http_parse_url`, `http_decode_chunked`, `http_mime_type`) |
@@ -190,7 +190,7 @@ editors/      VS Code extension (highlighting, live diagnostics, sbc fmt, outlin
 
 ## Status
 
-The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3` + full 25-module `std/`) and **Linux x64** (LLVM x86-64 System V ELF backend + POSIX FFI via `dlopen`/`dlsym` + Windows cross-compilation) are supported and tested in CI. Planned work — including a POSIX `std/` I/O layer, macOS target, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
+The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3` + full 25-module `std/`) and **Linux x64** (LLVM x86-64 System V ELF backend + 17 cross-platform `std/` modules via OS-aware `std/pal/` imports + POSIX FFI via `dlopen`/`dlsym` + Windows cross-compilation) are supported and tested in CI. Planned work — including a POSIX `std/` I/O/networking layer, macOS target, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
 
 ## License
 
