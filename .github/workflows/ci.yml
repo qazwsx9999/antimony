@@ -17,7 +17,19 @@ jobs:
         run: |
           gcc -std=c11 -O2 -Wall -Wextra -Werror src\util.c src\lexer.c src\parser.c src\check.c src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\fmt.c src\main.c -o sbc.exe
 
-      - name: Run full test suite (Native x64 & LLVM -O3)
+      - name: Verify CLI version and formatting
+        shell: pwsh
+        run: |
+          .\sbc.exe --version
+          .\sbc.exe fmt --check tests\stdlib_test.sb
+
+      - name: Run self-hosted stdlib unit tests (sbc test)
+        shell: pwsh
+        run: |
+          .\sbc.exe test tests\stdlib_test.sb
+          .\sbc.exe test tests\stdlib_test.sb --llvm
+
+      - name: Run full compiler & backend test suite (Native x64 & LLVM -O3)
         shell: pwsh
         run: |
           powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1

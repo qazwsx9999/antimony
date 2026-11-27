@@ -1,0 +1,250 @@
+// =============================================================================
+// tests/stdlib_test.sb - Self-hosted Antimony Standard Library Unit Tests
+//
+// Run with:
+//   sbc test tests\stdlib_test.sb
+//   sbc test tests\stdlib_test.sb --llvm
+// =============================================================================
+
+import "std/core.sb"
+import "std/mem.sb"
+import "std/vec.sb"
+import "std/map.sb"
+import "std/set.sb"
+import "std/deque.sb"
+import "std/heap.sb"
+import "std/sort.sb"
+import "std/str.sb"
+import "std/math.sb"
+import "std/encoding.sb"
+import "std/hash.sb"
+import "std/json.sb"
+import "std/path.sb"
+import "std/rand.sb"
+import "std/io.sb"
+import "std/bufio.sb"
+import "std/fs.sb"
+import "std/process.sb"
+import "std/net.sb"
+import "std/http.sb"
+import "std/testing.sb"
+
+fn test_core_and_mem() {
+    var a = 10
+    var b = 25
+    swap(&a, &b)
+    assert_eq(a, 25, "swap a")
+    assert_eq(b, 10, "swap b")
+
+    var o1: Option[i32] = .Some(7)
+    var o2: Option[i32] = .None
+    assert_eq(assert_some(o1, "some"), 7, "some value")
+    assert_none(o2, "none")
+
+    var arena: Arena
+    arena.init(256)
+    defer arena.free()
+    var p = arena.alloc(32, 8)
+    assert_true(p != null, "arena alloc")
+    assert_eq(arena.remaining(), usize(224), "arena remaining")
+}
+
+fn test_collections() {
+    // Vec
+    var v: Vec[i32]
+    v.init(2)
+    defer v.free()
+    var seed[3]: i32 = [10, 20, 30]
+    v.extend_slice(seed)
+    v.insert(1, 15)
+    assert_eq(v.remove(1), 15, "vec remove")
+    assert_eq(v.swap_remove(0), 10, "vec swap_remove")
+    assert_eq(v.len, i64(2), "vec len")
+    assert_none(v.try_get(99), "vec oob")
+
+    // HashMap
+    var m: HashMap[str, i64]
+    m.init(8)
+    defer m.free()
+    m.put("alpha", 1)
+    m.put("beta", 2)
+    assert_eq(assert_some(m.get("beta"), "map get"), i64(2), "map val")
+    var ptr = m.get_ptr("alpha")
+    *ptr = 99
+    assert_eq(assert_some(m.take("alpha"), "map take"), i64(99), "map take val")
+    assert_false(m.contains("alpha"), "map removed")
+
+    // HashSet
+    var hs: HashSet[i32]
+    hs.init(8)
+    defer hs.free()
+    assert_true(hs.insert(5), "set insert")
+    assert_false(hs.insert(5), "set dup")
+    assert_true(hs.contains(5), "set contains")
+    assert_true(hs.remove(5), "set remove")
+
+    // Deque
+    var dq: Deque[i32]
+    dq.init(4)
+    defer dq.free()
+    dq.push_back(2)
+    dq.push_front(1)
+    dq.push_back(3)
+    assert_eq(assert_some(dq.pop_front(), "dq front"), 1, "dq front val")
+    assert_eq(assert_some(dq.pop_back(), "dq back"), 3, "dq back val")
+
+    // BinaryHeap & MinHeap
+    var maxh: BinaryHeap[i32]
+    maxh.init(4)
+    defer maxh.free()
+    var minh: MinHeap[i32]
+    minh.init(4)
+    defer minh.free()
+    var nums[5]: i32 = [4, 1, 9, 2, 7]
+    loop x in nums {
+        maxh.push(x)
+        minh.push(x)
+    }
+    assert_eq(assert_some(maxh.pop(), "maxh"), 9, "maxh top")
+    assert_eq(assert_some(minh.pop(), "minh"), 1, "minh top")
+}
+
+fn test_sort_and_search() {
+    var a[6]: i32 = [5, 2, 2, 8, 1, 2]
+    sort(a)
+    assert_true(is_sorted(a), "is_sorted")
+    assert_eq(lower_bound(a, 2), i64(1), "lower_bound")
+    assert_eq(upper_bound(a, 2), i64(4), "upper_bound")
+    assert_eq(binary_search(a, 8), i64(5), "binary_search")
+    sort_desc(a)
+    assert_eq(a[0], 8, "sort_desc first")
+    assert_eq(a[5], 1, "sort_desc last")
+}
+
+fn test_strings_and_parsers() {
+    assert_true(str_contains("antimony-lang", "mony"), "contains")
+    assert_eq(str_count("ababa", "ab"), i64(2), "count")
+    assert_true(str_eq_ignore_ascii_case("SbLang", "sblang"), "ignore_case")
+    assert_eq(assert_ok(try_parse_i64(" -9223372036854775808 "), "i64 min"), -9223372036854775808, "i64 min val")
+    assert_err(try_parse_u64("18446744073709551616"), "u64 overflow")
+    assert_approx(assert_ok(try_parse_f64("-3.25e2"), "f64"), -325.0, 1.0e-9, "f64 val")
+
+    var sb: StringBuilder
+    sb.init(32)
+    defer sb.free()
+    sb.append_replace("x-y-z", "-", "::")
+    sb.append(" 0x")
+    sb.append_hex(255)
+    assert_eq(sb.as_str(), "x::y::z 0xff", "sb replace+hex")
+}
+
+fn test_math_and_rand() {
+    assert_approx(sqrt(144.0), 12.0, 1.0e-12, "sqrt")
+    assert_approx(hypot(3.0, 4.0), 5.0, 1.0e-12, "hypot")
+    assert_eq(gcd(48, -18), i64(6), "gcd")
+    assert_eq(next_pow2(1000), u64(1024), "next_pow2")
+
+    var r1 = rng_from_seed(777)
+    var r2 = rng_from_seed(777)
+    assert_eq(r1.next_u64(), r2.next_u64(), "rng deterministic")
+    var ri = r1.range_i64(10, 20)
+    assert_true(ri >= 10 && ri < 20, "rng range")
+    var rbytes[16]: u8 = []
+    assert_true(os_random_bytes(rbytes), "os csprng")
+}
+
+fn test_encoding_and_hash() {
+    var hb: StringBuilder
+    hb.init(32)
+    defer hb.free()
+    hex_encode_str("Hi!", &hb)
+    assert_eq(hb.as_str(), "486921", "hex encode")
+
+    var b64: StringBuilder
+    b64.init(32)
+    defer b64.free()
+    base64_encode_str("foobar", &b64)
+    assert_eq(b64.as_str(), "Zm9vYmFy", "base64 encode")
+
+    assert_eq(crc32_str("123456789"), u32(0xCBF43926), "crc32 vector")
+    var dig = sha256_str("abc")
+    var sh: StringBuilder
+    sh.init(64)
+    defer sh.free()
+    dig.to_hex(&sh)
+    assert_eq(sh.as_str(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 abc")
+}
+
+fn test_json_roundtrip() {
+    var doc: JsonDoc
+    doc.init()
+    defer doc.free()
+    var root = assert_ok(json_parse(`{"name":"Antimony","v":1,"arr":[10,20]}`, &doc), "json parse")
+    assert_eq(assert_some(doc.as_str(assert_some(doc.get(root, "name"), "name key")), "name str"), "Antimony", "name")
+    var arr = assert_some(doc.get(root, "arr"), "arr key")
+    assert_eq(assert_some(doc.as_i64(assert_some(doc.at(arr, 1), "arr[1]")), "arr[1] i64"), i64(20), "arr[1] val")
+    var out: StringBuilder
+    out.init(64)
+    defer out.free()
+    doc.stringify(root, &out)
+    assert_eq(out.as_str(), `{"name":"Antimony","v":1,"arr":[10,20]}`, "json stringify")
+    assert_err(json_parse(`{"bad": }`, &doc), "malformed json")
+}
+
+fn test_path_fs_bufio_and_process() {
+    assert_eq(path_basename(`C:\src\main.sb`), "main.sb", "basename")
+    assert_eq(path_extension(`C:\src\main.sb`), ".sb", "extension")
+
+    var dir = `tests\tmp\stdlib_self_test`
+    var fpath = `tests\tmp\stdlib_self_test\lines.txt`
+    if !fs_exists(dir) {
+        assert_ok(fs_mkdir(dir), "mkdir")
+    }
+    var wf = assert_ok(file_create(fpath), "file_create")
+    var bw: BufWriter
+    bw.init(&wf, 16)
+    defer bw.free()
+    assert_ok(bw.write_str("one\r\ntwo\n"), "bw write")
+    assert_ok(bw.flush(), "bw flush")
+    wf.close()
+
+    var rf = assert_ok(file_open(fpath), "file_open")
+    var br: BufReader
+    br.init(&rf, 16)
+    defer br.free()
+    var line: StringBuilder
+    line.init(32)
+    defer line.free()
+    assert_true(assert_ok(br.read_line(&line), "line 1"), "has line 1")
+    assert_eq(line.as_str(), "one", "line 1 val")
+    assert_true(assert_ok(br.read_line(&line), "line 2"), "has line 2")
+    assert_eq(line.as_str(), "two", "line 2 val")
+    assert_false(assert_ok(br.read_line(&line), "eof"), "at eof")
+    rf.close()
+
+    assert_ok(fs_remove_file(fpath), "rm file")
+    assert_ok(fs_rmdir(dir), "rmdir")
+
+    var pout: StringBuilder
+    pout.init(32)
+    defer pout.free()
+    var rc = assert_ok(process_capture("cmd.exe /c echo ok-child", &pout), "process_capture")
+    assert_eq(rc, u32(0), "child exit 0")
+    assert_eq(str_trim(pout.as_str()), "ok-child", "child stdout")
+}
+
+fn test_net_and_http_helpers() {
+    var lh = assert_ok(dns_resolve("localhost"), "dns localhost")
+    assert_true(lh.eq(ipv4_localhost()), "localhost == 127.0.0.1")
+
+    var u = assert_ok(http_parse_url("http://example.com:8080/api?x=1"), "http url")
+    assert_eq(u.host, "example.com", "url host")
+    assert_eq(u.port, u16(8080), "url port")
+    assert_eq(u.path, "/api?x=1", "url path")
+
+    var dec: StringBuilder
+    dec.init(32)
+    defer dec.free()
+    assert_eq(assert_ok(http_decode_chunked("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n", &dec), "chunked"), i64(9), "chunked len")
+    assert_eq(dec.as_str(), "Wikipedia", "chunked body")
+}

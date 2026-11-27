@@ -1,5 +1,8 @@
 # Antimony
 
+[![CI](https://github.com/qazwsx9999/antimony/actions/workflows/ci.yml/badge.svg)](https://github.com/qazwsx9999/antimony/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 **Antimony** (`.sb`) is a statically typed systems programming language with a compiler, `sbc`, written from scratch in C. It produces standalone Windows x64 executables directly — no external assembler, linker, or C toolchain required — and offers an optional LLVM backend for maximum runtime performance.
 
 ```
@@ -146,11 +149,16 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 - [Tutorial](docs/tutorial.md) — a guided tour of the language and standard library.
 - [Language specification](docs/spec.md) — the normative definition of the language, including the grammar and decision log.
 - [Examples](examples/) — [`demo.sb`](examples/demo.sb) (feature tour), [`sbwc.sb`](examples/sbwc.sb) (word-count & search CLI), and [`sbhttpd.sb`](examples/sbhttpd.sb) (multithreaded HTTP/1.1 static-file & JSON API server).
+- [Changelog](CHANGELOG.md) & [Contributing](CONTRIBUTING.md) — release history and contributor guidelines.
 
 ## Testing
 
 ```powershell
-# Full suite (native x64 + LLVM -O3 + compile-error + runtime-trap)
+# Self-hosted standard library unit tests (`sbc test`)
+.\sbc.exe test tests\stdlib_test.sb
+.\sbc.exe test tests\stdlib_test.sb --llvm
+
+# Full compiler & backend suite (native x64 + LLVM -O3 + compile-error + runtime-trap)
 powershell -ExecutionPolicy Bypass -File tests\run_tests.ps1
 
 # Fast native-only run (~10 seconds) or filtered subset
