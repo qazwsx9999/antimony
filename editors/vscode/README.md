@@ -18,7 +18,7 @@ Language support for the **Antimony** programming language in Visual Studio Code
 - **Hover Documentation**: Quick descriptions for Antimony keywords, scalar types, and built-in functions.
 - **Live Compiler Diagnostics**: Automatically runs `sbc check --lib` on open and save to highlight compile errors and hints inline (toggle with `antimony.enableDiagnostics`).
 - **Canonical Formatting (`Shift+Alt+F` / Format on Save)**: Uses `sbc fmt --stdin` to format Antimony source files cleanly without modifying disk until saved.
-- **Compile, Check & Run Commands**: Use the editor title ▶ button or Command Palette (`Antimony: Compile & Run Current File`, `Antimony: Compile Current File`, `Antimony: Type-Check Current File`, `Antimony: Format Current File (sbc fmt)`). Uses `sbc.exe` in the workspace root, `antimony.compilerPath`, or `sbc` on `PATH`.
+- **Compile, Check, Test & Run Commands**: Use the editor title ▶ button or Command Palette (`Antimony: Compile & Run Current File`, `Antimony: Compile Current File`, `Antimony: Type-Check Current File`, `Antimony: Run Tests in Current File (sbc test)`, `Antimony: Format Current File (sbc fmt)`). Uses `sbc.exe` in the workspace root, `antimony.compilerPath`, or `sbc` on `PATH`.
 
 ## Local Installation
 

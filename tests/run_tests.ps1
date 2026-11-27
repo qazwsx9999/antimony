@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Quick,
     [string]$Filter = ""
 )
@@ -3466,6 +3466,103 @@ if (Should-RunTest "phase28_sbhttpd_llvm" $true) {
     } finally { Pop-Location }
     $script:PassedCount++
     Write-Host "PASS [e2e]           phase28_sbhttpd_llvm"
+}
+
+# 38. Phase 29: Native Unit Test Runner (`sbc test`) & `std/testing.sb`
+$phase29_unit_code = @'
+import "std/core.sb"
+import "std/str.sb"
+import "std/testing.sb"
+
+pub fn add_nums(a: i32, b: i32): i32 {
+    return a + b
+}
+
+// Coexisting user main() should be ignored by `sbc test` (while still type-checked).
+pub fn main() {
+    print("user main should not run during sbc test")
+    exit(99)
+}
+
+// Implicitly private test inside a `pub` module — white-box unit test!
+fn test_math_ops() {
+    assert_eq(add_nums(20, 22), 42, "add_nums")
+    assert_ne(add_nums(1, 1), 3, "add_nums ne")
+    assert_approx(3.14159, 3.1416, 0.001, "pi approx")
+    assert_approx_f32(f32(1.5), f32(1.5001), f32(0.01), "f32 approx")
+}
+
+pub fn test_options_and_results() {
+    var parsed = assert_ok(try_parse_i64(" -12345 "), "try_parse_i64")
+    assert_eq(parsed, i64(-12345), "parsed value")
+    assert_err(try_parse_i64("not_a_number"), "parse err")
+
+    var o1: Option[str] = .Some("antimony")
+    var o2: Option[str] = .None
+    var s = assert_some(o1, "some str")
+    assert_str_contains(s, "mony", "contains mony")
+    assert_none(o2, "none opt")
+    assert_true(true, "true")
+    assert_false(false, "false")
+}
+'@
+
+if (Should-RunTest "phase29_sbc_test") {
+    $tfile = Join-Path $tmp "phase29_unit.sb"
+    Set-Content -Path $tfile -Value $phase29_unit_code -Encoding UTF8
+
+    # 1. Native run of all tests
+    $out = (& $sbc test $tfile 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $out -notmatch 'running 2 tests' -or
+        $out -notmatch 'test test_math_ops \.\.\. ok' -or
+        $out -notmatch 'test test_options_and_results \.\.\. ok' -or
+        $out -notmatch 'test result: ok\. 2 passed; 0 failed') {
+        throw "FAIL [phase29_sbc_test]: unexpected output:`n$out"
+    }
+
+    # 2. --filter matches subset
+    $fout = (& $sbc test $tfile --filter math 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $fout -notmatch 'running 1 test' -or
+        $fout -notmatch 'test test_math_ops \.\.\. ok' -or
+        $fout -match 'test_options_and_results') {
+        throw "FAIL [phase29_sbc_test]: --filter mismatch:`n$fout"
+    }
+
+    # 3. --filter matching 0 tests exits 0 cleanly
+    $zout = (& $sbc test $tfile --filter nonexistent_xyz 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $zout -notmatch 'running 0 tests') {
+        throw "FAIL [phase29_sbc_test]: 0-match filter failed:`n$zout"
+    }
+
+    # 4. Failing assertion returns non-zero with clear FAIL message
+    $failFile = Join-Path $tmp "phase29_fail.sb"
+    Set-Content -Path $failFile -Value "import `"std/testing.sb`"`nfn test_boom() {`n    assert_eq(1, 2, `"one equals two`")`n}" -Encoding UTF8
+    $failOut = (& $sbc test $failFile 2>&1) -join "`n"
+    if ($LASTEXITCODE -eq 0 -or $failOut -notmatch 'FAIL: one equals two \(expected 2, got 1\)') {
+        throw "FAIL [phase29_sbc_test]: failing test did not report expected FAIL:`n$failOut"
+    }
+
+    # 5. Malformed test signature rejected
+    $badSigFile = Join-Path $tmp "phase29_badsig.sb"
+    Set-Content -Path $badSigFile -Value "fn test_bad(x: i32) {`n    print(x)`n}" -Encoding UTF8
+    $badOut = (& $sbc test $badSigFile 2>&1) -join "`n"
+    if ($LASTEXITCODE -eq 0 -or $badOut -notmatch "must have signature 'fn test_bad\(\)'") {
+        throw "FAIL [phase29_sbc_test]: bad test signature not rejected:`n$badOut"
+    }
+
+    $script:PassedCount++
+    Write-Host "PASS [test-runner]   phase29_sbc_test"
+}
+
+if (Should-RunTest "phase29_sbc_test_llvm" $true) {
+    $tfile = Join-Path $tmp "phase29_unit.sb"
+    Set-Content -Path $tfile -Value $phase29_unit_code -Encoding UTF8
+    $lout = (& $sbc test $tfile --llvm 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $lout -notmatch 'test result: ok\. 2 passed; 0 failed') {
+        throw "FAIL [phase29_sbc_test_llvm]: unexpected output:`n$lout"
+    }
+    $script:PassedCount++
+    Write-Host "PASS [test-llvm]     phase29_sbc_test_llvm"
 }
 
 if ($script:SkippedCount -gt 0) {

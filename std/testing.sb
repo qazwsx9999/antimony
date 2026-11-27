@@ -1,0 +1,115 @@
+// =============================================================================
+// Antimony Standard Library: std/testing.sb
+// Unit-testing assertion helpers designed for use with `sbc test <file.sb>`.
+// =============================================================================
+
+import "std/core.sb"
+import "std/str.sb"
+
+// Fails the current test with `msg` if `cond` is false.
+pub fn assert_true(cond: bool, msg: str) {
+    if !cond {
+        print("FAIL: {} (expected true, got false)", msg)
+        exit(1)
+    }
+}
+
+// Fails the current test with `msg` if `cond` is true.
+pub fn assert_false(cond: bool, msg: str) {
+    if cond {
+        print("FAIL: {} (expected false, got true)", msg)
+        exit(1)
+    }
+}
+
+// Fails the current test if `actual != expected` (prints both values).
+pub fn assert_eq[T](actual: T, expected: T, msg: str) {
+    if actual != expected {
+        print("FAIL: {} (expected {}, got {})", msg, expected, actual)
+        exit(1)
+    }
+}
+
+// Fails the current test if `actual == unexpected`.
+pub fn assert_ne[T](actual: T, unexpected: T, msg: str) {
+    if actual == unexpected {
+        print("FAIL: {} (did not expect {})", msg, unexpected)
+        exit(1)
+    }
+}
+
+// Fails the current test if `|actual - expected| > eps` or if either value is NaN.
+pub fn assert_approx(actual: f64, expected: f64, eps: f64, msg: str) {
+    var diff = actual - expected
+    if diff < 0.0 {
+        diff = -diff
+    }
+    if !(diff <= eps) {
+        print("FAIL: {} (expected {} +/- {}, got {})", msg, expected, eps, actual)
+        exit(1)
+    }
+}
+
+// Single-precision float approximate equality assertion (fails on NaN).
+pub fn assert_approx_f32(actual: f32, expected: f32, eps: f32, msg: str) {
+    var diff = actual - expected
+    if diff < 0.0 {
+        diff = -diff
+    }
+    if !(diff <= eps) {
+        print("FAIL: {} (expected {} +/- {}, got {})", msg, expected, eps, actual)
+        exit(1)
+    }
+}
+
+// Fails the current test if `haystack` does not contain substring `needle`.
+pub fn assert_str_contains(haystack: str, needle: str, msg: str) {
+    if !str_contains(haystack, needle) {
+        print("FAIL: {} ('{}' does not contain '{}')", msg, haystack, needle)
+        exit(1)
+    }
+}
+
+// Asserts `o` is `.Some(v)` and returns `v`; fails the test if `.None`.
+pub fn assert_some[T](o: Option[T], msg: str): T {
+    match o {
+        .Some(v) { return v }
+        .None {
+            print("FAIL: {} (expected Some, got None)", msg)
+            exit(1)
+        }
+    }
+}
+
+// Asserts `o` is `.None`; fails the test if `.Some`.
+pub fn assert_none[T](o: Option[T], msg: str) {
+    match o {
+        .Some(_) {
+            print("FAIL: {} (expected None, got Some)", msg)
+            exit(1)
+        }
+        .None { }
+    }
+}
+
+// Asserts `r` is `.Ok(v)` and returns `v`; fails the test if `.Err`.
+pub fn assert_ok[T, E](r: Result[T, E], msg: str): T {
+    match r {
+        .Ok(v) { return v }
+        .Err(_) {
+            print("FAIL: {} (expected Ok, got Err)", msg)
+            exit(1)
+        }
+    }
+}
+
+// Asserts `r` is `.Err`; fails the test if `.Ok`.
+pub fn assert_err[T, E](r: Result[T, E], msg: str) {
+    match r {
+        .Ok(_) {
+            print("FAIL: {} (expected Err, got Ok)", msg)
+            exit(1)
+        }
+        .Err(_) { }
+    }
+}

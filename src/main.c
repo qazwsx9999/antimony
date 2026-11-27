@@ -3,6 +3,7 @@
 // Usage:
 //   sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]
 //   sbc run <file.sb> [--release] [--llvm | -O3]
+//   sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
 //   sbc check [--lib] <file.sb>
 //   sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
 //   sbc --version
@@ -203,6 +204,7 @@ static void usage(int exit_code) {
         "Usage:\n"
         "  sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]\n"
         "  sbc run <file.sb> [--release] [--llvm | -O3]\n"
+        "  sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]\n"
         "  sbc check [--lib] <file.sb>\n"
         "  sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]\n"
         "  sbc --version | --help\n",
@@ -321,6 +323,171 @@ static int run_check_cmd(int argc, char **argv) {
     return 0;
 }
 
+static int run_test_cmd(int argc, char **argv) {
+    const char *input = NULL;
+    const char *filter = NULL;
+    bool release = false;
+    bool use_llvm = false;
+
+    for (int i = 2; i < argc; i++) {
+        if (strcmp(argv[i], "--filter") == 0 || strcmp(argv[i], "-f") == 0) {
+            if (++i >= argc) usage(1);
+            filter = argv[i];
+        } else if (strcmp(argv[i], "--release") == 0 || strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O2") == 0) {
+            release = true;
+        } else if (strcmp(argv[i], "--llvm") == 0 || strcmp(argv[i], "-O3") == 0 || strcmp(argv[i], "--opt") == 0) {
+            use_llvm = true;
+            release = true;
+        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            usage(0);
+        } else if (argv[i][0] == '-') {
+            die("unknown option '%s' for 'sbc test'", argv[i]);
+        } else if (!input) {
+            input = argv[i];
+        } else {
+            usage(1);
+        }
+    }
+    if (!input) usage(1);
+
+#ifdef _WIN32
+    LARGE_INTEGER freq, t0, t1, t2;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t0);
+#endif
+
+    NodeVec decls = {0};
+    Pos root_pos = {1, 1, 0};
+    load_module_recursive(input, "", false, root_pos, &decls);
+    const int root_file_id = 0;
+
+    // Discover `fn test_*()` functions in the root file, and shadow any user `fn main()`
+    // (while still type-checking it) so the synthesized harness becomes the entry point.
+    StrVec tests = {0};
+    for (int i = 0; i < decls.len; i++) {
+        Node *d = decls.items[i];
+        if (d->kind != N_FN || d->is_extern || d->name2 || d->pos.file_id != root_file_id) {
+            continue;
+        }
+        if (strcmp(d->name, "main") == 0) {
+            d->name = intern("__sb_test_user_main", 19);
+            continue;
+        }
+        if (strncmp(d->name, "test_", 5) == 0) {
+            if (d->tparams.len > 0 || d->list.len != 0 || d->type_name != NULL) {
+                fatal(d->pos, "test function '%s' must have signature 'fn %s()' (no parameters or return type)",
+                      d->name, d->name);
+            }
+            if (!filter || strstr(d->name, filter) != NULL) {
+                vec_push(tests, d->name);
+            }
+        }
+    }
+
+    if (tests.len == 0) {
+        (void)check_ex(decls, false);
+        printf("running 0 tests\n\ntest result: ok. 0 passed; 0 failed\n");
+        free(tests.items);
+        return 0;
+    }
+
+    // Synthesize the test harness `fn main()` inside `root_file_id` so it can call both `pub` and `priv` tests.
+    Buf harness = {0};
+    char line[512];
+    int n = snprintf(line, sizeof(line),
+                     "fn main() {\n    print(\"running %d %s\")\n",
+                     tests.len, tests.len == 1 ? "test" : "tests");
+    buf_bytes(&harness, line, (size_t)n);
+    for (int i = 0; i < tests.len; i++) {
+        n = snprintf(line, sizeof(line),
+                     "    %s()\n    print(\"test %s ... ok\")\n",
+                     tests.items[i], tests.items[i]);
+        buf_bytes(&harness, line, (size_t)n);
+    }
+    n = snprintf(line, sizeof(line),
+                 "    print(\"\")\n    print(\"test result: ok. %d passed; 0 failed\")\n}\n",
+                 tests.len);
+    buf_bytes(&harness, line, (size_t)n);
+    buf_u8(&harness, '\0');
+
+    int saved_file_id = g_file_id;
+    const char *saved_filename = g_filename;
+    const char *saved_source = g_source;
+    g_file_id = root_file_id;
+    g_filename = input;
+    g_source = (const char *)harness.data;
+
+    int ntoks = 0;
+    Token *toks = lex((const char *)harness.data, &ntoks);
+    NodeVec hdecls = parse(toks, ntoks);
+    free(toks);
+    for (int i = 0; i < hdecls.len; i++) {
+        vec_push(decls, hdecls.items[i]);
+    }
+    free(hdecls.items);
+
+    g_file_id = saved_file_id;
+    g_filename = saved_filename;
+    g_source = saved_source;
+
+    Program prog = check(decls);
+
+    char tmp_exe[1024];
+#ifdef _WIN32
+    char tmp_dir[512];
+    DWORD tlen = GetTempPathA((DWORD)sizeof(tmp_dir), tmp_dir);
+    if (tlen > 0 && tlen < sizeof(tmp_dir)) {
+        snprintf(tmp_exe, sizeof(tmp_exe), "%ssbc_test_%lu.exe", tmp_dir, (unsigned long)GetCurrentProcessId());
+    } else {
+        snprintf(tmp_exe, sizeof(tmp_exe), "sbc_test_%lu.exe", (unsigned long)GetCurrentProcessId());
+    }
+#else
+    snprintf(tmp_exe, sizeof(tmp_exe), "/tmp/sbc_test_%d", (int)getpid());
+#endif
+
+    if (use_llvm) {
+        if (!compile_opt_backend(&prog, decls, tmp_exe, release)) {
+            free(tests.items);
+            free(harness.data);
+            die("optimizing backend failed for test harness '%s'", input);
+        }
+    } else {
+        Image img = codegen(&prog, release);
+        write_pe(tmp_exe, &img);
+    }
+
+#ifdef _WIN32
+    QueryPerformanceCounter(&t1);
+#endif
+
+    char run_cmd[1100];
+    snprintf(run_cmd, sizeof(run_cmd), "\"%s\"", tmp_exe);
+    int rc = system(run_cmd);
+    remove(tmp_exe);
+
+#ifdef _WIN32
+    QueryPerformanceCounter(&t2);
+    double comp_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    double run_ms  = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    if (rc != 0) {
+        fprintf(stderr, "\ntest result: FAILED (exit code %d, %.2f ms)\n", rc, run_ms);
+    } else {
+        fprintf(stderr, "finished in %.2f ms (compile %.2f ms, run %.2f ms, %s%s)\n",
+                comp_ms + run_ms, comp_ms, run_ms,
+                release ? "release" : "debug",
+                use_llvm ? ", llvm-O3" : "");
+    }
+#else
+    if (rc != 0) {
+        fprintf(stderr, "\ntest result: FAILED (exit code %d)\n", rc);
+    }
+#endif
+
+    free(tests.items);
+    free(harness.data);
+    return rc == 0 ? 0 : 1;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) usage(1);
 
@@ -336,6 +503,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "check") == 0) {
         return run_check_cmd(argc, argv);
+    }
+    if (strcmp(argv[1], "test") == 0) {
+        return run_test_cmd(argc, argv);
     }
 
     const char *input = NULL;

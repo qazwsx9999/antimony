@@ -483,15 +483,15 @@ function runDiagnostics(document, collection) {
   });
 }
 
-async function runCompilerTask(runAfter) {
+async function runCompilerTask(mode) {
   const editor = vscode.window.activeTextEditor;
   if (!editor || editor.document.languageId !== "antimony") {
-    vscode.window.showWarningMessage("Open an Antimony (.sb) file to build or run.");
+    vscode.window.showWarningMessage("Open an Antimony (.sb) file to build, run, or test.");
     return;
   }
 
   if (editor.document.isUntitled) {
-    vscode.window.showWarningMessage("Please save the Antimony file before compiling.");
+    vscode.window.showWarningMessage("Please save the Antimony file first.");
     return;
   }
 
@@ -502,14 +502,15 @@ async function runCompilerTask(runAfter) {
 
   const filePath = editor.document.uri.fsPath;
   const compiler = resolveCompiler(editor.document.uri);
-  const args = runAfter ? ["run", filePath] : ["build", filePath];
+  const args = [mode, filePath];
+  const label = mode === "run" ? "Run Antimony File" : (mode === "test" ? "Test Antimony File" : "Build Antimony File");
   const wsFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
   const cwd = wsFolder ? wsFolder.uri.fsPath : path.dirname(filePath);
 
   const task = new vscode.Task(
-    { type: "antimony", task: runAfter ? "run" : "build" },
+    { type: "antimony", task: mode },
     wsFolder || vscode.TaskScope.Workspace,
-    runAfter ? "Run Antimony File" : "Build Antimony File",
+    label,
     "antimony",
     new vscode.ProcessExecution(compiler, args, { cwd })
   );
@@ -535,8 +536,9 @@ function activate(context) {
       [selector, untitledSelector],
       new AntimonyDocumentFormattingEditProvider()
     ),
-    vscode.commands.registerCommand("antimony.runFile", () => runCompilerTask(true)),
-    vscode.commands.registerCommand("antimony.buildFile", () => runCompilerTask(false)),
+    vscode.commands.registerCommand("antimony.runFile", () => runCompilerTask("run")),
+    vscode.commands.registerCommand("antimony.buildFile", () => runCompilerTask("build")),
+    vscode.commands.registerCommand("antimony.testFile", () => runCompilerTask("test")),
     vscode.commands.registerCommand("antimony.checkFile", () => {
       const editor = vscode.window.activeTextEditor;
       if (editor && editor.document.languageId === "antimony") {

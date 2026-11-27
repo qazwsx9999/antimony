@@ -82,6 +82,7 @@ fn main() {
 ```
 sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]
 sbc run <file.sb> [--release] [--llvm | -O3]
+sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
 sbc check [--lib] <file.sb>
 sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
 sbc --version | --help
@@ -91,6 +92,7 @@ sbc --version | --help
 |---|---|
 | `sbc [build] <file.sb>` | Debug build with the native backend: overflow, narrowing, null, and bounds checks enabled. |
 | `sbc run <file.sb>` | Compile and execute immediately (equivalent to `--run` / `-r`). |
+| `sbc test <file.sb>` | Discover and run all `fn test_*()` unit tests in a file (supports `--filter`, `--release`, `--llvm`). |
 | `sbc check [--lib] <file.sb>` | Fast type-check only (no codegen, no output file). Pass `--lib` for library modules without `fn main()`. |
 | `sbc fmt <file.sb>...` | Canonical 4-space source formatter (lossless, comment-preserving). Use `-w` to format in place, `--check` for CI, or `--stdin` for editors. |
 | `--release` | Release build: arithmetic wraps; bounds checks, division by zero, and `MIN / -1` still trap. |
@@ -136,6 +138,7 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/encoding.sb` | RFC 4648 Hexadecimal and Base64 (standard & URL-safe) encoding and decoding |
 | `std/hash.sb` | FNV-1a 32/64, IEEE CRC32, and FIPS 180-4 SHA-256 (streaming & one-shot) |
 | `std/json.sb` | RFC 8259 arena-backed JSON parser, DOM builder, and compact/pretty serializer (`JsonDoc`) |
+| `std/testing.sb` | Unit-test assertions (`assert_eq`, `assert_ne`, `assert_approx`, `assert_ok`, `assert_some`, `assert_str_contains`) for `sbc test` |
 | `std/thread.sb` | Threads, `Mutex`, `RwLock`, `CondVar`, `AtomicI64` |
 
 ## Documentation

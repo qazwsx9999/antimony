@@ -71,6 +71,11 @@
         "icon": "$(check)"
       },
       {
+        "command": "antimony.testFile",
+        "title": "Antimony: Run Tests in Current File (sbc test)",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "antimony.formatFile",
         "title": "Antimony: Format Current File (sbc fmt)",
         "icon": "$(wand)"
