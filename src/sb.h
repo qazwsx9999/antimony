@@ -21,6 +21,7 @@ typedef __int128 i128;
 void *xmalloc(size_t n);
 void *xcalloc(size_t n, size_t size);
 void *xrealloc(void *p, size_t n);
+int sb_stricmp(const char *a, const char *b);
 
 #define VEC(T) struct { T *items; int len, cap; }
 #define vec_push(v, x)                                                        \
@@ -421,10 +422,15 @@ typedef struct {
     int total_iat_slots;
 } Image;
 
+typedef enum {
+    TARGET_WINDOWS_X64 = 0,
+    TARGET_LINUX_X64   = 1
+} TargetOs;
+
 Image codegen(Program *prog, bool release);
 void write_pe(const char *path, Image *img);
-bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release);
-bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release);
+bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release, TargetOs target);
+bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release, TargetOs target);
 char *fmt_source(const char *filename, const char *src);
 
 #endif

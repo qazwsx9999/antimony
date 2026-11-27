@@ -1,19 +1,76 @@
 // main.c - CLI driver for the Antimony compiler (sbc).
 //
 // Usage:
-//   sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]
+//   sbc [build] <file.sb> [-o <out>] [--target windows-x64|linux-x64] [--release] [--llvm | -O3] [--emit-llvm] [--run]
 //   sbc run <file.sb> [--release] [--llvm | -O3]
 //   sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
 //   sbc check [--lib] <file.sb>
 //   sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
 //   sbc --version
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "sb.h"
 
 #ifdef _WIN32
 #include <fcntl.h>
 #include <io.h>
 #include <windows.h>
+#else
+#include <limits.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
 #endif
+
+static TargetOs default_host_target(void) {
+#ifdef _WIN32
+    return TARGET_WINDOWS_X64;
+#else
+    return TARGET_LINUX_X64;
+#endif
+}
+
+static TargetOs parse_target_os(const char *s) {
+    if (sb_stricmp(s, "windows-x64") == 0 || sb_stricmp(s, "windows") == 0 || sb_stricmp(s, "win64") == 0) {
+        return TARGET_WINDOWS_X64;
+    }
+    if (sb_stricmp(s, "linux-x64") == 0 || sb_stricmp(s, "linux") == 0) {
+        return TARGET_LINUX_X64;
+    }
+    die("unknown target '%s' (supported: windows-x64, linux-x64)", s);
+}
+
+static double now_ms(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, t;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+#endif
+}
+
+static int run_executable_path(const char *path) {
+    char cmd[1152];
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "\"%s\"", path);
+    return system(cmd);
+#else
+    if (strchr(path, '/') == NULL) {
+        snprintf(cmd, sizeof(cmd), "\"./%s\"", path);
+    } else {
+        snprintf(cmd, sizeof(cmd), "\"%s\"", path);
+    }
+    int status = system(cmd);
+    if (status < 0) return 1;
+    if (WIFEXITED(status)) return WEXITSTATUS(status);
+    return 1;
+#endif
+}
 
 static char *read_entire_file_or_null(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -72,7 +129,11 @@ static VEC(const char *) g_loaded_files;
 
 static bool is_already_loaded(const char *canon) {
     for (int i = 0; i < g_loaded_files.len; i++) {
-        if (_stricmp(g_loaded_files.items[i], canon) == 0) return true;
+#ifdef _WIN32
+        if (sb_stricmp(g_loaded_files.items[i], canon) == 0) return true;
+#else
+        if (strcmp(g_loaded_files.items[i], canon) == 0) return true;
+#endif
     }
     return false;
 }
@@ -101,7 +162,7 @@ static char *try_open_module(const char *prefix, const char *raw_path, char *out
     char *src = read_entire_file_or_null(out_path);
     if (!src) {
         size_t clen = strlen(out_path);
-        if (clen < 3 || _stricmp(out_path + clen - 3, ".sb") != 0) {
+        if (clen < 3 || sb_stricmp(out_path + clen - 3, ".sb") != 0) {
             char with_ext[1032];
             snprintf(with_ext, sizeof(with_ext), "%s.sb", out_path);
             src = read_entire_file_or_null(with_ext);
@@ -117,15 +178,22 @@ static void load_module_recursive(const char *raw_path, const char *base_dir,
     bool is_abs = (raw_path[0] == '/' || raw_path[0] == '\\' ||
                    (raw_path[0] && raw_path[1] == ':'));
     char *src = try_open_module(is_abs ? "" : base_dir, raw_path, candidate, sizeof(candidate));
-#ifdef _WIN32
     if (!src && is_import && !is_abs) {
         char exe_path[1024], exe_dir[1024];
+#ifdef _WIN32
         if (GetModuleFileNameA(NULL, exe_path, sizeof(exe_path)) > 0) {
             extract_dir(exe_path, exe_dir, sizeof(exe_dir));
             src = try_open_module(exe_dir, raw_path, candidate, sizeof(candidate));
         }
-    }
+#else
+        ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (n > 0) {
+            exe_path[n] = '\0';
+            extract_dir(exe_path, exe_dir, sizeof(exe_dir));
+            src = try_open_module(exe_dir, raw_path, candidate, sizeof(candidate));
+        }
 #endif
+    }
     if (!src) {
         if (is_import) {
             fatal(import_pos, "cannot open imported module '%s'", raw_path);
@@ -134,11 +202,12 @@ static void load_module_recursive(const char *raw_path, const char *base_dir,
         }
     }
 
-    char full_buf[1024];
 #ifdef _WIN32
+    char full_buf[1024];
     const char *canon_str = _fullpath(full_buf, candidate, sizeof(full_buf)) ? full_buf : candidate;
 #else
-    const char *canon_str = candidate;
+    char full_buf[PATH_MAX];
+    const char *canon_str = realpath(candidate, full_buf) ? full_buf : candidate;
 #endif
     const char *canon = intern(canon_str, (int)strlen(canon_str));
     if (is_already_loaded(canon)) {
@@ -177,7 +246,7 @@ static void load_module_recursive(const char *raw_path, const char *base_dir,
     g_source = saved_source;
 }
 
-static char *default_output_path(const char *input) {
+static char *default_output_path(const char *input, TargetOs target, bool emit_ir) {
     const char *slash1 = strrchr(input, '/');
     const char *slash2 = strrchr(input, '\\');
     const char *base = input;
@@ -186,14 +255,26 @@ static char *default_output_path(const char *input) {
 
     const char *dot = strrchr(base, '.');
     size_t stem_len = dot ? (size_t)(dot - input) : strlen(input);
-    char *out = xmalloc(stem_len + 5);
+    const char *ext = emit_ir ? ".ll" : (target == TARGET_WINDOWS_X64 ? ".exe" : "");
+    size_t ext_len = strlen(ext);
+    if (ext_len == 0 && !dot) {
+        ext = ".out";
+        ext_len = 4;
+    }
+    char *out = xmalloc(stem_len + ext_len + 1);
     memcpy(out, input, stem_len);
-    memcpy(out + stem_len, ".exe", 5);
+    memcpy(out + stem_len, ext, ext_len + 1);
     return out;
 }
 
 static void print_version(void) {
+#ifdef _WIN32
     printf("sbc %s (Antimony, Windows x64)\n", SB_VERSION);
+#elif defined(__linux__)
+    printf("sbc %s (Antimony, Linux x64)\n", SB_VERSION);
+#else
+    printf("sbc %s (Antimony, POSIX x64)\n", SB_VERSION);
+#endif
 }
 
 static void usage(int exit_code) {
@@ -202,7 +283,7 @@ static void usage(int exit_code) {
         "Antimony compiler (sbc %s) — Dual-Backend (Native x64 & Optimizing/LLVM)\n"
         "\n"
         "Usage:\n"
-        "  sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]\n"
+        "  sbc [build] <file.sb> [-o <out>] [--target windows-x64|linux-x64] [--release] [--llvm | -O3] [--emit-llvm] [--run]\n"
         "  sbc run <file.sb> [--release] [--llvm | -O3]\n"
         "  sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]\n"
         "  sbc check [--lib] <file.sb>\n"
@@ -213,7 +294,6 @@ static void usage(int exit_code) {
 }
 
 static bool text_eq_normalized(const char *raw, const char *formatted) {
-    // Compare ignoring CRLF vs LF differences so Windows checkouts match `--check` cleanly.
     const char *a = raw;
     const char *b = formatted;
     if ((uint8_t)a[0] == 0xEF && (uint8_t)a[1] == 0xBB && (uint8_t)a[2] == 0xBF) {
@@ -328,6 +408,7 @@ static int run_test_cmd(int argc, char **argv) {
     const char *filter = NULL;
     bool release = false;
     bool use_llvm = false;
+    TargetOs target = default_host_target();
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--filter") == 0 || strcmp(argv[i], "-f") == 0) {
@@ -349,20 +430,15 @@ static int run_test_cmd(int argc, char **argv) {
         }
     }
     if (!input) usage(1);
+    if (target == TARGET_LINUX_X64) use_llvm = true;
 
-#ifdef _WIN32
-    LARGE_INTEGER freq, t0, t1, t2;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-#endif
+    double t0 = now_ms();
 
     NodeVec decls = {0};
     Pos root_pos = {1, 1, 0};
     load_module_recursive(input, "", false, root_pos, &decls);
     const int root_file_id = 0;
 
-    // Discover `fn test_*()` functions in the root file, and shadow any user `fn main()`
-    // (while still type-checking it) so the synthesized harness becomes the entry point.
     StrVec tests = {0};
     for (int i = 0; i < decls.len; i++) {
         Node *d = decls.items[i];
@@ -391,7 +467,6 @@ static int run_test_cmd(int argc, char **argv) {
         return 0;
     }
 
-    // Synthesize the test harness `fn main()` inside `root_file_id` so it can call both `pub` and `priv` tests.
     Buf harness = {0};
     char line[512];
     int n = snprintf(line, sizeof(line),
@@ -442,11 +517,11 @@ static int run_test_cmd(int argc, char **argv) {
         snprintf(tmp_exe, sizeof(tmp_exe), "sbc_test_%lu.exe", (unsigned long)GetCurrentProcessId());
     }
 #else
-    snprintf(tmp_exe, sizeof(tmp_exe), "/tmp/sbc_test_%d", (int)getpid());
+    snprintf(tmp_exe, sizeof(tmp_exe), "/tmp/sbc_test_%ld", (long)getpid());
 #endif
 
     if (use_llvm) {
-        if (!compile_opt_backend(&prog, decls, tmp_exe, release)) {
+        if (!compile_opt_backend(&prog, decls, tmp_exe, release, target)) {
             free(tests.items);
             free(harness.data);
             die("optimizing backend failed for test harness '%s'", input);
@@ -456,32 +531,21 @@ static int run_test_cmd(int argc, char **argv) {
         write_pe(tmp_exe, &img);
     }
 
-#ifdef _WIN32
-    QueryPerformanceCounter(&t1);
-#endif
-
-    char run_cmd[1100];
-    snprintf(run_cmd, sizeof(run_cmd), "\"%s\"", tmp_exe);
-    int rc = system(run_cmd);
+    double t1 = now_ms();
+    int rc = run_executable_path(tmp_exe);
     remove(tmp_exe);
+    double t2 = now_ms();
 
-#ifdef _WIN32
-    QueryPerformanceCounter(&t2);
-    double comp_ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-    double run_ms  = (double)(t2.QuadPart - t1.QuadPart) * 1000.0 / (double)freq.QuadPart;
+    double comp_ms = t1 - t0;
+    double run_ms  = t2 - t1;
     if (rc != 0) {
         fprintf(stderr, "\ntest result: FAILED (exit code %d, %.2f ms)\n", rc, run_ms);
     } else {
         fprintf(stderr, "finished in %.2f ms (compile %.2f ms, run %.2f ms, %s%s)\n",
                 comp_ms + run_ms, comp_ms, run_ms,
                 release ? "release" : "debug",
-                use_llvm ? ", llvm-O3" : "");
+                use_llvm ? ", llvm" : "");
     }
-#else
-    if (rc != 0) {
-        fprintf(stderr, "\ntest result: FAILED (exit code %d)\n", rc);
-    }
-#endif
 
     free(tests.items);
     free(harness.data);
@@ -514,6 +578,7 @@ int main(int argc, char **argv) {
     bool use_llvm = false;
     bool emit_ir = false;
     bool run_after = false;
+    TargetOs target = default_host_target();
 
     int start_idx = 1;
     if (strcmp(argv[1], "build") == 0) {
@@ -527,6 +592,9 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "-o") == 0) {
             if (++i >= argc) usage(1);
             output = argv[i];
+        } else if (strcmp(argv[i], "--target") == 0) {
+            if (++i >= argc) usage(1);
+            target = parse_target_os(argv[i]);
         } else if (strcmp(argv[i], "--release") == 0 || strcmp(argv[i], "-O") == 0 || strcmp(argv[i], "-O2") == 0) {
             release = true;
         } else if (strcmp(argv[i], "--llvm") == 0 || strcmp(argv[i], "-O3") == 0 || strcmp(argv[i], "--opt") == 0) {
@@ -547,13 +615,12 @@ int main(int argc, char **argv) {
         }
     }
     if (!input) usage(1);
-    if (!output) output = default_output_path(input);
+    if (!output) output = default_output_path(input, target, emit_ir);
+    if (target == TARGET_LINUX_X64 && !emit_ir) {
+        use_llvm = true;
+    }
 
-#ifdef _WIN32
-    LARGE_INTEGER freq, t0, t1;
-    QueryPerformanceFrequency(&freq);
-    QueryPerformanceCounter(&t0);
-#endif
+    double t0 = now_ms();
 
     NodeVec decls = {0};
     Pos root_pos = {1, 1, 0};
@@ -561,11 +628,11 @@ int main(int argc, char **argv) {
     Program prog = check(decls);
 
     if (emit_ir) {
-        if (!emit_llvm_ir(&prog, decls, output, release)) {
+        if (!emit_llvm_ir(&prog, decls, output, release, target)) {
             die("failed to write LLVM IR to '%s'", output);
         }
     } else if (use_llvm) {
-        if (!compile_opt_backend(&prog, decls, output, release)) {
+        if (!compile_opt_backend(&prog, decls, output, release, target)) {
             die("optimizing backend failed for '%s'", output);
         }
     } else {
@@ -573,17 +640,15 @@ int main(int argc, char **argv) {
         write_pe(output, &img);
     }
 
-#ifdef _WIN32
-    QueryPerformanceCounter(&t1);
-    double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)freq.QuadPart;
-    fprintf(stderr, "compiled %s -> %s (%.2f ms, %s%s)\n",
+    double ms = now_ms() - t0;
+    fprintf(stderr, "compiled %s -> %s (%.2f ms, %s, %s%s)\n",
             input, output, ms,
+            target == TARGET_LINUX_X64 ? "linux-x64" : "windows-x64",
             release ? "release" : "debug",
-            use_llvm ? ", llvm-O3" : (emit_ir ? ", llvm-ir" : ""));
-#endif
+            use_llvm ? ", llvm" : (emit_ir ? ", llvm-ir" : ""));
 
     if (run_after) {
-        return system(output);
+        return run_executable_path(output);
     }
     return 0;
 }

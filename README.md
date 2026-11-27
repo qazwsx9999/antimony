@@ -49,12 +49,13 @@ fn main() {
 
 ### Requirements
 
-- Windows x64.
-- A C11 compiler to build `sbc` — tested with **MinGW-w64 GCC 13**.
-- *Optional:* **LLVM/Clang** for the `--llvm` backend. `sbc` looks for `clang.exe` in `C:\Program Files\LLVM\bin`, then `C:\msys64\clang64\bin`, `C:\msys64\mingw64\bin`, and finally on `PATH`.
+- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend + full 25-module `std/`) or **Linux x64** (LLVM x86-64 ELF backend + cross-compilation to Windows PE32+ `.exe`).
+- A C11 compiler to build `sbc` — tested with **MinGW-w64 GCC 13** (Windows) and **GCC / Clang** (Linux).
+- *Optional on Windows, required on Linux:* **LLVM/Clang** (`clang`). On Windows, `sbc` looks for `clang.exe` in `C:\Program Files\LLVM\bin`, `C:\msys64\clang64\bin`, `C:\msys64\mingw64\bin`, and on `PATH`.
 
 ### Build
 
+**Windows:**
 ```powershell
 .\build.bat
 ```
@@ -63,7 +64,13 @@ fn main() {
 
 ```powershell
 gcc -std=c11 -O2 -Wall -Wextra src\util.c src\lexer.c src\parser.c src\check.c `
-    src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\main.c -o sbc.exe
+    src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\fmt.c src\main.c -o sbc.exe
+```
+
+**Linux x64:**
+```bash
+make
+./sbc --version
 ```
 
 Keep `std/` next to `sbc.exe`: imports are resolved relative to the importing file first, then relative to the compiler's directory.
@@ -83,7 +90,7 @@ fn main() {
 ## Usage
 
 ```
-sbc [build] <file.sb> [-o <out.exe>] [--release] [--llvm | -O3] [--emit-llvm] [--run]
+sbc [build] <file.sb> [-o <out>] [--target windows-x64|linux-x64] [--release] [--llvm | -O3] [--emit-llvm] [--run]
 sbc run <file.sb> [--release] [--llvm | -O3]
 sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
 sbc check [--lib] <file.sb>
@@ -93,7 +100,8 @@ sbc --version | --help
 
 | Command / Option | Effect |
 |---|---|
-| `sbc [build] <file.sb>` | Debug build with the native backend: overflow, narrowing, null, and bounds checks enabled. |
+| `sbc [build] <file.sb>` | Debug build (native PE32+ on Windows; LLVM ELF on Linux): overflow, narrowing, null, and bounds checks enabled. |
+| `--target <os>` | Select target platform: `windows-x64` or `linux-x64` (supports cross-compiling Windows PE32+ `.exe` directly from Linux, or emitting Linux LLVM IR from Windows). |
 | `sbc run <file.sb>` | Compile and execute immediately (equivalent to `--run` / `-r`). |
 | `sbc test <file.sb>` | Discover and run all `fn test_*()` unit tests in a file (supports `--filter`, `--release`, `--llvm`). |
 | `sbc check [--lib] <file.sb>` | Fast type-check only (no codegen, no output file). Pass `--lib` for library modules without `fn main()`. |
@@ -182,7 +190,7 @@ editors/      VS Code extension (highlighting, live diagnostics, sbc fmt, outlin
 
 ## Status
 
-The core language is complete and specified in [docs/spec.md](docs/spec.md). Windows x64 is currently the only target. Planned work — including a string ownership model, first-class ranges, and Linux/macOS backends — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
+The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3` + full 25-module `std/`) and **Linux x64** (LLVM x86-64 System V ELF backend + POSIX FFI via `dlopen`/`dlsym` + Windows cross-compilation) are supported and tested in CI. Planned work — including a POSIX `std/` I/O layer, macOS target, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
 
 ## License
 

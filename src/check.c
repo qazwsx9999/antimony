@@ -3616,7 +3616,7 @@ static void register_builtins(Checker *c) {
 static void register_dll_import(Program *prog, const char *dll_name, const char *fn_name) {
     int d_idx = -1;
     for (int i = 0; i < prog->dll_imports.len; i++) {
-        if (_stricmp(prog->dll_imports.items[i].dll_name, dll_name) == 0) {
+        if (sb_stricmp(prog->dll_imports.items[i].dll_name, dll_name) == 0) {
             d_idx = i;
             break;
         }
@@ -3637,7 +3637,7 @@ static void register_dll_import(Program *prog, const char *dll_name, const char 
 static int find_iat_slot(Program *prog, const char *dll_name, const char *fn_name) {
     for (int i = 0; i < prog->dll_imports.len; i++) {
         DllImport *di = &prog->dll_imports.items[i];
-        if (_stricmp(di->dll_name, dll_name) == 0) {
+        if (sb_stricmp(di->dll_name, dll_name) == 0) {
             for (int j = 0; j < di->funcs.len; j++) {
                 if (strcmp(di->funcs.items[j], fn_name) == 0) {
                     return di->first_iat_slot + j;
@@ -3819,7 +3819,7 @@ Program check_ex(NodeVec decls, bool require_main) {
                 Symbol *existing = lookup_in(c.global, d->name);
                 if (existing && existing->kind == SYM_FN && existing->is_extern &&
                     existing->type == ret && existing->decl->list.len == d->list.len &&
-                    _stricmp(existing->decl->dll_name, d->dll_name) == 0) {
+                    sb_stricmp(existing->decl->dll_name, d->dll_name) == 0) {
                     bool same_params = true;
                     for (int j = 0; j < d->list.len; j++) {
                         if (existing->decl->list.items[j]->type != d->list.items[j]->type) {

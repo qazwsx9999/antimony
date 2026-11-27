@@ -7,7 +7,7 @@ on:
     branches: [ master, main ]
 
 jobs:
-  build-and-test:
+  build-and-test-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,13 +21,14 @@ jobs:
         shell: pwsh
         run: |
           .\sbc.exe --version
-          .\sbc.exe fmt --check tests\stdlib_test.sb
+          .\sbc.exe fmt --check tests\stdlib_test.sb tests\linux_test.sb
 
-      - name: Run self-hosted stdlib unit tests (sbc test)
+      - name: Run self-hosted unit tests (sbc test)
         shell: pwsh
         run: |
           .\sbc.exe test tests\stdlib_test.sb
           .\sbc.exe test tests\stdlib_test.sb --llvm
+          .\sbc.exe test tests\linux_test.sb
 
       - name: Run full compiler & backend test suite (Native x64 & LLVM -O3)
         shell: pwsh
@@ -40,3 +41,38 @@ jobs:
           .\sbc.exe run examples\demo.sb
           .\sbc.exe run examples\sbwc.sb
           .\sbc.exe run examples\sbhttpd.sb
+
+  build-and-test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang
+        run: sudo apt-get update && sudo apt-get install -y clang
+
+      - name: Build sbc on Linux x64 (warnings as errors)
+        run: make CFLAGS="-std=c11 -O2 -Wall -Wextra -Werror"
+
+      - name: Verify CLI version, formatting, and cross-platform type-checking
+        run: |
+          ./sbc --version
+          ./sbc fmt --check tests/stdlib_test.sb tests/linux_test.sb
+          ./sbc check --lib std/core.sb
+          ./sbc check --lib std/sort.sb
+
+      - name: Run Antimony unit tests on Linux x64 (debug & -O3 release)
+        run: |
+          ./sbc test tests/linux_test.sb
+          ./sbc test tests/linux_test.sb --release
+
+      - name: Run Linux ELF shared-library FFI test (libm.so.6 & libc.so.6)
+        run: |
+          out=$(./sbc run tests/linux_ffi_test.sb)
+          echo "$out"
+          test "$out" = "linux_ffi_ok=12 14"
+
+      - name: Cross-compile Windows PE32+ .exe directly from Linux
+        run: |
+          ./sbc build examples/demo.sb --target windows-x64 -o /tmp/demo_win64.exe
+          head -c 2 /tmp/demo_win64.exe | grep -q "MZ"
+          rm -f /tmp/demo_win64.exe

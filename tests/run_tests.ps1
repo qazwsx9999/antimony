@@ -3565,6 +3565,38 @@ if (Should-RunTest "phase29_sbc_test_llvm" $true) {
     Write-Host "PASS [test-llvm]     phase29_sbc_test_llvm"
 }
 
+# 39. Phase 31: Cross-Platform Linux x64 LLVM IR Target & Cross-Platform Unit Tests
+if (Should-RunTest "phase31_linux_target_ir") {
+    $linuxFfi = Join-Path $root "tests\linux_ffi_test.sb"
+    $linuxLl  = Join-Path $tmp "phase31_linux_ffi.ll"
+    $compOut = (& $sbc build $linuxFfi --target linux-x64 --emit-llvm -o $linuxLl 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $linuxLl)) {
+        throw "FAIL [phase31_linux_target_ir]: --target linux-x64 --emit-llvm failed:`n$compOut"
+    }
+    $ll = Get-Content -Path $linuxLl -Raw
+    if ($ll -notmatch 'target triple = "x86_64-pc-linux-gnu"' -or
+        $ll -notmatch 'target datalayout = "e-m:e-' -or
+        $ll -notmatch 'declare i64 @write\(i32, ptr, i64\)' -or
+        $ll -notmatch 'declare void @_exit\(i32\)' -or
+        $ll -notmatch 'call ptr @dlopen\(' -or
+        $ll -notmatch 'call ptr @dlsym\(') {
+        throw "FAIL [phase31_linux_target_ir]: emitted Linux LLVM IR missing required System V / POSIX runtime ops"
+    }
+    if ($ll -match '@GetStdHandle|@WriteFile|@ExitProcess|@LoadLibraryA') {
+        throw "FAIL [phase31_linux_target_ir]: emitted Linux LLVM IR unexpectedly contains Win32 symbols"
+    }
+
+    # Verify cross-platform tests/linux_test.sb runs cleanly via `sbc test` on Windows too
+    $linuxUnit = Join-Path $root "tests\linux_test.sb"
+    $tout = (& $sbc test $linuxUnit 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 4 passed; 0 failed') {
+        throw "FAIL [phase31_linux_target_ir]: tests/linux_test.sb failed:`n$tout"
+    }
+
+    $script:PassedCount++
+    Write-Host "PASS [cross-target]  phase31_linux_target_ir"
+}
+
 if ($script:SkippedCount -gt 0) {
     Write-Host "`nAll $($script:PassedCount) selected tests passed ($($script:SkippedCount) skipped)."
 } else {

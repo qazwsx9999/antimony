@@ -1,0 +1,22 @@
+// =============================================================================
+// tests/linux_ffi_test.sb - Linux x64 dynamic library FFI test (`dlopen`/`dlsym`)
+// =============================================================================
+
+extern "libm.so.6" {
+    fn sqrt(x: f64): f64
+}
+
+extern "libc.so.6" {
+    fn strlen(s: *const u8): usize
+}
+
+fn main() {
+    var r = sqrt(144.0)
+    var s = "antimony-linux"
+    var n = strlen(ptr_cast(*const u8, s))
+    if r < 11.999 || r > 12.001 || n != 14 {
+        print("FAIL: r={} n={}", r, n)
+        exit(1)
+    }
+    print("linux_ffi_ok={} {}", i64(r), n)
+}

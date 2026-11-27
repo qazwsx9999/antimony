@@ -1,0 +1,94 @@
+// =============================================================================
+// tests/linux_test.sb - Cross-platform core language & stdlib unit tests
+// Runs identically on both Linux x64 (`sbc test tests/linux_test.sb`) and
+// Windows x64 (`sbc test tests\linux_test.sb`).
+// =============================================================================
+
+import "std/core.sb"
+import "std/sort.sb"
+
+struct Vec2 {
+    x: i64
+    y: i64
+}
+
+fn (v: *Vec2) add(dx: i64, dy: i64) {
+    v.x += dx
+    v.y += dy
+}
+
+fn (v: Vec2) dot(other: Vec2): i64 {
+    return v.x * other.x + v.y * other.y
+}
+
+enum CalcErr {
+    DivByZero
+}
+
+fn safe_div(a: i64, b: i64): Result[i64, CalcErr] {
+    if b == 0 {
+        return .Err(.DivByZero)
+    }
+    return .Ok(a / b)
+}
+
+fn compute_ratio(a: i64, b: i64): Result[i64, CalcErr] {
+    var q = safe_div(a, b)?
+    return .Ok(q * 2)
+}
+
+fn apply_op(a: i32, b: i32, op: fn(i32, i32): i32): i32 {
+    return op(a, b)
+}
+
+fn test_structs_methods_and_swap() {
+    var p = Vec2 { x: 3, y: 4 }
+    p.add(1, 2)
+    assert(p.x == 4 && p.y == 6, "Vec2.add")
+    assert(p.dot(Vec2 { x: 2, y: 3 }) == 26, "Vec2.dot")
+
+    var a: i64 = 100
+    var b: i64 = 200
+    swap(&a, &b)
+    assert(a == 200 && b == 100, "swap")
+}
+
+fn test_result_option_and_try() {
+    var ok_v = compute_ratio(20, 4).unwrap_or(-1)
+    var err_v = compute_ratio(20, 0).unwrap_or(-1)
+    assert(ok_v == 10 && err_v == -1, "Result ? propagation")
+
+    var o1: Option[str] = .Some("linux-and-windows")
+    var o2: Option[str] = .None
+    assert(o1.is_some() && o1.unwrap_or("") == "linux-and-windows", "Option Some")
+    assert(o2.is_none() && o2.unwrap_or("def") == "def", "Option None")
+}
+
+fn test_generics_sort_and_closures() {
+    var arr[7]: i32 = [9, 1, 5, 3, 5, 8, 2]
+    sort(arr)
+    assert(is_sorted(arr), "sort ascending")
+    assert(lower_bound(arr, 5) == 3 && upper_bound(arr, 5) == 5, "bounds")
+    assert(binary_search(arr, 8) == 5, "binary_search")
+
+    sort_desc(arr)
+    assert(arr[0] == 9 && arr[6] == 1, "sort_desc")
+
+    var res = apply_op(6, 7, fn(x: i32, y: i32): i32 { return x * y })
+    assert(res == 42, "anonymous fn ptr")
+}
+
+fn test_atomics_and_defer() {
+    var counter: i64 = 10
+    var prev = atomic_add(&counter, 5)
+    assert(prev == 10 && atomic_load(&counter) == 15, "atomic_add")
+    var cas_prev = atomic_cas(&counter, 15, 99)
+    assert(cas_prev == 15 && atomic_load(&counter) == 99, "atomic_cas")
+
+    var log: i32 = 0
+    if true {
+        defer { log = log * 10 + 1 }
+        defer { log = log * 10 + 2 }
+    }
+    assert(log == 21, "defer LIFO")
+}

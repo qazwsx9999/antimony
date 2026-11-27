@@ -52,6 +52,17 @@ void *xrealloc(void *p, size_t n) {
     return p;
 }
 
+int sb_stricmp(const char *a, const char *b) {
+    while (*a && *b) {
+        unsigned char ca = (unsigned char)*a++;
+        unsigned char cb = (unsigned char)*b++;
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return (int)ca - (int)cb;
+    }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
 void buf_reserve(Buf *b, size_t extra) {
     size_t need = b->len + extra;
     if (need <= b->cap) return;

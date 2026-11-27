@@ -30,6 +30,7 @@ typedef struct {
     Buf out;
     Program *prog;
     bool release;
+    TargetOs target;
     int tmp_id;
     int lbl_id;
     int str_id;
@@ -621,26 +622,46 @@ static void emit_llvm_int_ops_for_width(Buf *b, int bits, const char *smin, cons
     }
 }
 
-static void emit_llvm_runtime_preamble(Buf *b) {
-    bprintf(b,
-        "; ModuleID = 'antimony_module'\n"
-        "target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n"
-        "target triple = \"x86_64-pc-windows-msvc\"\n\n"
-        "%%sb.slice = type { ptr, i64 }\n"
-        "@sb_stdout_handle = internal global ptr null, align 8\n"
-        "@.str.nl        = private unnamed_addr constant [2 x i8] c\"\\0A\\00\", align 1\n"
-        "@.str.true_raw  = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n"
-        "@.str.false_raw = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n\n"
-        "declare ptr @GetStdHandle(i32)\n"
-        "declare i32 @WriteFile(ptr, ptr, i32, ptr, ptr)\n"
-        "declare void @ExitProcess(i32) #1\n"
-        "declare ptr @LoadLibraryA(ptr)\n"
-        "declare ptr @GetProcAddress(ptr, ptr)\n"
-        "declare i32 @memcmp(ptr, ptr, i64)\n"
-        "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n"
-        "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)\n"
-        "declare i1 @llvm.expect.i1(i1, i1)\n\n"
-    );
+static void emit_llvm_runtime_preamble(Buf *b, TargetOs target) {
+    if (target == TARGET_LINUX_X64) {
+        bprintf(b,
+            "; ModuleID = 'antimony_module'\n"
+            "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n"
+            "target triple = \"x86_64-pc-linux-gnu\"\n\n"
+            "%%sb.slice = type { ptr, i64 }\n"
+            "@.str.nl        = private unnamed_addr constant [2 x i8] c\"\\0A\\00\", align 1\n"
+            "@.str.true_raw  = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n"
+            "@.str.false_raw = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n\n"
+            "declare i64 @write(i32, ptr, i64)\n"
+            "declare void @_exit(i32) #1\n"
+            "declare ptr @dlopen(ptr, i32)\n"
+            "declare ptr @dlsym(ptr, ptr)\n"
+            "declare i32 @memcmp(ptr, ptr, i64)\n"
+            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n"
+            "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)\n"
+            "declare i1 @llvm.expect.i1(i1, i1)\n\n"
+        );
+    } else {
+        bprintf(b,
+            "; ModuleID = 'antimony_module'\n"
+            "target datalayout = \"e-m:w-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n"
+            "target triple = \"x86_64-pc-windows-msvc\"\n\n"
+            "%%sb.slice = type { ptr, i64 }\n"
+            "@sb_stdout_handle = internal global ptr null, align 8\n"
+            "@.str.nl        = private unnamed_addr constant [2 x i8] c\"\\0A\\00\", align 1\n"
+            "@.str.true_raw  = private unnamed_addr constant [5 x i8] c\"true\\00\", align 1\n"
+            "@.str.false_raw = private unnamed_addr constant [6 x i8] c\"false\\00\", align 1\n\n"
+            "declare ptr @GetStdHandle(i32)\n"
+            "declare i32 @WriteFile(ptr, ptr, i32, ptr, ptr)\n"
+            "declare void @ExitProcess(i32) #1\n"
+            "declare ptr @LoadLibraryA(ptr)\n"
+            "declare ptr @GetProcAddress(ptr, ptr)\n"
+            "declare i32 @memcmp(ptr, ptr, i64)\n"
+            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1 immarg)\n"
+            "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1 immarg)\n"
+            "declare i1 @llvm.expect.i1(i1, i1)\n\n"
+        );
+    }
 
     const int widths[4] = { 8, 16, 32, 64 };
     for (int i = 0; i < 4; i++) {
@@ -657,24 +678,45 @@ static void emit_llvm_runtime_preamble(Buf *b) {
             bits, bits, bits, bits, bits, bits, bits, bits);
     }
 
+    if (target == TARGET_LINUX_X64) {
+        bprintf(b,
+            "\ndefine internal void @sb_rt_write(ptr %%buf, i32 %%len) #2 {\n"
+            "entry:\n"
+            "  %%len64 = zext i32 %%len to i64\n"
+            "  %%ok = call i64 @write(i32 1, ptr %%buf, i64 %%len64)\n"
+            "  ret void\n"
+            "}\n\n"
+            "define internal void @sb_rt_trap(ptr %%msg, i32 %%len) #1 {\n"
+            "entry:\n"
+            "  %%len64 = zext i32 %%len to i64\n"
+            "  %%ok = call i64 @write(i32 2, ptr %%msg, i64 %%len64)\n"
+            "  call void @_exit(i32 101)\n"
+            "  unreachable\n"
+            "}\n\n"
+        );
+    } else {
+        bprintf(b,
+            "\ndefine internal void @sb_rt_write(ptr %%buf, i32 %%len) #2 {\n"
+            "entry:\n"
+            "  %%written = alloca i32, align 4\n"
+            "  store i32 0, ptr %%written, align 4\n"
+            "  %%h = load ptr, ptr @sb_stdout_handle, align 8\n"
+            "  %%ok = call i32 @WriteFile(ptr %%h, ptr %%buf, i32 %%len, ptr %%written, ptr null)\n"
+            "  ret void\n"
+            "}\n\n"
+            "define internal void @sb_rt_trap(ptr %%msg, i32 %%len) #1 {\n"
+            "entry:\n"
+            "  %%written = alloca i32, align 4\n"
+            "  store i32 0, ptr %%written, align 4\n"
+            "  %%herr = call ptr @GetStdHandle(i32 -12)\n"
+            "  %%ok = call i32 @WriteFile(ptr %%herr, ptr %%msg, i32 %%len, ptr %%written, ptr null)\n"
+            "  call void @ExitProcess(i32 101)\n"
+            "  unreachable\n"
+            "}\n\n"
+        );
+    }
+
     bprintf(b,
-        "\ndefine internal void @sb_rt_write(ptr %%buf, i32 %%len) #2 {\n"
-        "entry:\n"
-        "  %%written = alloca i32, align 4\n"
-        "  store i32 0, ptr %%written, align 4\n"
-        "  %%h = load ptr, ptr @sb_stdout_handle, align 8\n"
-        "  %%ok = call i32 @WriteFile(ptr %%h, ptr %%buf, i32 %%len, ptr %%written, ptr null)\n"
-        "  ret void\n"
-        "}\n\n"
-        "define internal void @sb_rt_trap(ptr %%msg, i32 %%len) #1 {\n"
-        "entry:\n"
-        "  %%written = alloca i32, align 4\n"
-        "  store i32 0, ptr %%written, align 4\n"
-        "  %%herr = call ptr @GetStdHandle(i32 -12)\n"
-        "  %%ok = call i32 @WriteFile(ptr %%herr, ptr %%msg, i32 %%len, ptr %%written, ptr null)\n"
-        "  call void @ExitProcess(i32 101)\n"
-        "  unreachable\n"
-        "}\n\n"
         "define internal void @sb_rt_print_nl() #2 {\n"
         "entry:\n"
         "  call void @sb_rt_write(ptr @.str.nl, i32 1)\n"
@@ -1654,7 +1696,11 @@ static LlvmVal llvm_gen_expr(LlvmGen *g, Node *n) {
         }
         if (n->builtin == B_EXIT) {
             LlvmVal av = llvm_gen_expr(g, n->list.items[0]);
-            bprintf(&g->out, "  call void @ExitProcess(i32 %s)\n", av.op);
+            if (g->target == TARGET_LINUX_X64) {
+                bprintf(&g->out, "  call void @_exit(i32 %s)\n", av.op);
+            } else {
+                bprintf(&g->out, "  call void @ExitProcess(i32 %s)\n", av.op);
+            }
             bprintf(&g->out, "  unreachable\n");
             g->block_terminated = true;
             return (LlvmVal){ NULL, "void" };
@@ -2245,12 +2291,13 @@ static void llvm_gen_block(LlvmGen *g, Node *blk) {
 // Module generation & LLVM Clang driver
 // ---------------------------------------------------------------------------
 
-static void generate_llvm_ir_unit(Program *prog, NodeVec all_decls, bool release, Buf *final_out) {
+static void generate_llvm_ir_unit(Program *prog, NodeVec all_decls, bool release, TargetOs target, Buf *final_out) {
     LlvmGen g = {0};
     g.prog = prog;
     g.release = release;
+    g.target = target;
 
-    emit_llvm_runtime_preamble(&g.hdr);
+    emit_llvm_runtime_preamble(&g.hdr, target);
 
     // 1. Struct and tagged union enum type definitions (in topological layout order).
     for (int i = 0; i < prog->type_decls.len; i++) {
@@ -2351,22 +2398,33 @@ static void generate_llvm_ir_unit(Program *prog, NodeVec all_decls, bool release
         bprintf(&g.mod_fns, "}\n\n");
     }
 
-    // 5. Program entry point `@main`: init stdout handle, resolve extern DLLs, call `@sb_fn_main`.
+    // 5. Program entry point `@main`: init runtime, resolve extern libraries, call `@sb_fn_main`.
     bprintf(&g.mod_fns,
         "define i32 @main() #2 {\n"
-        "entry:\n"
-        "  %%hstd = call ptr @GetStdHandle(i32 -11)\n"
-        "  store ptr %%hstd, ptr @sb_stdout_handle, align 8\n");
+        "entry:\n");
+    if (target == TARGET_WINDOWS_X64) {
+        bprintf(&g.mod_fns,
+            "  %%hstd = call ptr @GetStdHandle(i32 -11)\n"
+            "  store ptr %%hstd, ptr @sb_stdout_handle, align 8\n");
+    }
     for (int i = 0; i < extern_fns.len; i++) {
         Node *d = extern_fns.items[i];
         const char *dll_sym = llvm_intern_str(&g, d->dll_name, (int)strlen(d->dll_name));
         const char *fn_sym  = llvm_intern_str(&g, d->name, (int)strlen(d->name));
         const char *ext_ptr = llvm_mangled(&g, "@sb_ext_", d->name);
-        bprintf(&g.mod_fns,
-            "  %%hdll_%d = call ptr @LoadLibraryA(ptr %s)\n"
-            "  %%fp_%d = call ptr @GetProcAddress(ptr %%hdll_%d, ptr %s)\n"
-            "  store ptr %%fp_%d, ptr %s, align 8\n",
-            i, dll_sym, i, i, fn_sym, i, ext_ptr);
+        if (target == TARGET_LINUX_X64) {
+            bprintf(&g.mod_fns,
+                "  %%hdll_%d = call ptr @dlopen(ptr %s, i32 1)\n"
+                "  %%fp_%d = call ptr @dlsym(ptr %%hdll_%d, ptr %s)\n"
+                "  store ptr %%fp_%d, ptr %s, align 8\n",
+                i, dll_sym, i, i, fn_sym, i, ext_ptr);
+        } else {
+            bprintf(&g.mod_fns,
+                "  %%hdll_%d = call ptr @LoadLibraryA(ptr %s)\n"
+                "  %%fp_%d = call ptr @GetProcAddress(ptr %%hdll_%d, ptr %s)\n"
+                "  store ptr %%fp_%d, ptr %s, align 8\n",
+                i, dll_sym, i, i, fn_sym, i, ext_ptr);
+        }
     }
     bprintf(&g.mod_fns,
         "  call void @sb_fn_main()\n"
@@ -2391,9 +2449,9 @@ static void generate_llvm_ir_unit(Program *prog, NodeVec all_decls, bool release
     free(extern_fns.items);
 }
 
-bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release) {
+bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release, TargetOs target) {
     Buf ll_src = {0};
-    generate_llvm_ir_unit(prog, all_decls, release, &ll_src);
+    generate_llvm_ir_unit(prog, all_decls, release, target, &ll_src);
     FILE *fp = fopen(ll_path, "wb");
     if (!fp) {
         free(ll_src.data);
@@ -2423,9 +2481,9 @@ static const char *find_llvm_clang(void) {
     return "clang";
 }
 
-bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release) {
+bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release, TargetOs target) {
     Buf ll_src = {0};
-    generate_llvm_ir_unit(prog, all_decls, release, &ll_src);
+    generate_llvm_ir_unit(prog, all_decls, release, target, &ll_src);
 
     char tmp_ll[1024];
     snprintf(tmp_ll, sizeof(tmp_ll), "%s.__sb_opt.ll", exe_path);
@@ -2439,16 +2497,17 @@ bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path,
     free(ll_src.data);
 
     const char *clang = find_llvm_clang();
+    const char *opt_flags = release ? "-O3 -march=native" : "-O1";
     char cmd[4096];
 #ifdef _WIN32
     // In cmd.exe, wrap the entire command in outer quotes when executable path contains spaces/quotes.
     snprintf(cmd, sizeof(cmd),
-             "\"\"%s\" -O3 -march=native -Wno-override-module \"%s\" -o \"%s\" -lkernel32\"",
-             clang, tmp_ll, exe_path);
+             "\"\"%s\" %s -Wno-override-module \"%s\" -o \"%s\" -lkernel32\"",
+             clang, opt_flags, tmp_ll, exe_path);
 #else
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" -O3 -march=native -Wno-override-module \"%s\" -o \"%s\"",
-             clang, tmp_ll, exe_path);
+             "\"%s\" %s -Wno-override-module \"%s\" -o \"%s\" -ldl -lm",
+             clang, opt_flags, tmp_ll, exe_path);
 #endif
     int rc = system(cmd);
     remove(tmp_ll);
