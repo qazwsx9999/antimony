@@ -2,7 +2,7 @@
 #ifndef SB_H
 #define SB_H
 
-#define SB_VERSION "1.0.0"
+#define SB_VERSION "1.1.0"
 
 #include <stdarg.h>
 #include <stdbool.h>

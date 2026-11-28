@@ -4,6 +4,23 @@ All notable changes to **Antimony (`sbc`)** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-11-28
+
+Full dual-platform release with **100% parity across all 25 standard library modules** on both **Windows x64** and **Linux x64**.
+
+### Cross-Platform Compiler & Build System
+- Added native **Linux x64** target (`--target linux-x64`, System V AMD64 LLVM IR + POSIX `write`/`_exit`/`dlopen`/`dlsym` + `-ldl -lm -lpthread`), POSIX `Makefile`, and direct cross-compilation of Windows PE32+ `.exe` binaries from Linux.
+- Added Go-style OS-aware module resolution (`std/pal/*` automatically resolves `*_windows.sb` or `*_linux.sb` for the active target) and `sbc check --target windows-x64|linux-x64`.
+
+### Complete 25/25 Cross-Platform Standard Library (`std/pal/`)
+- **Core, Memory, Math, Time, Rand & Strings:** Cross-platform `std/mem.sb` (`calloc`/`malloc`/`realloc`), pure-Antimony `cstr_len`/`cstr_eq` in `std/str.sb`, `libm.so.6` + IEEE-754 `is_nan`/`is_finite` in `std/math.sb`, `CLOCK_MONOTONIC`/`nanosleep` + overflow-safe `elapsed_us` in `std/time.sb`, and `getrandom(2)` CSPRNG in `std/rand.sb`.
+- **I/O, Buffered I/O, Filesystem & OS:** Cross-platform `std/io.sb` (POSIX fds + `EINTR` retry), `std/bufio.sb`, `std/fs.sb` (`opendir`/`readdir` directory iteration + file copy), and `std/os.sb` (`/proc/self/cmdline` argv, `getenv`, `getcwd`).
+- **Concurrency, Processes & Networking:** Cross-platform `std/thread.sb` (`pthreads` + `pthread_mutex_t`/`pthread_rwlock_t`/`pthread_cond_t`), `std/process.sb` (`fork`/`execv`/`waitpid`/`pipe`/`dup2`/`kill`), `std/net.sb` (BSD sockets + `MSG_NOSIGNAL` + Linux `struct addrinfo`), and `std/http.sb`.
+
+### Verification, CI & Releases
+- Expanded `tests/linux_test.sb` to 10 unit tests covering all 25 `std/` modules; added `examples/sbwc.sb` and `examples/sbhttpd.sb` native Linux runs to GitHub Actions CI.
+- Added `release-linux-x64` (`antimony-v1.1.0-linux-x64.tar.gz` + `.sha256`) alongside Windows x64 `.zip` in `.github/workflows/release.yml`.
+
 ## [1.0.0] - 2026-11-27
 
 First stable core language and toolchain release for Windows x64.
