@@ -1,0 +1,184 @@
+// =============================================================================
+// Antimony PAL: std/pal/process_linux.sb
+// Linux POSIX child process spawning, waiting, termination, and pipe capture
+// via fork / execv("/bin/sh", ...) / waitpid / pipe / dup2 / kill.
+// =============================================================================
+
+import "std/str.sb"
+
+const PAL_PROC_WNOHANG: i32 = 1
+const PAL_PROC_SIGKILL: i32 = 9
+const PAL_PROC_EINTR: i32 = 4
+
+priv extern "libc.so.6" {
+    fn getpid(): i32
+    fn fork(): i32
+    fn execv(path: *const u8, argv: *const *const u8): i32
+    fn _exit(status: i32)
+    fn waitpid(pid: i32, wstatus: *i32, options: i32): i32
+    fn kill(pid: i32, sig: i32): i32
+    fn pipe(pipefd: *i32): i32
+    fn dup2(oldfd: i32, newfd: i32): i32
+    fn read(fd: i32, buf: *u8, count: usize): isize
+    fn close(fd: i32): i32
+    fn __errno_location(): *i32
+}
+
+priv fn decode_wait_status(status: i32): u32 {
+    var sig = status & 0x7F
+    if sig == 0 {
+        return u32((status >> 8) & 0xFF)
+    }
+    return u32(128 + sig)
+}
+
+pub fn pal_current_pid(): u32 {
+    return u32(getpid())
+}
+
+pub fn pal_proc_is_open(proc_handle: isize): bool {
+    return proc_handle > 0
+}
+
+pub fn pal_proc_close(proc_handle: *isize, thread_handle: *isize) {
+    *proc_handle = 0
+    *thread_handle = 0
+}
+
+pub fn pal_proc_wait(proc_handle: *isize, thread_handle: *isize, out_code: *u32): i32 {
+    var pid = i32(*proc_handle)
+    var status: i32 = 0
+    loop {
+        var r = waitpid(pid, &status, 0)
+        if r < 0 {
+            if *__errno_location() == PAL_PROC_EINTR {
+                continue
+            }
+            return -1
+        }
+        *proc_handle = 0
+        *thread_handle = 0
+        *out_code = decode_wait_status(status)
+        return 0
+    }
+}
+
+pub fn pal_proc_try_wait(proc_handle: *isize, thread_handle: *isize, out_code: *u32): i32 {
+    var pid = i32(*proc_handle)
+    var status: i32 = 0
+    var r = waitpid(pid, &status, PAL_PROC_WNOHANG)
+    if r == 0 {
+        return 0
+    }
+    if r < 0 {
+        return -1
+    }
+    *proc_handle = 0
+    *thread_handle = 0
+    *out_code = decode_wait_status(status)
+    return 1
+}
+
+pub fn pal_proc_kill(proc_handle: isize, exit_code: u32): bool {
+    var _unused = exit_code
+    return kill(i32(proc_handle), PAL_PROC_SIGKILL) == 0
+}
+
+pub fn pal_proc_spawn(cmd: str, out_proc: *isize, out_thread: *isize, out_pid: *u32): bool {
+    // Prepare C strings in parent before fork() so child stays async-signal-safe.
+    var sh_sb: StringBuilder
+    sh_sb.init(16)
+    defer sh_sb.free()
+    sh_sb.append("/bin/sh")
+
+    var flag_sb: StringBuilder
+    flag_sb.init(8)
+    defer flag_sb.free()
+    flag_sb.append("-c")
+
+    var cmd_sb: StringBuilder
+    cmd_sb.init(usize(len(cmd)) + 1)
+    defer cmd_sb.free()
+    cmd_sb.append(cmd)
+
+    var sh_p: *const u8 = sh_sb.cstr()
+    var flag_p: *const u8 = flag_sb.cstr()
+    var cmd_p: *const u8 = cmd_sb.cstr()
+
+    var pid = fork()
+    if pid < 0 {
+        return false
+    }
+    if pid == 0 {
+        var argv[4]: *const u8 = [sh_p, flag_p, cmd_p, null]
+        execv(sh_p, &argv[0])
+        _exit(127)
+    }
+    *out_proc = isize(pid)
+    *out_thread = 0
+    *out_pid = u32(pid)
+    return true
+}
+
+pub fn pal_proc_capture(cmd: str, out: *StringBuilder, out_code: *u32): bool {
+    var fds[2]: i32 = []
+    if pipe(&fds[0]) != 0 {
+        return false
+    }
+
+    var sh_sb: StringBuilder
+    sh_sb.init(16)
+    defer sh_sb.free()
+    sh_sb.append("/bin/sh")
+
+    var flag_sb: StringBuilder
+    flag_sb.init(8)
+    defer flag_sb.free()
+    flag_sb.append("-c")
+
+    var cmd_sb: StringBuilder
+    cmd_sb.init(usize(len(cmd)) + 1)
+    defer cmd_sb.free()
+    cmd_sb.append(cmd)
+
+    var sh_p: *const u8 = sh_sb.cstr()
+    var flag_p: *const u8 = flag_sb.cstr()
+    var cmd_p: *const u8 = cmd_sb.cstr()
+
+    var pid = fork()
+    if pid < 0 {
+        close(fds[0])
+        close(fds[1])
+        return false
+    }
+    if pid == 0 {
+        close(fds[0])
+        dup2(fds[1], 1)
+        dup2(fds[1], 2)
+        close(fds[1])
+        var argv[4]: *const u8 = [sh_p, flag_p, cmd_p, null]
+        execv(sh_p, &argv[0])
+        _exit(127)
+    }
+
+    close(fds[1])
+    var buf[4096]: u8
+    loop {
+        var n = read(fds[0], &buf[0], 4096)
+        if n < 0 {
+            if *__errno_location() == PAL_PROC_EINTR {
+                continue
+            }
+            break
+        }
+        if n == 0 {
+            break
+        }
+        out.append_bytes(buf[0..i64(n)])
+    }
+    close(fds[0])
+
+    var p = isize(pid)
+    var t: isize = 0
+    return pal_proc_wait(&p, &t, out_code) == 0
+}

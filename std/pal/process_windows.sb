@@ -1,0 +1,212 @@
+// =============================================================================
+// Antimony PAL: std/pal/process_windows.sb
+// Win32 child process creation, waiting, termination, and pipe capture.
+// =============================================================================
+
+import "std/str.sb"
+
+const PAL_PROC_STARTF_USESTDHANDLES: u32 = 0x00000100
+const PAL_PROC_HANDLE_FLAG_INHERIT: u32 = 0x00000001
+const PAL_PROC_WAIT_OBJECT_0: u32 = 0x00000000
+const PAL_PROC_WAIT_TIMEOUT_CODE: u32 = 0x00000102
+const PAL_PROC_WAIT_INFINITE: u32 = 0xFFFFFFFF
+const PAL_PROC_STD_INPUT_ID: u32 = 0xFFFFFFF6
+const PAL_PROC_INVALID_HANDLE: isize = -1
+
+priv struct SecurityAttributes {
+    n_length: u32
+    _pad0: u32
+    lp_security_descriptor: usize
+    b_inherit_handle: i32
+    _pad1: u32
+}
+
+priv struct StartupInfoA {
+    cb: u32
+    _pad0: u32
+    lp_reserved: usize
+    lp_desktop: usize
+    lp_title: usize
+    dw_x: u32
+    dw_y: u32
+    dw_x_size: u32
+    dw_y_size: u32
+    dw_x_count_chars: u32
+    dw_y_count_chars: u32
+    dw_fill_attribute: u32
+    dw_flags: u32
+    w_show_window: u16
+    cb_reserved2: u16
+    _pad1: u32
+    lp_reserved2: usize
+    h_std_input: isize
+    h_std_output: isize
+    h_std_error: isize
+}
+
+priv struct ProcessInformation {
+    h_process: isize
+    h_thread: isize
+    dw_process_id: u32
+    dw_thread_id: u32
+}
+
+priv extern "kernel32.dll" {
+    fn CreateProcessA(
+        lpApplicationName: *const u8,
+        lpCommandLine: *u8,
+        lpProcessAttributes: usize,
+        lpThreadAttributes: usize,
+        bInheritHandles: i32,
+        dwCreationFlags: u32,
+        lpEnvironment: usize,
+        lpCurrentDirectory: *const u8,
+        lpStartupInfo: *u8,
+        lpProcessInformation: *u8
+    ): i32
+    fn CreatePipe(
+        hReadPipe: *isize,
+        hWritePipe: *isize,
+        lpPipeAttributes: *u8,
+        nSize: u32
+    ): i32
+    fn SetHandleInformation(hObject: isize, dwMask: u32, dwFlags: u32): i32
+    fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32): u32
+    fn GetExitCodeProcess(hProcess: isize, lpExitCode: *u32): i32
+    fn TerminateProcess(hProcess: isize, uExitCode: u32): i32
+    fn GetCurrentProcessId(): u32
+    fn GetStdHandle(nStdHandle: u32): isize
+    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
+    fn CloseHandle(hObject: isize): i32
+    fn GetLastError(): u32
+}
+
+pub fn pal_current_pid(): u32 {
+    return GetCurrentProcessId()
+}
+
+pub fn pal_proc_is_open(proc_handle: isize): bool {
+    return proc_handle != 0 && proc_handle != PAL_PROC_INVALID_HANDLE
+}
+
+pub fn pal_proc_close(proc_handle: *isize, thread_handle: *isize) {
+    if *thread_handle != 0 && *thread_handle != PAL_PROC_INVALID_HANDLE {
+        CloseHandle(*thread_handle)
+        *thread_handle = 0
+    }
+    if *proc_handle != 0 && *proc_handle != PAL_PROC_INVALID_HANDLE {
+        CloseHandle(*proc_handle)
+        *proc_handle = 0
+    }
+}
+
+// Returns 0 on success (exit code in `*out_code`), or -1 on error (use pal_last_os_error()).
+pub fn pal_proc_wait(proc_handle: *isize, thread_handle: *isize, out_code: *u32): i32 {
+    var w = WaitForSingleObject(usize(*proc_handle), PAL_PROC_WAIT_INFINITE)
+    if w != PAL_PROC_WAIT_OBJECT_0 {
+        return -1
+    }
+    var code: u32 = 0
+    if GetExitCodeProcess(*proc_handle, &code) == 0 {
+        pal_proc_close(proc_handle, thread_handle)
+        return -1
+    }
+    pal_proc_close(proc_handle, thread_handle)
+    *out_code = code
+    return 0
+}
+
+// Returns 1 if exited (`*out_code` set, handles closed), 0 if still running, -1 on error.
+pub fn pal_proc_try_wait(proc_handle: *isize, thread_handle: *isize, out_code: *u32): i32 {
+    var w = WaitForSingleObject(usize(*proc_handle), 0)
+    if w == PAL_PROC_WAIT_TIMEOUT_CODE {
+        return 0
+    }
+    if w != PAL_PROC_WAIT_OBJECT_0 {
+        return -1
+    }
+    var code: u32 = 0
+    if GetExitCodeProcess(*proc_handle, &code) == 0 {
+        pal_proc_close(proc_handle, thread_handle)
+        return -1
+    }
+    pal_proc_close(proc_handle, thread_handle)
+    *out_code = code
+    return 1
+}
+
+pub fn pal_proc_kill(proc_handle: isize, exit_code: u32): bool {
+    return TerminateProcess(proc_handle, exit_code) != 0
+}
+
+pub fn pal_proc_spawn(cmd: str, out_proc: *isize, out_thread: *isize, out_pid: *u32): bool {
+    var cb: StringBuilder
+    cb.init(usize(len(cmd)) + 1)
+    defer cb.free()
+    cb.append(cmd)
+
+    var si = StartupInfoA { cb: u32(sizeof(StartupInfoA)) }
+    var pi = ProcessInformation {}
+    var ok = CreateProcessA(
+        null, cb.cstr(), 0, 0, 0, 0, 0, null,
+        ptr_cast(*u8, &si), ptr_cast(*u8, &pi)
+    )
+    if ok == 0 {
+        return false
+    }
+    *out_proc = pi.h_process
+    *out_thread = pi.h_thread
+    *out_pid = pi.dw_process_id
+    return true
+}
+
+pub fn pal_proc_capture(cmd: str, out: *StringBuilder, out_code: *u32): bool {
+    var sa = SecurityAttributes {
+        n_length: u32(sizeof(SecurityAttributes)),
+        b_inherit_handle: 1
+    }
+    var h_read: isize = 0
+    var h_write: isize = 0
+    if CreatePipe(&h_read, &h_write, ptr_cast(*u8, &sa), 0) == 0 {
+        return false
+    }
+    SetHandleInformation(h_read, PAL_PROC_HANDLE_FLAG_INHERIT, 0)
+
+    var cb: StringBuilder
+    cb.init(usize(len(cmd)) + 1)
+    defer cb.free()
+    cb.append(cmd)
+
+    var si = StartupInfoA {
+        cb: u32(sizeof(StartupInfoA)),
+        dw_flags: PAL_PROC_STARTF_USESTDHANDLES,
+        h_std_input: GetStdHandle(PAL_PROC_STD_INPUT_ID),
+        h_std_output: h_write,
+        h_std_error: h_write
+    }
+    var pi = ProcessInformation {}
+    var ok = CreateProcessA(
+        null, cb.cstr(), 0, 0, 1, 0, 0, null,
+        ptr_cast(*u8, &si), ptr_cast(*u8, &pi)
+    )
+    CloseHandle(h_write)
+    if ok == 0 {
+        CloseHandle(h_read)
+        return false
+    }
+
+    var buf[4096]: u8
+    loop {
+        var nread: u32 = 0
+        var rok = ReadFile(h_read, &buf[0], 4096, &nread, 0)
+        if rok == 0 || nread == 0 {
+            break
+        }
+        out.append_bytes(buf[0..i64(nread)])
+    }
+    CloseHandle(h_read)
+
+    var p = pi.h_process
+    var t = pi.h_thread
+    return pal_proc_wait(&p, &t, out_code) == 0
+}

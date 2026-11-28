@@ -11,19 +11,19 @@ priv struct Timespec {
 }
 
 priv extern "libc.so.6" {
-    fn clock_gettime(clk_id: i32, tp: *Timespec): i32
+    fn clock_gettime(clk_id: i32, tp: *u8): i32
     fn nanosleep(req: *const Timespec, rem: *Timespec): i32
 }
 
 pub fn pal_ticks_ms(): u64 {
     var ts = Timespec {}
-    clock_gettime(CLOCK_MONOTONIC, &ts)
+    clock_gettime(CLOCK_MONOTONIC, ptr_cast(*u8, &ts))
     return u64(ts.tv_sec) * 1000 + u64(ts.tv_nsec) / 1_000_000
 }
 
 pub fn pal_perf_counter(): i64 {
     var ts = Timespec {}
-    clock_gettime(CLOCK_MONOTONIC, &ts)
+    clock_gettime(CLOCK_MONOTONIC, ptr_cast(*u8, &ts))
     return ts.tv_sec * 1_000_000_000 + ts.tv_nsec
 }
 

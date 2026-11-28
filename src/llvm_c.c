@@ -2506,7 +2506,7 @@ bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path,
              clang, opt_flags, tmp_ll, exe_path);
 #else
     snprintf(cmd, sizeof(cmd),
-             "\"%s\" %s -Wno-override-module \"%s\" -o \"%s\" -ldl -lm",
+             "\"%s\" %s -Wno-override-module \"%s\" -o \"%s\" -ldl -lm -lpthread",
              clang, opt_flags, tmp_ll, exe_path);
 #endif
     int rc = system(cmd);

@@ -1,9 +1,10 @@
 // =============================================================================
 // tests/linux_test.sb - Cross-Platform Language & Standard Library Unit Tests
-// Exercises all 21 cross-platform std/ modules identically on Linux x64 and
+// Exercises all 25 cross-platform std/ modules identically on Linux x64 and
 // Windows x64:
 //   core, mem, vec, map, set, deque, heap, sort, str, path, math, time,
-//   rand, encoding, hash, json, io, bufio, fs, os, testing
+//   rand, encoding, hash, json, io, bufio, fs, os, thread, process, net,
+//   http, testing
 //
 // Run with:
 //   sbc test tests/linux_test.sb
@@ -30,6 +31,10 @@ import "std/io.sb"
 import "std/bufio.sb"
 import "std/fs.sb"
 import "std/os.sb"
+import "std/thread.sb"
+import "std/process.sb"
+import "std/net.sb"
+import "std/http.sb"
 import "std/testing.sb"
 
 struct Vec2 {
@@ -450,4 +455,180 @@ fn test_io_bufio_fs_and_os() {
     assert_ok(fs_remove_file(f4), "rm f4")
     assert_ok(fs_rmdir(dir), "rmdir")
     assert_false(fs_exists(dir), "dir cleaned up")
+}
+
+struct SharedCounter {
+    mtx: Mutex
+    cv: CondVar
+    total: i64
+    ready: bool
+    atom: AtomicI64
+}
+
+fn worker_increment(raw: *u8): u32 {
+    var sc = ptr_cast(*SharedCounter, raw)
+    loop _ in 0..500 {
+        sc.mtx.lock()
+        sc.total += 1
+        sc.mtx.unlock()
+        sc.atom.fetch_add(1)
+    }
+    return 77
+}
+
+fn worker_signal_cond(raw: *u8): u32 {
+    var sc = ptr_cast(*SharedCounter, raw)
+    sleep_ms(10)
+    sc.mtx.lock()
+    sc.ready = true
+    sc.cv.notify_one()
+    sc.mtx.unlock()
+    return 1
+}
+
+fn test_threads_locks_and_condvar() {
+    assert_ne(current_thread_id(), u32(0), "current_thread_id")
+
+    var sc = SharedCounter {}
+    sc.mtx.init()
+    sc.cv.init()
+    sc.atom.init(0)
+
+    var t1 = spawn(worker_increment, ptr_cast(*u8, &sc))
+    var t2 = spawn(worker_increment, ptr_cast(*u8, &sc))
+    var t3 = spawn(worker_increment, ptr_cast(*u8, &sc))
+    var t4 = spawn(worker_increment, ptr_cast(*u8, &sc))
+    assert_true(t1.is_valid() && t2.is_valid() && t3.is_valid() && t4.is_valid(), "threads valid")
+    assert_eq(t1.join(), u32(77), "t1 exit")
+    assert_eq(t2.join(), u32(77), "t2 exit")
+    assert_eq(t3.join(), u32(77), "t3 exit")
+    assert_eq(t4.join(), u32(77), "t4 exit")
+    assert_eq(sc.total, i64(2000), "mutex total")
+    assert_eq(sc.atom.load(), i64(2000), "atomic total")
+
+    // RwLock
+    var rw = RwLock {}
+    rw.init()
+    assert_true(rw.try_read_lock(), "rw try_read_lock")
+    assert_true(rw.try_read_lock(), "rw nested read_lock")
+    rw.read_unlock()
+    rw.read_unlock()
+    assert_true(rw.try_write_lock(), "rw try_write_lock")
+    assert_false(rw.try_read_lock(), "rw read blocked while write held")
+    rw.write_unlock()
+
+    // CondVar signal + timeout
+    sc.mtx.lock()
+    assert_false(sc.cv.wait_timeout(&sc.mtx, 5), "condvar timeout")
+    sc.mtx.unlock()
+
+    var ts = spawn(worker_signal_cond, ptr_cast(*u8, &sc))
+    sc.mtx.lock()
+    loop !sc.ready {
+        sc.cv.wait(&sc.mtx)
+    }
+    sc.mtx.unlock()
+    assert_eq(ts.join(), u32(1), "condvar signaler exit")
+    assert_true(sc.ready, "condvar ready")
+}
+
+fn test_process_and_pid() {
+    assert_true(current_pid() > 0, "current_pid > 0")
+
+    var cwd_buf[512]: u8 = []
+    var cwd = assert_some(cwd_into(cwd_buf), "proc cwd")
+    var is_win = len(cwd) >= 2 && cwd[1] == ':'
+
+    var cmd = "echo cross-proc-ok"
+    var ok_cmd = "exit 0"
+    if is_win {
+        cmd = "cmd.exe /c echo cross-proc-ok"
+        ok_cmd = "cmd.exe /c exit 0"
+    }
+
+    var pout: StringBuilder
+    pout.init(64)
+    defer pout.free()
+    var rc = assert_ok(process_capture(cmd, &pout), "process_capture")
+    assert_eq(rc, u32(0), "capture exit 0")
+    assert_eq(str_trim(pout.as_str()), "cross-proc-ok", "capture stdout")
+
+    var run_rc = assert_ok(process_run(ok_cmd), "process_run")
+    assert_eq(run_rc, u32(0), "process_run exit 0")
+}
+
+struct MiniHttpServer {
+    listener: TcpListener
+}
+
+fn mini_http_worker(raw: *u8): u32 {
+    var srv = ptr_cast(*MiniHttpServer, raw)
+    match srv.listener.accept() {
+        .Ok(conn) {
+            var s = conn
+            defer s.close()
+            var req: HttpRequest
+            req.init()
+            defer req.free()
+            match http_read_request(&s, &req) {
+                .Ok(_) {
+                    var res: HttpResponse
+                    res.init(200)
+                    defer res.free()
+                    if req.path == "/ping" {
+                        res.set_json(`{"ok":true}`)
+                    } else {
+                        res.set_json(`{"ok":false}`)
+                    }
+                    var wr = http_write_response(&s, &res)
+                    match wr {
+                        .Ok(_) { return 0 }
+                        .Err(_) { return 3 }
+                    }
+                }
+                .Err(_) { return 1 }
+            }
+        }
+        .Err(_) { return 2 }
+    }
+}
+
+fn test_net_and_http_loopback() {
+    // DNS resolve localhost
+    var lh = assert_ok(dns_resolve("localhost"), "dns localhost")
+    assert_true(lh.eq(ipv4_localhost()), "localhost == 127.0.0.1")
+
+    // UDP loopback
+    var u = assert_ok(udp_bind(socket_addr(ipv4_localhost(), 0)), "udp_bind")
+    defer u.close()
+    var uaddr = assert_ok(u.local_addr(), "udp local_addr")
+    assert_eq(assert_ok(u.send_str_to("ping-udp", uaddr), "udp send"), i64(8), "udp sent 8")
+    var ubuf[64]: u8 = []
+    var pkt = assert_ok(u.recv_from(ubuf), "udp recv")
+    assert_eq(pkt.len, i64(8), "udp recv len")
+    assert_eq(str(ubuf[0..pkt.len]), "ping-udp", "udp recv payload")
+
+    // Multithreaded HTTP/1.1 client & server loopback
+    var listener = assert_ok(tcp_bind(socket_addr(ipv4_localhost(), 0)), "tcp_bind")
+    var laddr = assert_ok(listener.local_addr(), "listener local_addr")
+    var srv = MiniHttpServer { listener: listener }
+    var th = spawn(mini_http_worker, ptr_cast(*u8, &srv))
+    assert_true(th.is_valid(), "http server thread valid")
+
+    var url_sb: StringBuilder
+    url_sb.init(64)
+    defer url_sb.free()
+    url_sb.append("http://127.0.0.1:")
+    url_sb.append_u64(u64(laddr.port))
+    url_sb.append("/ping")
+
+    var resp: HttpClientResponse
+    resp.init()
+    defer resp.free()
+    var status = assert_ok(http_get(url_sb.as_str(), &resp), "http_get loopback")
+    assert_eq(status, 200, "http status 200")
+    assert_eq(resp.body, `{"ok":true}`, "http json body")
+
+    assert_eq(th.join(), u32(0), "http server thread exit 0")
+    srv.listener.close()
 }

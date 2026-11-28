@@ -1,0 +1,167 @@
+// =============================================================================
+// Antimony PAL: std/pal/thread_linux.sb
+// Linux POSIX pthreads (`pthread_create`/`join`/`detach`, `pthread_mutex_t`,
+// `pthread_rwlock_t`, `pthread_cond_t`) via libc.so.6.
+// =============================================================================
+
+import "std/mem.sb"
+
+const PAL_THR_CLOCK_REALTIME: i32 = 0
+
+priv struct LinuxThreadStart {
+    entry: fn(*u8): u32
+    arg: *u8
+}
+
+priv struct LinuxCondTimespec {
+    tv_sec: i64
+    tv_nsec: i64
+}
+
+priv extern "libc.so.6" {
+    fn pthread_create(thread: *usize, attr: *const u8, start_routine: fn(*u8): usize, arg: *u8): i32
+    fn pthread_join(thread: usize, retval: *usize): i32
+    fn pthread_detach(thread: usize): i32
+    fn pthread_self(): usize
+
+    fn pthread_mutex_init(mutex: *usize, attr: *const u8): i32
+    fn pthread_mutex_lock(mutex: *usize): i32
+    fn pthread_mutex_trylock(mutex: *usize): i32
+    fn pthread_mutex_unlock(mutex: *usize): i32
+
+    fn pthread_rwlock_init(rwlock: *usize, attr: *const u8): i32
+    fn pthread_rwlock_rdlock(rwlock: *usize): i32
+    fn pthread_rwlock_tryrdlock(rwlock: *usize): i32
+    fn pthread_rwlock_wrlock(rwlock: *usize): i32
+    fn pthread_rwlock_trywrlock(rwlock: *usize): i32
+    fn pthread_rwlock_unlock(rwlock: *usize): i32
+
+    fn pthread_cond_init(cond: *usize, attr: *const u8): i32
+    fn pthread_cond_wait(cond: *usize, mutex: *usize): i32
+    fn pthread_cond_timedwait(cond: *usize, mutex: *usize, abstime: *const u8): i32
+    fn pthread_cond_signal(cond: *usize): i32
+    fn pthread_cond_broadcast(cond: *usize): i32
+
+    fn clock_gettime(clk_id: i32, tp: *u8): i32
+}
+
+priv fn linux_thread_trampoline(raw: *u8): usize {
+    var ctx = ptr_cast(*LinuxThreadStart, raw)
+    var entry = ctx.entry
+    var arg = ctx.arg
+    free_mem(raw)
+    var code = entry(arg)
+    return usize(code)
+}
+
+pub fn pal_thread_spawn(entry: fn(*u8): u32, arg: *u8, out_id: *u32): usize {
+    var raw = alloc(usize(sizeof(LinuxThreadStart)))
+    if raw == null {
+        *out_id = 0
+        return 0
+    }
+    var ctx = ptr_cast(*LinuxThreadStart, raw)
+    ctx.entry = entry
+    ctx.arg = arg
+
+    var tid: usize = 0
+    if pthread_create(&tid, null, linux_thread_trampoline, raw) != 0 {
+        free_mem(raw)
+        *out_id = 0
+        return 0
+    }
+    *out_id = u32(tid ^ (tid >> 32))
+    return tid
+}
+
+pub fn pal_thread_join(handle: usize): u32 {
+    if handle == 0 {
+        return 0
+    }
+    var ret: usize = 0
+    pthread_join(handle, &ret)
+    return u32(ret)
+}
+
+pub fn pal_thread_detach(handle: usize) {
+    if handle != 0 {
+        pthread_detach(handle)
+    }
+}
+
+pub fn pal_current_thread_id(): u32 {
+    var self = pthread_self()
+    return u32(self ^ (self >> 32))
+}
+
+pub fn pal_mutex_init(raw: *usize) {
+    set_mem(ptr_cast(*u8, raw), 0, 64)
+    pthread_mutex_init(raw, null)
+}
+
+pub fn pal_mutex_lock(raw: *usize) {
+    pthread_mutex_lock(raw)
+}
+
+pub fn pal_mutex_unlock(raw: *usize) {
+    pthread_mutex_unlock(raw)
+}
+
+pub fn pal_mutex_try_lock(raw: *usize): bool {
+    return pthread_mutex_trylock(raw) == 0
+}
+
+pub fn pal_rwlock_init(raw: *usize) {
+    set_mem(ptr_cast(*u8, raw), 0, 64)
+    pthread_rwlock_init(raw, null)
+}
+
+pub fn pal_rwlock_read_lock(raw: *usize) {
+    pthread_rwlock_rdlock(raw)
+}
+
+pub fn pal_rwlock_read_unlock(raw: *usize) {
+    pthread_rwlock_unlock(raw)
+}
+
+pub fn pal_rwlock_try_read_lock(raw: *usize): bool {
+    return pthread_rwlock_tryrdlock(raw) == 0
+}
+
+pub fn pal_rwlock_write_lock(raw: *usize) {
+    pthread_rwlock_wrlock(raw)
+}
+
+pub fn pal_rwlock_write_unlock(raw: *usize) {
+    pthread_rwlock_unlock(raw)
+}
+
+pub fn pal_rwlock_try_write_lock(raw: *usize): bool {
+    return pthread_rwlock_trywrlock(raw) == 0
+}
+
+pub fn pal_cond_init(raw: *usize) {
+    set_mem(ptr_cast(*u8, raw), 0, 64)
+    pthread_cond_init(raw, null)
+}
+
+pub fn pal_cond_wait(cond_raw: *usize, mutex_raw: *usize) {
+    pthread_cond_wait(cond_raw, mutex_raw)
+}
+
+pub fn pal_cond_wait_timeout(cond_raw: *usize, mutex_raw: *usize, timeout_ms: u32): bool {
+    var ts = LinuxCondTimespec {}
+    clock_gettime(PAL_THR_CLOCK_REALTIME, ptr_cast(*u8, &ts))
+    var add_ns = ts.tv_nsec + (i64(timeout_ms) % 1000) * 1_000_000
+    ts.tv_sec += i64(timeout_ms) / 1000 + add_ns / 1_000_000_000
+    ts.tv_nsec = add_ns % 1_000_000_000
+    return pthread_cond_timedwait(cond_raw, mutex_raw, ptr_cast(*const u8, &ts)) == 0
+}
+
+pub fn pal_cond_notify_one(cond_raw: *usize) {
+    pthread_cond_signal(cond_raw)
+}
+
+pub fn pal_cond_notify_all(cond_raw: *usize) {
+    pthread_cond_broadcast(cond_raw)
+}

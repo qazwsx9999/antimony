@@ -1,0 +1,129 @@
+// =============================================================================
+// Antimony PAL: std/pal/thread_windows.sb
+// Win32 threads, SRWLOCK mutexes & reader-writer locks, and condition variables.
+// =============================================================================
+
+const PAL_THR_WAIT_INFINITE: u32 = 0xFFFFFFFF
+
+priv extern "kernel32.dll" {
+    fn CreateThread(
+        lpThreadAttributes: *u8,
+        dwStackSize: usize,
+        lpStartAddress: fn(*u8): u32,
+        lpParameter: *u8,
+        dwCreationFlags: u32,
+        lpThreadId: *u32
+    ): usize
+    fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32): u32
+    fn GetExitCodeThread(hThread: usize, lpExitCode: *u32): i32
+    fn CloseHandle(hObject: isize): i32
+    fn GetCurrentThreadId(): u32
+
+    fn AcquireSRWLockExclusive(SRWLock: *usize)
+    fn ReleaseSRWLockExclusive(SRWLock: *usize)
+    fn TryAcquireSRWLockExclusive(SRWLock: *usize): u8
+    fn AcquireSRWLockShared(SRWLock: *usize)
+    fn ReleaseSRWLockShared(SRWLock: *usize)
+    fn TryAcquireSRWLockShared(SRWLock: *usize): u8
+
+    fn WakeConditionVariable(ConditionVariable: *usize)
+    fn WakeAllConditionVariable(ConditionVariable: *usize)
+    fn SleepConditionVariableSRW(
+        ConditionVariable: *usize,
+        SRWLock: *usize,
+        dwMilliseconds: u32,
+        Flags: u32
+    ): i32
+}
+
+pub fn pal_thread_spawn(entry: fn(*u8): u32, arg: *u8, out_id: *u32): usize {
+    var tid: u32 = 0
+    var h = CreateThread(null, 0, entry, arg, 0, &tid)
+    *out_id = tid
+    return h
+}
+
+pub fn pal_thread_join(handle: usize): u32 {
+    if handle == 0 {
+        return 0
+    }
+    WaitForSingleObject(handle, PAL_THR_WAIT_INFINITE)
+    var code: u32 = 0
+    GetExitCodeThread(handle, &code)
+    CloseHandle(isize(handle))
+    return code
+}
+
+pub fn pal_thread_detach(handle: usize) {
+    if handle != 0 {
+        CloseHandle(isize(handle))
+    }
+}
+
+pub fn pal_current_thread_id(): u32 {
+    return GetCurrentThreadId()
+}
+
+pub fn pal_mutex_init(raw: *usize) {
+    *raw = 0
+}
+
+pub fn pal_mutex_lock(raw: *usize) {
+    AcquireSRWLockExclusive(raw)
+}
+
+pub fn pal_mutex_unlock(raw: *usize) {
+    ReleaseSRWLockExclusive(raw)
+}
+
+pub fn pal_mutex_try_lock(raw: *usize): bool {
+    return TryAcquireSRWLockExclusive(raw) != 0
+}
+
+pub fn pal_rwlock_init(raw: *usize) {
+    *raw = 0
+}
+
+pub fn pal_rwlock_read_lock(raw: *usize) {
+    AcquireSRWLockShared(raw)
+}
+
+pub fn pal_rwlock_read_unlock(raw: *usize) {
+    ReleaseSRWLockShared(raw)
+}
+
+pub fn pal_rwlock_try_read_lock(raw: *usize): bool {
+    return TryAcquireSRWLockShared(raw) != 0
+}
+
+pub fn pal_rwlock_write_lock(raw: *usize) {
+    AcquireSRWLockExclusive(raw)
+}
+
+pub fn pal_rwlock_write_unlock(raw: *usize) {
+    ReleaseSRWLockExclusive(raw)
+}
+
+pub fn pal_rwlock_try_write_lock(raw: *usize): bool {
+    return TryAcquireSRWLockExclusive(raw) != 0
+}
+
+pub fn pal_cond_init(raw: *usize) {
+    *raw = 0
+}
+
+pub fn pal_cond_wait(cond_raw: *usize, mutex_raw: *usize) {
+    SleepConditionVariableSRW(cond_raw, mutex_raw, PAL_THR_WAIT_INFINITE, 0)
+}
+
+pub fn pal_cond_wait_timeout(cond_raw: *usize, mutex_raw: *usize, timeout_ms: u32): bool {
+    return SleepConditionVariableSRW(cond_raw, mutex_raw, timeout_ms, 0) != 0
+}
+
+pub fn pal_cond_notify_one(cond_raw: *usize) {
+    WakeConditionVariable(cond_raw)
+}
+
+pub fn pal_cond_notify_all(cond_raw: *usize) {
+    WakeAllConditionVariable(cond_raw)
+}

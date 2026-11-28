@@ -49,7 +49,7 @@ fn main() {
 
 ### Requirements
 
-- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend + full 25-module `std/`) or **Linux x64** (LLVM x86-64 ELF backend + 21 cross-platform `std/` modules via `std/pal/` + cross-compilation to Windows PE32+ `.exe`).
+- **Windows x64** (native PE32+ backend + optional LLVM `-O3` backend) or **Linux x64** (LLVM x86-64 ELF backend + Windows PE32+ cross-compilation) — with **all 25 `std/` modules** supported on both platforms via `std/pal/`.
 - A C11 compiler to build `sbc` — tested with **MinGW-w64 GCC 13** (Windows) and **GCC / Clang** (Linux).
 - *Optional on Windows, required on Linux:* **LLVM/Clang** (`clang`). On Windows, `sbc` looks for `clang.exe` in `C:\Program Files\LLVM\bin`, `C:\msys64\clang64\bin`, `C:\msys64\mingw64\bin`, and on `PATH`.
 
@@ -144,7 +144,7 @@ With `--llvm`, Antimony performs on par with Rust. The native backend is about 3
 | `std/time.sb` | High-resolution timers, `Stopwatch`, `sleep_ms` |
 | `std/rand.sb` | Deterministic PRNG (`Rng`, xoshiro256++), `rng_shuffle`, OS CSPRNG (`os_random_bytes` via `BCryptGenRandom` / `getrandom`) |
 | `std/process.sb` | Child process spawning, `wait`/`try_wait`/`kill`, stdout/stderr pipe capture (`process_capture`), `current_pid` |
-| `std/net.sb` | Winsock2 IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `NetError`) |
+| `std/net.sb` | Cross-platform IPv4 TCP & UDP networking (`TcpListener`, `TcpStream`, `UdpSocket`, `Ipv4Addr`, `SocketAddr`, `dns_resolve`, `tcp_connect_host`, `NetError`) |
 | `std/http.sb` | HTTP/1.1 client & server (`http_get`, `http_post`, `http_request`, `HttpRequest`, `HttpResponse`, `http_parse_url`, `http_decode_chunked`, `http_mime_type`) |
 | `std/encoding.sb` | RFC 4648 Hexadecimal and Base64 (standard & URL-safe) encoding and decoding |
 | `std/hash.sb` | FNV-1a 32/64, IEEE CRC32, and FIPS 180-4 SHA-256 (streaming & one-shot) |
@@ -190,7 +190,7 @@ editors/      VS Code extension (highlighting, live diagnostics, sbc fmt, outlin
 
 ## Status
 
-The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3` + full 25-module `std/`) and **Linux x64** (LLVM x86-64 System V ELF backend + 21 cross-platform `std/` modules including file I/O, buffered I/O, filesystem, and OS via `std/pal/` + POSIX FFI via `dlopen`/`dlsym` + Windows cross-compilation) are supported and tested in CI. Planned work — including POSIX threads/process/networking PALs, macOS target, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
+The core language is complete and specified in [docs/spec.md](docs/spec.md). Both **Windows x64** (native PE32+ + LLVM `-O3`) and **Linux x64** (LLVM x86-64 System V ELF + POSIX FFI + Windows cross-compilation) have **100% parity across all 25 `std/` modules** (including threads, processes, sockets, HTTP/1.1, filesystem, and JSON) and are verified in CI. Planned work — including macOS support, an LSP server, and self-hosting — is tracked in [§13 of the specification](docs/spec.md#13-open-items).
 
 ## License
 

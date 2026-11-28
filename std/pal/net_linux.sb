@@ -1,0 +1,289 @@
+// =============================================================================
+// Antimony PAL: std/pal/net_linux.sb
+// Linux POSIX BSD IPv4 TCP/UDP sockets and getaddrinfo DNS via libc.so.6.
+// Valid socket handles are stored as `fd + 1` so zero-initialized structs are
+// closed while still supporting fd 0 cleanly.
+// =============================================================================
+
+const PAL_NET_AF_INET: i32 = 2
+const PAL_NET_SOCK_STREAM: i32 = 1
+const PAL_NET_SOCK_DGRAM: i32 = 2
+const PAL_NET_IPPROTO_TCP: i32 = 6
+const PAL_NET_IPPROTO_UDP: i32 = 17
+const PAL_NET_SOL_SOCKET: i32 = 1
+const PAL_NET_SO_REUSEADDR: i32 = 2
+const PAL_NET_SO_RCVTIMEO: i32 = 20
+const PAL_NET_SO_SNDTIMEO: i32 = 21
+const PAL_NET_TCP_NODELAY: i32 = 1
+const PAL_NET_SHUT_WR: i32 = 1
+const PAL_NET_MSG_NOSIGNAL: i32 = 0x4000
+
+const PAL_NET_EINTR: i32 = 4
+const PAL_NET_EAGAIN: i32 = 11
+const PAL_NET_EPIPE: i32 = 32
+const PAL_NET_EADDRINUSE: i32 = 98
+const PAL_NET_ECONNABORTED: i32 = 103
+const PAL_NET_ECONNRESET: i32 = 104
+const PAL_NET_ETIMEDOUT: i32 = 110
+const PAL_NET_ECONNREFUSED: i32 = 111
+
+priv struct LinuxSockAddrIn {
+    sin_family: u16
+    sin_port: u16
+    sin_addr: u32
+    sin_zero[8]: u8
+}
+
+// Exact Linux glibc x86-64 `struct addrinfo` layout:
+// Note: `ai_addr` precedes `ai_canonname` on Linux (opposite of Winsock2!).
+priv struct LinuxAddrInfo {
+    ai_flags: i32
+    ai_family: i32
+    ai_socktype: i32
+    ai_protocol: i32
+    ai_addrlen: u32
+    _pad0: u32
+    ai_addr: *u8
+    ai_canonname: *u8
+    ai_next: *u8
+}
+
+priv struct LinuxTimeval {
+    tv_sec: i64
+    tv_usec: i64
+}
+
+priv extern "libc.so.6" {
+    fn getaddrinfo(node: *const u8, service: *const u8, hints: *const u8, res: *usize): i32
+    fn freeaddrinfo(res: usize)
+    fn socket(domain: i32, sock_type: i32, protocol: i32): i32
+    fn bind(sockfd: i32, addr: *const u8, addrlen: u32): i32
+    fn listen(sockfd: i32, backlog: i32): i32
+    fn accept(sockfd: i32, addr: *u8, addrlen: *u32): i32
+    fn connect(sockfd: i32, addr: *const u8, addrlen: u32): i32
+    fn send(sockfd: i32, buf: *const u8, len: usize, flags: i32): isize
+    fn recv(sockfd: i32, buf: *u8, len: usize, flags: i32): isize
+    fn sendto(sockfd: i32, buf: *const u8, len: usize, flags: i32, dest_addr: *const u8, addrlen: u32): isize
+    fn recvfrom(sockfd: i32, buf: *u8, len: usize, flags: i32, src_addr: *u8, addrlen: *u32): isize
+    fn setsockopt(sockfd: i32, level: i32, optname: i32, optval: *const u8, optlen: u32): i32
+    fn getsockname(sockfd: i32, addr: *u8, addrlen: *u32): i32
+    fn getpeername(sockfd: i32, addr: *u8, addrlen: *u32): i32
+    fn shutdown(sockfd: i32, how: i32): i32
+    fn close(fd: i32): i32
+    fn __errno_location(): *i32
+}
+
+pub const PAL_INVALID_SOCK: usize = 0xFFFFFFFFFFFFFFFF
+
+pub fn pal_net_init(): i32 {
+    return 0
+}
+
+pub fn pal_net_last_error(): i32 {
+    return *__errno_location()
+}
+
+pub fn pal_net_classify_error(code: i32): i32 {
+    match code {
+        PAL_NET_EADDRINUSE { return 1 }
+        PAL_NET_ECONNREFUSED { return 2 }
+        PAL_NET_ECONNRESET, PAL_NET_ECONNABORTED, PAL_NET_EPIPE { return 3 }
+        PAL_NET_ETIMEDOUT { return 4 }
+        PAL_NET_EAGAIN { return 5 }
+        else { return 0 }
+    }
+}
+
+pub fn pal_sock_is_open(sock: usize): bool {
+    return sock != PAL_INVALID_SOCK && sock != 0
+}
+
+pub fn pal_sock_open_tcp(): usize {
+    var fd = socket(PAL_NET_AF_INET, PAL_NET_SOCK_STREAM, PAL_NET_IPPROTO_TCP)
+    if fd < 0 {
+        return PAL_INVALID_SOCK
+    }
+    return usize(fd) + 1
+}
+
+pub fn pal_sock_open_udp(): usize {
+    var fd = socket(PAL_NET_AF_INET, PAL_NET_SOCK_DGRAM, PAL_NET_IPPROTO_UDP)
+    if fd < 0 {
+        return PAL_INVALID_SOCK
+    }
+    return usize(fd) + 1
+}
+
+pub fn pal_sock_close(sock: usize) {
+    if pal_sock_is_open(sock) {
+        close(i32(sock - 1))
+    }
+}
+
+pub fn pal_sock_set_reuseaddr(sock: usize, enabled: bool): bool {
+    var v: i32 = 0
+    if enabled {
+        v = 1
+    }
+    return setsockopt(i32(sock - 1), PAL_NET_SOL_SOCKET, PAL_NET_SO_REUSEADDR, ptr_cast(*const u8, &v), 4) == 0
+}
+
+pub fn pal_sock_set_nodelay(sock: usize, enabled: bool): bool {
+    var v: i32 = 0
+    if enabled {
+        v = 1
+    }
+    return setsockopt(i32(sock - 1), PAL_NET_IPPROTO_TCP, PAL_NET_TCP_NODELAY, ptr_cast(*const u8, &v), 4) == 0
+}
+
+pub fn pal_sock_set_read_timeout(sock: usize, ms: u32): bool {
+    var tv = LinuxTimeval {
+        tv_sec: i64(ms) / 1000,
+        tv_usec: (i64(ms) % 1000) * 1000
+    }
+    return setsockopt(i32(sock - 1), PAL_NET_SOL_SOCKET, PAL_NET_SO_RCVTIMEO, ptr_cast(*const u8, &tv), u32(sizeof(LinuxTimeval))) == 0
+}
+
+pub fn pal_sock_set_write_timeout(sock: usize, ms: u32): bool {
+    var tv = LinuxTimeval {
+        tv_sec: i64(ms) / 1000,
+        tv_usec: (i64(ms) % 1000) * 1000
+    }
+    return setsockopt(i32(sock - 1), PAL_NET_SOL_SOCKET, PAL_NET_SO_SNDTIMEO, ptr_cast(*const u8, &tv), u32(sizeof(LinuxTimeval))) == 0
+}
+
+pub fn pal_sock_bind(sock: usize, sa: *const u8, slen: i32): bool {
+    return bind(i32(sock - 1), sa, u32(slen)) == 0
+}
+
+pub fn pal_sock_listen(sock: usize, backlog: i32): bool {
+    return listen(i32(sock - 1), backlog) == 0
+}
+
+pub fn pal_sock_accept(sock: usize, sa_out: *u8, slen_inout: *i32): usize {
+    var fd = i32(sock - 1)
+    loop {
+        var ul = u32(*slen_inout)
+        var cfd = accept(fd, sa_out, &ul)
+        *slen_inout = i32(ul)
+        if cfd < 0 {
+            if *__errno_location() == PAL_NET_EINTR {
+                continue
+            }
+            return PAL_INVALID_SOCK
+        }
+        return usize(cfd) + 1
+    }
+}
+
+pub fn pal_sock_connect(sock: usize, sa: *const u8, slen: i32): bool {
+    var fd = i32(sock - 1)
+    loop {
+        var rc = connect(fd, sa, u32(slen))
+        if rc < 0 {
+            if *__errno_location() == PAL_NET_EINTR {
+                continue
+            }
+            return false
+        }
+        return true
+    }
+}
+
+pub fn pal_sock_send(sock: usize, buf: *const u8, count: usize): i64 {
+    var fd = i32(sock - 1)
+    loop {
+        var n = send(fd, buf, count, PAL_NET_MSG_NOSIGNAL)
+        if n < 0 {
+            if *__errno_location() == PAL_NET_EINTR {
+                continue
+            }
+            return -1
+        }
+        return i64(n)
+    }
+}
+
+pub fn pal_sock_recv(sock: usize, buf: *u8, count: usize): i64 {
+    var fd = i32(sock - 1)
+    loop {
+        var n = recv(fd, buf, count, 0)
+        if n < 0 {
+            if *__errno_location() == PAL_NET_EINTR {
+                continue
+            }
+            return -1
+        }
+        return i64(n)
+    }
+}
+
+pub fn pal_sock_sendto(sock: usize, buf: *const u8, count: usize, sa: *const u8, slen: i32): i64 {
+    var fd = i32(sock - 1)
+    loop {
+        var n = sendto(fd, buf, count, PAL_NET_MSG_NOSIGNAL, sa, u32(slen))
+        if n < 0 {
+            if *__errno_location() == PAL_NET_EINTR {
+                continue
+            }
+            return -1
+        }
+        return i64(n)
+    }
+}
+
+pub fn pal_sock_recvfrom(sock: usize, buf: *u8, count: usize, sa_out: *u8, slen_inout: *i32): i64 {
+    var fd = i32(sock - 1)
+    loop {
+        var ul = u32(*slen_inout)
+        var n = recvfrom(fd, buf, count, 0, sa_out, &ul)
+        *slen_inout = i32(ul)
+        if n < 0 {
+            if *__errno_location() == PAL_NET_EINTR {
+                continue
+            }
+            return -1
+        }
+        return i64(n)
+    }
+}
+
+pub fn pal_sock_getsockname(sock: usize, sa_out: *u8, slen_inout: *i32): bool {
+    var ul = u32(*slen_inout)
+    var ok = getsockname(i32(sock - 1), sa_out, &ul) == 0
+    *slen_inout = i32(ul)
+    return ok
+}
+
+pub fn pal_sock_getpeername(sock: usize, sa_out: *u8, slen_inout: *i32): bool {
+    var ul = u32(*slen_inout)
+    var ok = getpeername(i32(sock - 1), sa_out, &ul) == 0
+    *slen_inout = i32(ul)
+    return ok
+}
+
+pub fn pal_sock_shutdown_write(sock: usize): bool {
+    return shutdown(i32(sock - 1), PAL_NET_SHUT_WR) == 0
+}
+
+pub fn pal_dns_resolve_ipv4(host_cstr: *const u8, out_ip_net: *u32): bool {
+    var hints = LinuxAddrInfo { ai_family: PAL_NET_AF_INET, ai_socktype: PAL_NET_SOCK_STREAM }
+    var res_ptr: usize = 0
+    var rc = getaddrinfo(host_cstr, null, ptr_cast(*const u8, &hints), &res_ptr)
+    if rc != 0 || res_ptr == 0 {
+        return false
+    }
+    defer freeaddrinfo(res_ptr)
+
+    var cur = res_ptr
+    loop cur != 0 {
+        var ai = ptr_cast(*const LinuxAddrInfo, cur)
+        if ai.ai_family == PAL_NET_AF_INET && ai.ai_addr != null {
+            var sa = ptr_cast(*const LinuxSockAddrIn, ai.ai_addr)
+            *out_ip_net = sa.sin_addr
+            return true
+        }
+        cur = usize(ai.ai_next)
+    }
+    return false
+}

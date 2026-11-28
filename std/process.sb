@@ -1,92 +1,17 @@
 // =============================================================================
 // Antimony Standard Library: std/process.sb
-// Native Win32 child process spawning, waiting, termination, and stdout/stderr
+// Cross-platform child process spawning, waiting, termination, and stdout/stderr
 // pipe capture (`Child`, `process_spawn`, `process_run`, `process_capture`).
 // =============================================================================
 
 import "std/core.sb"
 import "std/io.sb"
 import "std/str.sb"
-
-const STARTF_USESTDHANDLES: u32 = 0x00000100
-const HANDLE_FLAG_INHERIT: u32  = 0x00000001
-const WAIT_OBJECT_0: u32        = 0x00000000
-const WAIT_TIMEOUT_CODE: u32    = 0x00000102
-const WAIT_INFINITE_PROC: u32   = 0xFFFFFFFF
-const STD_INPUT_ID: u32         = 0xFFFFFFF6
-const INVALID_PROC_HANDLE: isize = -1
-
-priv struct SecurityAttributes {
-    n_length: u32
-    _pad0: u32
-    lp_security_descriptor: usize
-    b_inherit_handle: i32
-    _pad1: u32
-}
-
-priv struct StartupInfoA {
-    cb: u32
-    _pad0: u32
-    lp_reserved: usize
-    lp_desktop: usize
-    lp_title: usize
-    dw_x: u32
-    dw_y: u32
-    dw_x_size: u32
-    dw_y_size: u32
-    dw_x_count_chars: u32
-    dw_y_count_chars: u32
-    dw_fill_attribute: u32
-    dw_flags: u32
-    w_show_window: u16
-    cb_reserved2: u16
-    _pad1: u32
-    lp_reserved2: usize
-    h_std_input: isize
-    h_std_output: isize
-    h_std_error: isize
-}
-
-priv struct ProcessInformation {
-    h_process: isize
-    h_thread: isize
-    dw_process_id: u32
-    dw_thread_id: u32
-}
-
-priv extern "kernel32.dll" {
-    fn CreateProcessA(
-        lpApplicationName: *const u8,
-        lpCommandLine: *u8,
-        lpProcessAttributes: usize,
-        lpThreadAttributes: usize,
-        bInheritHandles: i32,
-        dwCreationFlags: u32,
-        lpEnvironment: usize,
-        lpCurrentDirectory: *const u8,
-        lpStartupInfo: *u8,
-        lpProcessInformation: *u8
-    ): i32
-    fn CreatePipe(
-        hReadPipe: *isize,
-        hWritePipe: *isize,
-        lpPipeAttributes: *u8,
-        nSize: u32
-    ): i32
-    fn SetHandleInformation(hObject: isize, dwMask: u32, dwFlags: u32): i32
-    fn WaitForSingleObject(hHandle: usize, dwMilliseconds: u32): u32
-    fn GetExitCodeProcess(hProcess: isize, lpExitCode: *u32): i32
-    fn TerminateProcess(hProcess: isize, uExitCode: u32): i32
-    fn GetCurrentProcessId(): u32
-    fn GetStdHandle(nStdHandle: u32): isize
-    fn ReadFile(hFile: isize, lpBuffer: *u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *u32, lpOverlapped: usize): i32
-    fn CloseHandle(hObject: isize): i32
-    fn GetLastError(): u32
-}
+import "std/pal/process.sb"
 
 // Returns the OS process ID of the current process.
 pub fn current_pid(): u32 {
-    return GetCurrentProcessId()
+    return pal_current_pid()
 }
 
 // Handle to a spawned child process.
@@ -97,19 +22,12 @@ pub struct Child {
 }
 
 pub fn (c: *Child) is_open(): bool {
-    return c.process != 0 && c.process != INVALID_PROC_HANDLE
+    return pal_proc_is_open(c.process)
 }
 
 // Closes the child's OS handles without waiting for it to exit.
 pub fn (c: *Child) close() {
-    if c.thread != 0 && c.thread != INVALID_PROC_HANDLE {
-        CloseHandle(c.thread)
-        c.thread = 0
-    }
-    if c.process != 0 && c.process != INVALID_PROC_HANDLE {
-        CloseHandle(c.process)
-        c.process = 0
-    }
+    pal_proc_close(&c.process, &c.thread)
 }
 
 // Waits for the child process to exit, closes its handles, and returns its exit code.
@@ -117,17 +35,10 @@ pub fn (c: *Child) wait(): Result[u32, IoError] {
     if !c.is_open() {
         return .Err(.InvalidInput)
     }
-    var w = WaitForSingleObject(usize(c.process), WAIT_INFINITE_PROC)
-    if w != WAIT_OBJECT_0 {
-        return .Err(io_error_from_win32(GetLastError()))
-    }
     var code: u32 = 0
-    if GetExitCodeProcess(c.process, &code) == 0 {
-        var err = GetLastError()
-        c.close()
-        return .Err(io_error_from_win32(err))
+    if pal_proc_wait(&c.process, &c.thread, &code) != 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    c.close()
     return .Ok(code)
 }
 
@@ -136,20 +47,14 @@ pub fn (c: *Child) try_wait(): Result[Option[u32], IoError] {
     if !c.is_open() {
         return .Err(.InvalidInput)
     }
-    var w = WaitForSingleObject(usize(c.process), 0)
-    if w == WAIT_TIMEOUT_CODE {
+    var code: u32 = 0
+    var rc = pal_proc_try_wait(&c.process, &c.thread, &code)
+    if rc == 0 {
         return .Ok(.None)
     }
-    if w != WAIT_OBJECT_0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if rc < 0 {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    var code: u32 = 0
-    if GetExitCodeProcess(c.process, &code) == 0 {
-        var err = GetLastError()
-        c.close()
-        return .Err(io_error_from_win32(err))
-    }
-    c.close()
     return .Ok(.Some(code))
 }
 
@@ -158,8 +63,8 @@ pub fn (c: *Child) kill(exit_code: u32): Result[bool, IoError] {
     if !c.is_open() {
         return .Err(.InvalidInput)
     }
-    if TerminateProcess(c.process, exit_code) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    if !pal_proc_kill(c.process, exit_code) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(true)
 }
@@ -169,24 +74,16 @@ pub fn process_spawn(cmd: str): Result[Child, IoError] {
     if len(cmd) == 0 {
         return .Err(.InvalidInput)
     }
-    var cb: StringBuilder
-    cb.init(usize(len(cmd)) + 1)
-    defer cb.free()
-    cb.append(cmd)
-
-    var si = StartupInfoA { cb: u32(sizeof(StartupInfoA)) }
-    var pi = ProcessInformation {}
-    var ok = CreateProcessA(
-        null, cb.cstr(), 0, 0, 0, 0, 0, null,
-        ptr_cast(*u8, &si), ptr_cast(*u8, &pi)
-    )
-    if ok == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
+    var ph: isize = 0
+    var th: isize = 0
+    var pid: u32 = 0
+    if !pal_proc_spawn(cmd, &ph, &th, &pid) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
     return .Ok(Child {
-        process: pi.h_process,
-        thread: pi.h_thread,
-        pid: pi.dw_process_id
+            process: ph,
+            thread: th,
+            pid: pid
     })
 }
 
@@ -202,58 +99,9 @@ pub fn process_capture(cmd: str, out: *StringBuilder): Result[u32, IoError] {
     if len(cmd) == 0 {
         return .Err(.InvalidInput)
     }
-    var sa = SecurityAttributes {
-        n_length: u32(sizeof(SecurityAttributes)),
-        b_inherit_handle: 1
+    var code: u32 = 0
+    if !pal_proc_capture(cmd, out, &code) {
+        return .Err(io_error_from_os(pal_last_os_error()))
     }
-    var h_read: isize = 0
-    var h_write: isize = 0
-    if CreatePipe(&h_read, &h_write, ptr_cast(*u8, &sa), 0) == 0 {
-        return .Err(io_error_from_win32(GetLastError()))
-    }
-    // Ensure the read end of the pipe is NOT inherited by the child so EOF works cleanly.
-    SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0)
-
-    var cb: StringBuilder
-    cb.init(usize(len(cmd)) + 1)
-    defer cb.free()
-    cb.append(cmd)
-
-    var si = StartupInfoA {
-        cb: u32(sizeof(StartupInfoA)),
-        dw_flags: STARTF_USESTDHANDLES,
-        h_std_input: GetStdHandle(STD_INPUT_ID),
-        h_std_output: h_write,
-        h_std_error: h_write
-    }
-    var pi = ProcessInformation {}
-    var ok = CreateProcessA(
-        null, cb.cstr(), 0, 0, 1, 0, 0, null,
-        ptr_cast(*u8, &si), ptr_cast(*u8, &pi)
-    )
-    // Parent closes write end immediately so ReadFile sees EOF when child exits.
-    CloseHandle(h_write)
-    if ok == 0 {
-        var err = GetLastError()
-        CloseHandle(h_read)
-        return .Err(io_error_from_win32(err))
-    }
-
-    var child = Child {
-        process: pi.h_process,
-        thread: pi.h_thread,
-        pid: pi.dw_process_id
-    }
-
-    var buf[4096]: u8
-    loop {
-        var nread: u32 = 0
-        var rok = ReadFile(h_read, &buf[0], 4096, &nread, 0)
-        if rok == 0 || nread == 0 {
-            break
-        }
-        out.append_bytes(buf[0..i64(nread)])
-    }
-    CloseHandle(h_read)
-    return child.wait()
+    return .Ok(code)
 }

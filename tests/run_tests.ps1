@@ -3589,7 +3589,7 @@ if (Should-RunTest "phase31_linux_target_ir") {
     # Verify cross-platform tests/linux_test.sb runs cleanly via `sbc test` on Windows too
     $linuxUnit = Join-Path $root "tests\linux_test.sb"
     $tout = (& $sbc test $linuxUnit 2>&1) -join "`n"
-    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 7 passed; 0 failed') {
+    if ($LASTEXITCODE -ne 0 -or $tout -notmatch 'test result: ok\. 10 passed; 0 failed') {
         throw "FAIL [phase31_linux_target_ir]: tests/linux_test.sb failed:`n$tout"
     }
 
@@ -3697,7 +3697,7 @@ fn main() {
     if (!$Quick -and $clangExe) {
         $linuxUnit = Join-Path $root "tests\linux_test.sb"
         $lout = (& $sbc test $linuxUnit --llvm 2>&1) -join "`n"
-        if ($LASTEXITCODE -ne 0 -or $lout -notmatch 'test result: ok\. 7 passed; 0 failed') {
+        if ($LASTEXITCODE -ne 0 -or $lout -notmatch 'test result: ok\. 10 passed; 0 failed') {
             throw "FAIL [phase32_linux_stdlib_pal]: tests/linux_test.sb --llvm failed:`n$lout"
         }
     }
@@ -3817,6 +3817,101 @@ fn main() {
 
     $script:PassedCount++
     Write-Host "PASS [linux-io]      phase33_linux_io_fs_os_pal"
+}
+
+# 42. Phase 34: Complete 25/25 Cross-Platform Stdlib (thread, process, net, http + examples/sbhttpd.sb on Linux x64)
+if (Should-RunTest "phase34_linux_full_stdlib_pal") {
+    $allStd = Get-ChildItem -Path (Join-Path $root "std") -Filter "*.sb"
+    if ($allStd.Count -lt 25) {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: expected at least 25 std/*.sb modules, found $($allStd.Count)"
+    }
+    foreach ($sf in $allStd) {
+        $cout = (& $sbc check --lib --target linux-x64 $sf.FullName 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "FAIL [phase34_linux_full_stdlib_pal]: sbc check --lib --target linux-x64 $($sf.Name) failed:`n$cout"
+        }
+    }
+
+    # Emit Linux x64 LLVM IR for flagship multithreaded HTTP server examples/sbhttpd.sb
+    $httpdPath = Join-Path $root "examples\sbhttpd.sb"
+    $httpdLl   = Join-Path $tmp "phase34_sbhttpd_linux.ll"
+    $compOut = (& $sbc build $httpdPath --target linux-x64 --emit-llvm -o $httpdLl 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $httpdLl)) {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: Linux IR emission for examples/sbhttpd.sb failed:`n$compOut"
+    }
+    $ll = Get-Content -Path $httpdLl -Raw
+    if ($ll -notmatch 'target triple = "x86_64-pc-linux-gnu"' -or
+        $ll -notmatch 'libc\.so\.6' -or
+        $ll -notmatch 'pthread_create' -or
+        $ll -notmatch 'getaddrinfo') {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: sbhttpd Linux IR missing POSIX pthread/socket/DNS symbols"
+    }
+    if ($ll -match 'kernel32\.dll|ws2_32\.dll|msvcrt\.dll|bcrypt\.dll|WSAStartup|CreateThread|CreateProcessA') {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: sbhttpd Linux IR leaked Windows API symbols"
+    }
+
+    # Emit Linux x64 LLVM IR for std/process.sb (fork/execv/waitpid/pipe/kill)
+    $p34ProcSrc = Join-Path $tmp "phase34_linux_proc.sb"
+    $p34ProcLl  = Join-Path $tmp "phase34_linux_proc.ll"
+    $p34ProcCode = @'
+import "std/process.sb"
+import "std/str.sb"
+
+fn main() {
+    var pid = current_pid()
+    var out: StringBuilder
+    out.init(32)
+    defer out.free()
+    var r1 = process_capture("echo ok", &out)
+    match process_spawn("sleep 1") {
+        .Ok(ch) {
+            var c = ch
+            var tw = c.try_wait()
+            var kl = c.kill(9)
+            var wt = c.wait()
+        }
+        .Err(_) { }
+    }
+    print("{}", pid)
+}
+'@
+    Set-Content -Path $p34ProcSrc -Value $p34ProcCode -Encoding UTF8
+    $comp2 = (& $sbc build $p34ProcSrc --target linux-x64 --emit-llvm -o $p34ProcLl 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0 -or !(Test-Path $p34ProcLl)) {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: Linux IR emission for std/process.sb failed:`n$comp2"
+    }
+    $ll2 = Get-Content -Path $p34ProcLl -Raw
+    if ($ll2 -notmatch 'fork' -or $ll2 -notmatch 'execv' -or $ll2 -notmatch 'waitpid' -or $ll2 -notmatch 'dup2') {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: process Linux IR missing POSIX fork/execv/waitpid/dup2"
+    }
+    if ($ll2 -match 'kernel32\.dll|CreateProcessA|CreatePipe|TerminateProcess') {
+        throw "FAIL [phase34_linux_full_stdlib_pal]: process Linux IR leaked Windows API symbols"
+    }
+
+    # Cross-compile both Linux IR files to ELF64 objects with Clang
+    $clangExe = $null
+    if (Test-Path "C:\Program Files\LLVM\bin\clang.exe") {
+        $clangExe = "C:\Program Files\LLVM\bin\clang.exe"
+    } else {
+        $cmd = Get-Command clang -ErrorAction SilentlyContinue
+        if ($cmd) { $clangExe = $cmd.Source }
+    }
+    if ($clangExe) {
+        foreach ($irFile in @($httpdLl, $p34ProcLl)) {
+            $objFile = [System.IO.Path]::ChangeExtension($irFile, ".o")
+            $clOut = (& $clangExe -O3 -c --target=x86_64-pc-linux-gnu $irFile -o $objFile 2>&1) -join "`n"
+            if ($LASTEXITCODE -ne 0 -or !(Test-Path $objFile)) {
+                throw "FAIL [phase34_linux_full_stdlib_pal]: clang cross-compile failed for ${irFile}:`n$clOut"
+            }
+            $hdr = [System.IO.File]::ReadAllBytes($objFile)
+            if ($hdr.Length -lt 4 -or $hdr[0] -ne 0x7F -or $hdr[1] -ne 0x45 -or $hdr[2] -ne 0x4C -or $hdr[3] -ne 0x46) {
+                throw "FAIL [phase34_linux_full_stdlib_pal]: output $objFile does not have ELF magic bytes"
+            }
+        }
+    }
+
+    $script:PassedCount++
+    Write-Host "PASS [linux-25/25]   phase34_linux_full_stdlib_pal"
 }
 
 if ($script:SkippedCount -gt 0) {

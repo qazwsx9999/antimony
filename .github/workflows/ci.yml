@@ -54,22 +54,23 @@ jobs:
       - name: Build sbc on Linux x64 (warnings as errors)
         run: make CFLAGS="-std=c11 -O2 -Wall -Wextra -Werror"
 
-      - name: Verify CLI version, formatting, and cross-platform type-checking
+      - name: Verify CLI version, formatting, and all 25 std/ modules type-check on Linux
         run: |
           ./sbc --version
           ./sbc fmt --check tests/stdlib_test.sb tests/linux_test.sb std/pal/*.sb
-          for mod in core mem vec map set deque heap sort str path math time rand encoding hash json io bufio fs os testing; do
-            ./sbc check --lib "std/${mod}.sb"
+          for mod in std/*.sb; do
+            ./sbc check --lib "$mod"
           done
 
-      - name: Run Antimony cross-platform stdlib tests on Linux x64 (debug & -O3 release)
+      - name: Run full 25-module cross-platform stdlib tests on Linux x64 (debug & -O3 release)
         run: |
           ./sbc test tests/linux_test.sb
           ./sbc test tests/linux_test.sb --release
 
-      - name: Run real CLI example natively on Linux x64 (examples/sbwc.sb)
+      - name: Run real CLI & multithreaded HTTP server examples natively on Linux x64
         run: |
           ./sbc run examples/sbwc.sb
+          ./sbc run examples/sbhttpd.sb
 
       - name: Run Linux ELF shared-library FFI test (libm.so.6 & libc.so.6)
         run: |
