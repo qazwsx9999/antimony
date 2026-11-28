@@ -4,6 +4,7 @@
 
 #define SB_VERSION "1.1.0"
 
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -57,8 +58,21 @@ extern const char *g_source;
 extern int g_file_id;
 
 int register_source_file(const char *filename, const char *source);
+void reset_source_files(void);
+int source_file_count(void);
+const char *source_file_name(int file_id);
 const char *file_name_of(Pos pos);
 const char *file_source_of(Pos pos);
+
+typedef struct {
+    bool has_error;
+    Pos pos;
+    char filename[1024];
+    char message[1024];
+} SbErrorCapture;
+
+void sb_error_begin(jmp_buf *env, SbErrorCapture *cap);
+void sb_error_end(void);
 
 _Noreturn void fatal(Pos pos, const char *fmt, ...);
 _Noreturn void die(const char *fmt, ...);
@@ -432,5 +446,10 @@ void write_pe(const char *path, Image *img);
 bool emit_llvm_ir(Program *prog, NodeVec all_decls, const char *ll_path, bool release, TargetOs target);
 bool compile_opt_backend(Program *prog, NodeVec all_decls, const char *exe_path, bool release, TargetOs target);
 char *fmt_source(const char *filename, const char *src);
+
+// Language Server (lsp.c) & module loading hooks (main.c)
+void load_module_for_lsp(const char *path, const char *override_src, NodeVec *all_decls, TargetOs target);
+bool resolve_import_path_for_lsp(const char *raw_path, const char *base_dir, TargetOs target, char *out_buf, size_t out_cap);
+int run_lsp_server(void);
 
 #endif

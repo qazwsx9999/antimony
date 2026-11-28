@@ -3653,6 +3653,13 @@ Program check(NodeVec decls) {
 }
 
 Program check_ex(NodeVec decls, bool require_main) {
+    // Clear type-interning caches so repeated in-process checks (e.g. `sbc lsp`)
+    // never match stale Type* pointers from previous analyses.
+    array_types.len = 0;
+    slice_types.len = 0;
+    ptr_types.len = 0;
+    fn_types.len = 0;
+
     Checker c = {0};
     c.global = push_scope(&c, false);
     register_builtins(&c);

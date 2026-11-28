@@ -523,45 +523,348 @@ async function runCompilerTask(mode) {
   await vscode.tasks.executeTask(task);
 }
 
+// ---------------------------------------------------------------------------
+// Zero-dependency JSON-RPC 2.0 client talking directly to `sbc lsp`
+// ---------------------------------------------------------------------------
+
+class AntimonyLspClient {
+  constructor(diagnostics) {
+    this.diagnostics = diagnostics;
+    this.proc = null;
+    this.buf = Buffer.alloc(0);
+    this.nextId = 1;
+    this.pending = new Map();
+    this.ready = false;
+    this.starting = null;
+    this.openedUris = new Set();
+  }
+
+  isEnabled(uri) {
+    const cfg = vscode.workspace.getConfiguration("antimony", uri);
+    return cfg.get("enableLsp", true);
+  }
+
+  async ensureStarted(fileUri) {
+    if (!this.isEnabled(fileUri)) return false;
+    if (this.ready && this.proc && !this.proc.killed) return true;
+    if (this.starting) return this.starting;
+
+    this.starting = new Promise((resolve) => {
+      const compiler = resolveCompiler(fileUri);
+      const wsFolder = vscode.workspace.getWorkspaceFolder(fileUri) ||
+        (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders[0]);
+      const cwd = wsFolder ? wsFolder.uri.fsPath : (fileUri && fileUri.fsPath ? path.dirname(fileUri.fsPath) : undefined);
+
+      let proc;
+      try {
+        proc = spawn(compiler, ["lsp"], { cwd, windowsHide: true });
+      } catch (_err) {
+        this.starting = null;
+        resolve(false);
+        return;
+      }
+
+      this.proc = proc;
+      this.buf = Buffer.alloc(0);
+
+      proc.stdout.on("data", (chunk) => this.onData(chunk));
+      proc.on("error", () => {
+        this.cleanup();
+        resolve(false);
+      });
+      proc.on("exit", () => {
+        this.cleanup();
+      });
+
+      this.request("initialize", {
+        processId: process.pid,
+        rootUri: wsFolder ? wsFolder.uri.toString() : null,
+        capabilities: {}
+      }).then((res) => {
+        if (res && res.capabilities) {
+          this.ready = true;
+          this.notify("initialized", {});
+          this.starting = null;
+          resolve(true);
+        } else {
+          this.cleanup();
+          resolve(false);
+        }
+      }).catch(() => {
+        this.cleanup();
+        resolve(false);
+      });
+    });
+
+    return this.starting;
+  }
+
+  cleanup() {
+    this.ready = false;
+    this.starting = null;
+    this.openedUris.clear();
+    for (const [, p] of this.pending.entries()) {
+      p.reject(new Error("LSP disconnected"));
+    }
+    this.pending.clear();
+    if (this.proc && !this.proc.killed) {
+      try { this.proc.kill(); } catch (_e) {}
+    }
+    this.proc = null;
+  }
+
+  sendRaw(obj) {
+    if (!this.proc || this.proc.killed) return;
+    const body = Buffer.from(JSON.stringify(obj), "utf8");
+    const header = Buffer.from(`Content-Length: ${body.length}\r\n\r\n`, "ascii");
+    this.proc.stdin.write(Buffer.concat([header, body]));
+  }
+
+  notify(method, params) {
+    this.sendRaw({ jsonrpc: "2.0", method, params });
+  }
+
+  request(method, params) {
+    return new Promise((resolve, reject) => {
+      if (!this.proc || this.proc.killed) {
+        reject(new Error("LSP not running"));
+        return;
+      }
+      const id = this.nextId++;
+      this.pending.set(id, { resolve, reject });
+      this.sendRaw({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+
+  onData(chunk) {
+    this.buf = Buffer.concat([this.buf, chunk]);
+    for (;;) {
+      const hdrEnd = this.buf.indexOf("\r\n\r\n");
+      if (hdrEnd === -1) break;
+      const hdrText = this.buf.slice(0, hdrEnd).toString("ascii");
+      const m = hdrText.match(/Content-Length:\s*(\d+)/i);
+      if (!m) {
+        this.buf = this.buf.slice(hdrEnd + 4);
+        continue;
+      }
+      const len = parseInt(m[1], 10);
+      const total = hdrEnd + 4 + len;
+      if (this.buf.length < total) break;
+      const bodyStr = this.buf.slice(hdrEnd + 4, total).toString("utf8");
+      this.buf = this.buf.slice(total);
+
+      let msg;
+      try { msg = JSON.parse(bodyStr); } catch (_e) { continue; }
+      if (msg.id !== undefined && this.pending.has(msg.id)) {
+        const p = this.pending.get(msg.id);
+        this.pending.delete(msg.id);
+        p.resolve(msg.result);
+      } else if (msg.method === "textDocument/publishDiagnostics" && msg.params) {
+        this.handleDiagnostics(msg.params);
+      }
+    }
+  }
+
+  handleDiagnostics(params) {
+    const uri = vscode.Uri.parse(params.uri);
+    const cfg = vscode.workspace.getConfiguration("antimony", uri);
+    if (!cfg.get("enableDiagnostics", true)) {
+      this.diagnostics.delete(uri);
+      return;
+    }
+    const list = (params.diagnostics || []).map((d) => {
+      const r = new vscode.Range(
+        d.range.start.line, d.range.start.character,
+        d.range.end.line, d.range.end.character
+      );
+      const diag = new vscode.Diagnostic(r, d.message, vscode.DiagnosticSeverity.Error);
+      diag.source = d.source || "sbc";
+      return diag;
+    });
+    this.diagnostics.set(uri, list);
+  }
+
+  async syncOpen(doc) {
+    if (!doc || doc.languageId !== "antimony" || doc.uri.scheme !== "file") return false;
+    if (!(await this.ensureStarted(doc.uri))) return false;
+    const uri = doc.uri.toString();
+    if (!this.openedUris.has(uri)) {
+      this.openedUris.add(uri);
+      this.notify("textDocument/didOpen", {
+        textDocument: { uri, languageId: "antimony", version: doc.version, text: doc.getText() }
+      });
+    } else {
+      this.notify("textDocument/didChange", {
+        textDocument: { uri, version: doc.version },
+        contentChanges: [{ text: doc.getText() }]
+      });
+    }
+    return true;
+  }
+
+  syncClose(doc) {
+    if (!doc || !this.ready) return;
+    const uri = doc.uri.toString();
+    if (this.openedUris.has(uri)) {
+      this.openedUris.delete(uri);
+      this.notify("textDocument/didClose", { textDocument: { uri } });
+    }
+  }
+
+  async stop() {
+    if (this.ready && this.proc && !this.proc.killed) {
+      try {
+        await this.request("shutdown", null);
+        this.notify("exit", null);
+      } catch (_e) {}
+    }
+    this.cleanup();
+  }
+}
+
+let activeLsp = null;
+
 function activate(context) {
   const selector = { language: "antimony", scheme: "file" };
   const untitledSelector = { language: "antimony", scheme: "untitled" };
   const diagnostics = vscode.languages.createDiagnosticCollection("antimony");
+  const fallbackSymbols = new AntimonyDocumentSymbolProvider();
+  const fallbackHover = new AntimonyHoverProvider();
+  const fallbackFmt = new AntimonyDocumentFormattingEditProvider();
+  const lsp = new AntimonyLspClient(diagnostics);
+  activeLsp = lsp;
+
+  let changeTimer = null;
 
   context.subscriptions.push(
     diagnostics,
-    vscode.languages.registerDocumentSymbolProvider([selector, untitledSelector], new AntimonyDocumentSymbolProvider()),
-    vscode.languages.registerHoverProvider([selector, untitledSelector], new AntimonyHoverProvider()),
-    vscode.languages.registerDocumentFormattingEditProvider(
-      [selector, untitledSelector],
-      new AntimonyDocumentFormattingEditProvider()
-    ),
+    vscode.languages.registerDefinitionProvider(selector, {
+      async provideDefinition(doc, pos) {
+        if (!(await lsp.syncOpen(doc))) return null;
+        try {
+          const res = await lsp.request("textDocument/definition", {
+            textDocument: { uri: doc.uri.toString() },
+            position: { line: pos.line, character: pos.character }
+          });
+          if (!res || !res.uri) return null;
+          const r = new vscode.Range(
+            res.range.start.line, res.range.start.character,
+            res.range.end.line, res.range.end.character
+          );
+          return new vscode.Location(vscode.Uri.parse(res.uri), r);
+        } catch (_e) {
+          return null;
+        }
+      }
+    }),
+    vscode.languages.registerHoverProvider([selector, untitledSelector], {
+      async provideHover(doc, pos) {
+        if (doc.uri.scheme === "file" && (await lsp.syncOpen(doc))) {
+          try {
+            const res = await lsp.request("textDocument/hover", {
+              textDocument: { uri: doc.uri.toString() },
+              position: { line: pos.line, character: pos.character }
+            });
+            if (res && res.contents && res.contents.value) {
+              return new vscode.Hover(new vscode.MarkdownString(res.contents.value));
+            }
+          } catch (_e) {}
+        }
+        return fallbackHover.provideHover(doc, pos);
+      }
+    }),
+    vscode.languages.registerDocumentSymbolProvider([selector, untitledSelector], {
+      async provideDocumentSymbols(doc) {
+        if (doc.uri.scheme === "file" && (await lsp.syncOpen(doc))) {
+          try {
+            const res = await lsp.request("textDocument/documentSymbol", {
+              textDocument: { uri: doc.uri.toString() }
+            });
+            if (Array.isArray(res) && res.length > 0) {
+              return res.map((s) => new vscode.DocumentSymbol(
+                s.name,
+                s.detail || "",
+                s.kind || vscode.SymbolKind.Function,
+                new vscode.Range(s.range.start.line, s.range.start.character, s.range.end.line, s.range.end.character),
+                new vscode.Range(s.selectionRange.start.line, s.selectionRange.start.character, s.selectionRange.end.line, s.selectionRange.end.character)
+              ));
+            }
+          } catch (_e) {}
+        }
+        return fallbackSymbols.provideDocumentSymbols(doc);
+      }
+    }),
+    vscode.languages.registerCompletionItemProvider(selector, {
+      async provideCompletionItems(doc, pos) {
+        if (!(await lsp.syncOpen(doc))) return [];
+        try {
+          const res = await lsp.request("textDocument/completion", {
+            textDocument: { uri: doc.uri.toString() },
+            position: { line: pos.line, character: pos.character }
+          });
+          if (!Array.isArray(res)) return [];
+          return res.map((it) => {
+            const ci = new vscode.CompletionItem(it.label, it.kind || vscode.CompletionItemKind.Text);
+            if (it.detail) ci.detail = it.detail;
+            return ci;
+          });
+        } catch (_e) {
+          return [];
+        }
+      }
+    }, "."),
+    vscode.languages.registerDocumentFormattingEditProvider([selector, untitledSelector], fallbackFmt),
     vscode.commands.registerCommand("antimony.runFile", () => runCompilerTask("run")),
     vscode.commands.registerCommand("antimony.buildFile", () => runCompilerTask("build")),
     vscode.commands.registerCommand("antimony.testFile", () => runCompilerTask("test")),
-    vscode.commands.registerCommand("antimony.checkFile", () => {
+    vscode.commands.registerCommand("antimony.checkFile", async () => {
       const editor = vscode.window.activeTextEditor;
       if (editor && editor.document.languageId === "antimony") {
-        runDiagnostics(editor.document, diagnostics);
+        if (!(await lsp.syncOpen(editor.document))) {
+          runDiagnostics(editor.document, diagnostics);
+        }
       }
     }),
     vscode.commands.registerCommand("antimony.formatFile", async () => {
       await vscode.commands.executeCommand("editor.action.formatDocument");
     }),
-    vscode.workspace.onDidOpenTextDocument((doc) => runDiagnostics(doc, diagnostics)),
-    vscode.workspace.onDidSaveTextDocument((doc) => runDiagnostics(doc, diagnostics)),
-    vscode.workspace.onDidCloseTextDocument((doc) => diagnostics.delete(doc.uri)),
-    vscode.window.onDidChangeActiveTextEditor((editor) => {
-      if (editor) runDiagnostics(editor.document, diagnostics);
+    vscode.workspace.onDidOpenTextDocument(async (doc) => {
+      if (!(await lsp.syncOpen(doc))) runDiagnostics(doc, diagnostics);
+    }),
+    vscode.workspace.onDidChangeTextDocument((ev) => {
+      if (ev.document.languageId !== "antimony" || ev.document.uri.scheme !== "file") return;
+      if (changeTimer) clearTimeout(changeTimer);
+      changeTimer = setTimeout(() => { lsp.syncOpen(ev.document); }, 180);
+    }),
+    vscode.workspace.onDidSaveTextDocument(async (doc) => {
+      if (!(await lsp.syncOpen(doc))) runDiagnostics(doc, diagnostics);
+    }),
+    vscode.workspace.onDidCloseTextDocument((doc) => {
+      lsp.syncClose(doc);
+      diagnostics.delete(doc.uri);
+    }),
+    vscode.window.onDidChangeActiveTextEditor(async (editor) => {
+      if (editor && !(await lsp.syncOpen(editor.document))) {
+        runDiagnostics(editor.document, diagnostics);
+      }
     })
   );
 
   if (vscode.window.activeTextEditor) {
-    runDiagnostics(vscode.window.activeTextEditor.document, diagnostics);
+    const doc = vscode.window.activeTextEditor.document;
+    lsp.syncOpen(doc).then((ok) => {
+      if (!ok) runDiagnostics(doc, diagnostics);
+    });
   }
 }
 
-function deactivate() {}
+function deactivate() {
+  if (activeLsp) {
+    const cur = activeLsp;
+    activeLsp = null;
+    return cur.stop();
+  }
+}
 
 module.exports = {
   activate,

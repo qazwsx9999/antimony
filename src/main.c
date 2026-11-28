@@ -6,6 +6,7 @@
 //   sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
 //   sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>
 //   sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
+//   sbc lsp
 //   sbc --version
 #ifndef _WIN32
 #define _POSIX_C_SOURCE 200809L
@@ -264,6 +265,77 @@ static void load_module_recursive(const char *raw_path, const char *base_dir,
     g_source = saved_source;
 }
 
+bool resolve_import_path_for_lsp(const char *raw_path, const char *base_dir, TargetOs target,
+                                 char *out_buf, size_t out_cap) {
+    g_load_target = target;
+    bool is_abs = (raw_path[0] == '/' || raw_path[0] == '\\' ||
+                   (raw_path[0] && raw_path[1] == ':'));
+    char *src = try_open_module(is_abs ? "" : base_dir, raw_path, out_buf, out_cap);
+    if (!src && !is_abs) {
+        char exe_path[1024], exe_dir[1024];
+#ifdef _WIN32
+        if (GetModuleFileNameA(NULL, exe_path, sizeof(exe_path)) > 0) {
+            extract_dir(exe_path, exe_dir, sizeof(exe_dir));
+            src = try_open_module(exe_dir, raw_path, out_buf, out_cap);
+        }
+#else
+        ssize_t n = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+        if (n > 0) {
+            exe_path[n] = '\0';
+            extract_dir(exe_path, exe_dir, sizeof(exe_dir));
+            src = try_open_module(exe_dir, raw_path, out_buf, out_cap);
+        }
+#endif
+    }
+    if (!src) return false;
+    free(src);
+    return true;
+}
+
+void load_module_for_lsp(const char *path, const char *override_src, NodeVec *all_decls, TargetOs target) {
+    g_loaded_files.len = 0;
+    g_load_target = target;
+
+#ifdef _WIN32
+    char full_buf[1024];
+    const char *canon_str = _fullpath(full_buf, path, sizeof(full_buf)) ? full_buf : path;
+#else
+    char full_buf[PATH_MAX];
+    const char *canon_str = realpath(path, full_buf) ? full_buf : path;
+#endif
+    const char *canon = intern(canon_str, (int)strlen(canon_str));
+    vec_push(g_loaded_files, canon);
+
+    const char *disp_name = intern(path, (int)strlen(path));
+    int saved_file_id = g_file_id;
+    const char *saved_filename = g_filename;
+    const char *saved_source = g_source;
+
+    register_source_file(disp_name, override_src);
+
+    int ntoks = 0;
+    Token *toks = lex(override_src, &ntoks);
+    NodeVec file_decls = parse(toks, ntoks);
+    free(toks);
+
+    char cur_dir[1024];
+    extract_dir(path, cur_dir, sizeof(cur_dir));
+
+    for (int i = 0; i < file_decls.len; i++) {
+        Node *d = file_decls.items[i];
+        if (d->kind == N_IMPORT) {
+            load_module_recursive(d->str, cur_dir, true, d->pos, all_decls);
+        } else {
+            vec_push(*all_decls, d);
+        }
+    }
+    free(file_decls.items);
+
+    g_file_id = saved_file_id;
+    g_filename = saved_filename;
+    g_source = saved_source;
+}
+
 static char *default_output_path(const char *input, TargetOs target, bool emit_ir) {
     const char *slash1 = strrchr(input, '/');
     const char *slash2 = strrchr(input, '\\');
@@ -306,6 +378,7 @@ static void usage(int exit_code) {
         "  sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]\n"
         "  sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>\n"
         "  sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]\n"
+        "  sbc lsp\n"
         "  sbc --version | --help\n",
         SB_VERSION);
     exit(exit_code);
@@ -594,6 +667,9 @@ int main(int argc, char **argv) {
     }
     if (strcmp(argv[1], "test") == 0) {
         return run_test_cmd(argc, argv);
+    }
+    if (strcmp(argv[1], "lsp") == 0) {
+        return run_lsp_server();
     }
 
     const char *input = NULL;

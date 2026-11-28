@@ -22,6 +22,23 @@ int register_source_file(const char *filename, const char *source) {
     return id;
 }
 
+void reset_source_files(void) {
+    g_files.len = 0;
+    g_filename = "<input>";
+    g_source = "";
+    g_file_id = 0;
+}
+
+int source_file_count(void) {
+    return g_files.len;
+}
+
+const char *source_file_name(int file_id) {
+    if (file_id >= 0 && file_id < g_files.len)
+        return g_files.items[file_id].filename;
+    return g_filename;
+}
+
 const char *file_name_of(Pos pos) {
     if (pos.file_id >= 0 && pos.file_id < g_files.len)
         return g_files.items[pos.file_id].filename;
@@ -118,7 +135,36 @@ void buf_put_u32(Buf *b, size_t off, uint32_t v) {
     memcpy(b->data + off, &v, 4);
 }
 
+static jmp_buf *g_error_jmp = NULL;
+static SbErrorCapture *g_error_cap = NULL;
+
+void sb_error_begin(jmp_buf *env, SbErrorCapture *cap) {
+    g_error_jmp = env;
+    g_error_cap = cap;
+    if (cap) {
+        memset(cap, 0, sizeof(*cap));
+    }
+}
+
+void sb_error_end(void) {
+    g_error_jmp = NULL;
+    g_error_cap = NULL;
+}
+
 _Noreturn void die(const char *fmt, ...) {
+    if (g_error_jmp && g_error_cap) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(g_error_cap->message, sizeof(g_error_cap->message), fmt, ap);
+        va_end(ap);
+        g_error_cap->has_error = true;
+        g_error_cap->pos = (Pos){1, 1, 0};
+        snprintf(g_error_cap->filename, sizeof(g_error_cap->filename), "%s", g_filename ? g_filename : "<input>");
+        jmp_buf *env = g_error_jmp;
+        g_error_jmp = NULL;
+        g_error_cap = NULL;
+        longjmp(*env, 1);
+    }
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "sbc: error: ");
@@ -131,6 +177,19 @@ _Noreturn void die(const char *fmt, ...) {
 _Noreturn void fatal(Pos pos, const char *fmt, ...) {
     const char *fname = file_name_of(pos);
     const char *fsrc  = file_source_of(pos);
+    if (g_error_jmp && g_error_cap) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(g_error_cap->message, sizeof(g_error_cap->message), fmt, ap);
+        va_end(ap);
+        g_error_cap->has_error = true;
+        g_error_cap->pos = pos;
+        snprintf(g_error_cap->filename, sizeof(g_error_cap->filename), "%s", fname ? fname : "<input>");
+        jmp_buf *env = g_error_jmp;
+        g_error_jmp = NULL;
+        g_error_cap = NULL;
+        longjmp(*env, 1);
+    }
     va_list ap;
     va_start(ap, fmt);
     fprintf(stderr, "%s:%d:%d: error: ", fname, pos.line, pos.col);

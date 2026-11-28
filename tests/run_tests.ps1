@@ -3914,6 +3914,27 @@ fn main() {
     Write-Host "PASS [linux-25/25]   phase34_linux_full_stdlib_pal"
 }
 
+# 43. Phase 35: Built-in Native Language Server (`sbc lsp`) JSON-RPC 2.0 Integration Test
+if (Should-RunTest "phase35_sbc_lsp") {
+    $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
+    if (!$nodeCmd) {
+        Write-Host "SKIP [lsp]           phase35_sbc_lsp (node not found on PATH)"
+    } else {
+        $lspScript = Join-Path $root "tests\test_lsp.js"
+        $lspOut = (& $nodeCmd.Source $lspScript $sbc 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0 -or $lspOut -notmatch 'LSP integration tests passed') {
+            throw "FAIL [phase35_sbc_lsp]: sbc lsp integration test failed:`n$lspOut"
+        }
+        $extJs = Join-Path $root "editors\vscode\extension.js"
+        $chkOut = (& $nodeCmd.Source --check $extJs 2>&1) -join "`n"
+        if ($LASTEXITCODE -ne 0) {
+            throw "FAIL [phase35_sbc_lsp]: VS Code extension.js syntax check failed:`n$chkOut"
+        }
+        $script:PassedCount++
+        Write-Host "PASS [lsp]           phase35_sbc_lsp"
+    }
+}
+
 if ($script:SkippedCount -gt 0) {
     Write-Host "`nAll $($script:PassedCount) selected tests passed ($($script:SkippedCount) skipped)."
 } else {

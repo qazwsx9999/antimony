@@ -95,6 +95,7 @@ sbc run <file.sb> [--release] [--llvm | -O3]
 sbc test <file.sb> [--filter <pat> | -f <pat>] [--release] [--llvm | -O3]
 sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>
 sbc fmt [-w | --write] [--check] [--stdin | <file.sb>...]
+sbc lsp
 sbc --version | --help
 ```
 
@@ -106,6 +107,7 @@ sbc --version | --help
 | `sbc test <file.sb>` | Discover and run all `fn test_*()` unit tests in a file (supports `--filter`, `--release`, `--llvm`). |
 | `sbc check [--lib] [--target windows-x64|linux-x64] <file.sb>` | Fast type-check only (no codegen, no output file). Pass `--lib` for library modules without `fn main()`. |
 | `sbc fmt <file.sb>...` | Canonical 4-space source formatter (lossless, comment-preserving). Use `-w` to format in place, `--check` for CI, or `--stdin` for editors. |
+| `sbc lsp` | Built-in Language Server (LSP 3.17 / JSON-RPC 2.0 over stdio): live diagnostics, Go to Definition across `std/`, Hover, Outline, Completion, and Formatting. |
 | `--release` | Release build: arithmetic wraps; bounds checks, division by zero, and `MIN / -1` still trap. |
 | `--llvm`, `-O3` | Compile through LLVM (`clang -O3 -march=native`); implies `--release`. |
 | `--emit-llvm` | Write textual LLVM IR (`.ll`) to the output path instead of an executable. |

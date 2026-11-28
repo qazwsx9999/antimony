@@ -1,8 +1,8 @@
 {
   "name": "antimony",
   "displayName": "Antimony (sb)",
-  "description": "Syntax highlighting, live diagnostics, canonical formatting (sbc fmt), snippets, outline symbols, hover docs, and build/run support for the Antimony (.sb) programming language.",
-  "version": "0.2.0",
+  "description": "Built-in LSP (sbc lsp) for Go to Definition, compiler-backed Hover, Completion, Live Diagnostics, Outline, Formatting (sbc fmt), Snippets, and Build/Run/Test for Antimony (.sb).",
+  "version": "0.3.0",
   "publisher": "antimony-lang",
   "license": "MIT",
   "engines": {
@@ -101,7 +101,12 @@
         "antimony.enableDiagnostics": {
           "type": "boolean",
           "default": true,
-          "description": "Run `sbc check --lib` automatically on open and save to show inline compiler errors and hints."
+          "description": "Show live compiler diagnostics for open Antimony files."
+        },
+        "antimony.enableLsp": {
+          "type": "boolean",
+          "default": true,
+          "description": "Use the built-in `sbc lsp` language server for live diagnostics, Go to Definition, Hover, Completion, Outline, and Formatting."
         }
       }
     }

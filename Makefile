@@ -3,7 +3,7 @@ CC      ?= gcc
 CFLAGS  ?= -std=c11 -O2 -Wall -Wextra
 TARGET  := sbc
 SRCS    := src/util.c src/lexer.c src/parser.c src/check.c src/x64.c \
-           src/codegen.c src/pe.c src/llvm_c.c src/fmt.c src/main.c
+           src/codegen.c src/pe.c src/llvm_c.c src/fmt.c src/lsp.c src/main.c
 
 .PHONY: all clean check-fmt
 

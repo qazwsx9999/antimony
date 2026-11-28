@@ -15,7 +15,7 @@ jobs:
       - name: Build sbc (MinGW-w64 GCC, warnings as errors)
         shell: cmd
         run: |
-          gcc -std=c11 -O2 -Wall -Wextra -Werror src\util.c src\lexer.c src\parser.c src\check.c src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\fmt.c src\main.c -o sbc.exe
+          gcc -std=c11 -O2 -Wall -Wextra -Werror src\util.c src\lexer.c src\parser.c src\check.c src\x64.c src\codegen.c src\pe.c src\llvm_c.c src\fmt.c src\lsp.c src\main.c -o sbc.exe
 
       - name: Verify CLI version and formatting
         shell: pwsh
@@ -71,6 +71,10 @@ jobs:
         run: |
           ./sbc run examples/sbwc.sb
           ./sbc run examples/sbhttpd.sb
+
+      - name: Run built-in Language Server (sbc lsp) integration tests on Linux x64
+        run: |
+          node tests/test_lsp.js ./sbc
 
       - name: Run Linux ELF shared-library FFI test (libm.so.6 & libc.so.6)
         run: |
